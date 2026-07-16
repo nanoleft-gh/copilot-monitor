@@ -106,7 +106,7 @@ All windows publish through the same port and URL. Windows Firewall may ask whet
 - `Copilot Monitor: Open Dashboard`
 - `Copilot Monitor: Copy Dashboard URL`
 
-## Compatibility And Limitations
+## Known Limitations for Future Scope
 
 - Only local VS Code Copilot chats are included; Copilot CLI, cloud-agent, and Agent Host sessions are outside this prototype.
 - Hidden loopback ports are implementation details. Only the shared gateway port is exposed to the LAN.
