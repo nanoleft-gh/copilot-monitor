@@ -1,0 +1,9 @@
+out
+dist
+node_modules
+.vscode-test/
+.research/
+*.vsix
+.playwright-mcp/
+.vscode/
+nul
