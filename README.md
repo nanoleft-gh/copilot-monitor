@@ -22,6 +22,7 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Shows all persisted local Copilot chats for each live window.
 - Reconstructs the session transcript from VS Code's append-only chat operation log.
 - Streams live in-memory transcript and working-state changes with Server-Sent Events.
+- Keeps long chats responsive with bounded transcript rendering, sampled message jumpers, lightweight inactive-chat summaries, and throttled live exports.
 - Shows assistant markdown, code blocks, and summarized tool activity.
 - Renders compact semantic headings, lists, quotes, rules, inline code, and emphasis instead of exposing raw markdown spacing.
 - Renders fenced `mermaid` blocks as self-hosted, theme-aware SVG diagrams without a CDN.
@@ -31,6 +32,7 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Lists every currently selectable Copilot model for each VS Code window, including Auto.
 - Shows the selected model, the model used by the latest request, thinking effort, context tier, and available configuration choices.
 - Changes the model for the exact selected window and chat session.
+- Synchronizes native VS Code model and effort/context changes back to the dashboard through lightweight application-state polling.
 - Changes thinking effort and context size for the exact selected window and chat, then briefly reloads that chat so VS Code restores the new configuration through its native editor-scoped store.
 - Places model, effort, and context controls in a compact Copilot-style composer toolbar.
 - Adds a workspace/conversation navigator, per-turn message rail, conversation search, and top/bottom navigation.
@@ -80,7 +82,7 @@ Press `F5` to open the Extension Development Host. In that window:
 
 ```sh
 npm run package
-code --install-extension githubcopilot-monitor-1.0.0.vsix --force
+code --install-extension githubcopilot-monitor-1.0.2.vsix --force
 ```
 
 Reload VS Code. The bridge starts automatically, adds a `Copilot Monitor` status bar item, and needs no proposed-API or launch flags.

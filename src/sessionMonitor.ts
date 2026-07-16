@@ -1,12 +1,14 @@
 import { FSWatcher, watch } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import * as vscode from 'vscode';
 import { buildLocalSessionResource, createNewChat, decideTool, focusChatSession, inspectChatSession, releaseChatSession, selectChatModel, sendPrompt } from './chatBridge';
 import { LiveExportFileSystem, liveExportScheme } from './liveExportFileSystem';
 import { LiveExportTracker } from './liveExportTracker';
-import { mergeSessionModelState, parseSessionModelState, readLatestModelCatalog, withSelectedModel } from './modelCatalog';
+import { mergeSessionModelState, parseSessionModelState, readLatestModelCatalog, withNativeModelState, withSelectedModel } from './modelCatalog';
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
+import { parseNativeChatInputState } from './nativeChatInputState';
 import { findMatchingSession } from './sessionMatcher';
 import { SessionStateCache } from './sessionStateCache';
 import { isActivePendingTool } from './toolDecision';
@@ -35,12 +37,13 @@ import {
 } from './transcript';
 
 const fallbackPollIntervalMs = 1_000;
-const liveExportIntervalMs = 200;
+const liveExportIntervalMs = 500;
 const fileEventDebounceMs = 20;
 const partialWriteRetryMs = 50;
 const maximumMessageLength = 32_000;
 const maximumOutboundHistory = 20;
 const modelCatalogRefreshIntervalMs = 10_000;
+const nativeInputStatePollIntervalMs = 1_000;
 
 export class SessionMonitor implements vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<MonitorState>();
@@ -51,6 +54,8 @@ export class SessionMonitor implements vscode.Disposable {
 	private readonly copilotTranscriptDirectories: string[];
 	private readonly copilotModelDirectories: string[];
 	private readonly languageModelsConfigurationPath: string;
+	private readonly stateDatabasePath: string;
+	private nativeStateDatabase: DatabaseSync | undefined;
 	private readonly watchedDirectories: string[];
 	private readonly directoryWatchers = new Map<string, FSWatcher>();
 	private readonly sessionStateCache = new SessionStateCache();
@@ -60,11 +65,11 @@ export class SessionMonitor implements vscode.Disposable {
 	private liveExportRunning = false;
 	private readonly liveExportTracker = new LiveExportTracker();
 	private liveExportTargetResource: string | undefined;
-	private eventClientCount = 0;
 	private scheduledPoll: NodeJS.Timeout | undefined;
 	private pollQueue = Promise.resolve();
 	private readonly fallbackPollTimer: NodeJS.Timeout;
 	private readonly liveExportTimer: NodeJS.Timeout;
+	private readonly nativeInputStateTimer: NodeJS.Timeout;
 	private readonly liveExportUri: vscode.Uri;
 	private readonly liveExportFileSystem = new LiveExportFileSystem();
 	private models: readonly ChatModelDescriptor[] = [];
@@ -85,6 +90,7 @@ export class SessionMonitor implements vscode.Disposable {
 			path.dirname(path.dirname(context.globalStorageUri.fsPath)),
 			'chatLanguageModels.json',
 		);
+		this.stateDatabasePath = path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
 		this.watchedDirectories = [...new Set([
 			...this.sessionDirectories,
 			...this.copilotTranscriptDirectories,
@@ -107,10 +113,17 @@ export class SessionMonitor implements vscode.Disposable {
 		this.fallbackPollTimer.unref();
 		this.liveExportTimer = setInterval(() => void this.refreshLiveExport(), liveExportIntervalMs);
 		this.liveExportTimer.unref();
+		this.nativeInputStateTimer = setInterval(() => void this.refreshNativeInputState(), nativeInputStatePollIntervalMs);
+		this.nativeInputStateTimer.unref();
 		this.schedulePoll();
 	}
 
 	getState(): MonitorState {
+		const sessions = this.getSessions();
+		const activeResource = this.activeSession?.resource;
+		const serializedSessions = sessions.map(session => activeResource === session.resource
+			? { ...session, turnCount: session.turns.length }
+			: { ...session, turnCount: session.turns.length, turns: [] });
 		return {
 			version: 1,
 			windowId: this.windowId,
@@ -118,15 +131,15 @@ export class SessionMonitor implements vscode.Disposable {
 			workspaceFolders: vscode.workspace.workspaceFolders?.map(folder => folder.uri.fsPath) ?? [],
 			startedAt: this.startedAt,
 			models: this.models,
-			sessions: this.getSessions(),
-			activeSession: this.activeSession,
+			sessions: serializedSessions,
+			activeSession: this.activeSession ? { ...this.activeSession, turnCount: this.activeSession.turns.length, turns: [] } : undefined,
+			activeSessionResource: activeResource,
 			outboundMessages: [...this.outboundMessages.values()],
 			error: this.error,
 		};
 	}
 
 	setEventClientCount(count: number): void {
-		this.eventClientCount = count;
 		if (count > 0) {
 			void this.refreshLiveExport(true);
 		}
@@ -176,7 +189,9 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
 		}
 		await focusChatSession(vscode.Uri.parse(targetSession.resource));
+		this.activeSession = targetSession;
 		this.liveExportTargetResource = targetSession.resource;
+		this.emit();
 		void this.refreshLiveExport(true);
 	}
 
@@ -361,6 +376,7 @@ export class SessionMonitor implements vscode.Disposable {
 	dispose(): void {
 		clearInterval(this.fallbackPollTimer);
 		clearInterval(this.liveExportTimer);
+		clearInterval(this.nativeInputStateTimer);
 		if (this.scheduledPoll) {
 			clearTimeout(this.scheduledPoll);
 		}
@@ -368,6 +384,8 @@ export class SessionMonitor implements vscode.Disposable {
 			watcher.close();
 		}
 		this.directoryWatchers.clear();
+		this.nativeStateDatabase?.close();
+		this.nativeStateDatabase = undefined;
 		for (const disposable of this.disposables) {
 			disposable.dispose();
 		}
@@ -429,9 +447,10 @@ export class SessionMonitor implements vscode.Disposable {
 			changed = await this.refreshSession(file) || changed;
 		}
 
-		const newest = this.getSessions()[0];
-		if (this.activeSession?.resource !== newest?.resource || this.activeSession !== newest) {
-			this.activeSession = newest;
+		const sessions = this.getSessions();
+		const active = sessions.find(session => session.resource === this.activeSession?.resource) ?? sessions[0];
+		if (this.activeSession !== active) {
+			this.activeSession = active;
 			changed = true;
 		}
 		if (changed) {
@@ -510,7 +529,7 @@ export class SessionMonitor implements vscode.Disposable {
 			: this.activeSession;
 		if (this.liveExportRunning
 			|| !targetSession
-			|| this.eventClientCount === 0 && !this.liveExportTracker.shouldSample(force, targetSession.status, Date.now())) {
+			|| !this.liveExportTracker.shouldSample(force, targetSession.status, Date.now())) {
 			return;
 		}
 
@@ -586,6 +605,39 @@ export class SessionMonitor implements vscode.Disposable {
 		this.modelCatalogRevision = snapshot.revision;
 		this.models = snapshot.models;
 		return true;
+	}
+
+	private async refreshNativeInputState(): Promise<void> {
+		try {
+			const commands = await vscode.commands.getCommands(true);
+			if (!commands.includes('_chat.voice.getCurrentSession')) {return;}
+			const resource = await vscode.commands.executeCommand<string | undefined>('_chat.voice.getCurrentSession');
+			if (!resource) {return;}
+			const session = this.getSessions().find(candidate => candidate.resource === resource);
+			if (!session) {return;}
+
+			const database = this.nativeStateDatabase ??= new DatabaseSync(this.stateDatabasePath, { readOnly: true });
+			try {
+				const rows = database.prepare("SELECT key, value FROM ItemTable WHERE key IN ('chat.currentLanguageModel.panel', 'chat.modelConfiguration.panel')").all() as Array<{ key: string; value: string }>;
+				const nativeState = parseNativeChatInputState(rows);
+				const modelId = nativeState.modelId;
+				const model = this.models.find(candidate => candidate.identifier === modelId);
+				if (!model) {return;}
+				const next = withNativeModelState(session.model, model, nativeState.configuration);
+				const selectedModelChanged = session.model?.selectedModelId !== next.selectedModelId;
+				const configurationChanged = JSON.stringify(session.model?.configuration ?? {}) !== JSON.stringify(next.configuration);
+				if ((selectedModelChanged || configurationChanged) && this.sessionStateCache.updateModel(resource, next)) {
+					this.activeSession = this.getSessions().find(candidate => candidate.resource === resource);
+					this.emit();
+				}
+			} catch (error) {
+				this.nativeStateDatabase?.close();
+				this.nativeStateDatabase = undefined;
+				throw error;
+			}
+		} catch {
+			// Native storage polling is opportunistic; persisted session watching remains the fallback.
+		}
 	}
 
 	private async updateProfileModelConfiguration(

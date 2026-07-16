@@ -342,3 +342,21 @@ export function mergeSessionModelState(
 		lastUsedModelId: live.lastUsedModelId ?? persisted.lastUsedModelId,
 	};
 }
+
+export function withNativeModelState(
+	current: SessionModelState | undefined,
+	model: ChatModelDescriptor,
+	configuration: Readonly<Record<string, ModelConfigurationValue>>,
+): SessionModelState {
+	const base = withSelectedModel(current, model);
+	const effectiveConfiguration = { ...base.configuration, ...configuration };
+	return {
+		...base,
+		lastUsedModelId: current?.lastUsedModelId,
+		configuration: effectiveConfiguration,
+		configurationFields: model.configurationFields.map(field => ({
+			...field,
+			value: effectiveConfiguration[field.key] ?? field.defaultValue,
+		})),
+	};
+}

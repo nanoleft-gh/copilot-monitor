@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.2]
+
+- Added one-second lightweight reverse synchronization for native VS Code model and model-configuration changes using exact current-session identity and read-only application storage keys.
+- Kept reverse synchronization independent of full transcript exports, DOM rendering, and workbench focus.
+- Confined horizontal scrolling to code and terminal blocks so long commands and unbroken lines no longer create a chat-wide scrollbar.
+
+## [1.0.1]
+
+- Stopped expensive full chat exports while sessions are idle and reduced working-session export cadence from five to two times per second.
+- Sent complete transcript bodies only for the selected chat while retaining accurate turn counts for inactive conversations.
+- Added bounded 40-turn transcript windows with Load earlier/newer controls and bounded search/message-jump expansion.
+- Capped long-chat message rails at 80 representative jump points.
+- Suppressed empty fenced code blocks that appeared as blank rectangles.
+- Stress-tested a 500-turn conversation at 40 rendered turns, 73 jumpers, roughly 603 DOM nodes, and zero empty code blocks.
+
 ## [1.0.0]
 
 - First public Visual Studio Marketplace release under the Nanoleft publisher.

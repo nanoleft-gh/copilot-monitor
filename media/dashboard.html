@@ -675,6 +675,7 @@
 			color: var(--muted);
 			font-size: 12px;
 			line-height: 1.45;
+			min-width: 0;
 		}
 
 		.activity[data-status="running"] {
@@ -701,17 +702,21 @@
 		}
 
 		.activity-body {
+			max-width: 100%;
 			min-width: 0;
 		}
 
 		.activity-head {
 			display: flex;
+			min-width: 0;
+			flex-wrap: wrap;
 			align-items: baseline;
 			justify-content: space-between;
 			gap: 10px;
 		}
 
 		.activity-meta {
+			max-width: 100%;
 			margin-top: 3px;
 			color: var(--muted);
 			font-family: "Cascadia Code", Consolas, monospace;
@@ -720,6 +725,7 @@
 		}
 
 		.terminal-output {
+			max-width: 100%;
 			margin-top: 8px;
 			border: 1px solid #343d39;
 			background: var(--code);
@@ -1230,13 +1236,18 @@
 
 		.transcript-scroll {
 			position: relative;
+			width: 100%;
+			min-width: 0;
 			background: var(--surface);
 			scroll-behavior: smooth;
+			overflow-x: hidden;
 		}
 
 		.transcript {
 			gap: 24px;
 			width: min(860px, calc(100% - 150px));
+			max-width: 100%;
+			min-width: 0;
 			padding: 28px 20px 48px;
 		}
 
@@ -1249,6 +1260,27 @@
 			border-radius: 6px;
 			box-shadow: 0 0 0 3px rgba(185, 138, 22, 0.24);
 		}
+
+		.history-loader {
+			display: flex;
+			justify-content: center;
+			padding: 2px 0 8px;
+		}
+
+		.history-loader button {
+			min-height: 30px;
+			padding: 5px 12px;
+			border: 1px solid var(--line);
+			border-radius: 5px;
+			background: var(--surface-soft);
+			color: var(--muted);
+			font-size: 10px;
+			font-weight: 650;
+			cursor: pointer;
+		}
+
+		.history-loader button:hover,
+		.history-loader button:focus-visible { border-color: var(--line-strong); color: var(--ink); outline: none; }
 
 		.user-message {
 			max-width: min(78%, 680px);
@@ -1271,10 +1303,14 @@
 		}
 
 		.assistant-content {
+			max-width: 100%;
+			min-width: 0;
 			padding-top: 1px;
 		}
 
 		.rich-text {
+			max-width: 100%;
+			min-width: 0;
 			font-size: 13.5px;
 			line-height: 1.55;
 		}
@@ -1335,6 +1371,8 @@
 		}
 
 		.code-block {
+			width: 100%;
+			max-width: 100%;
 			margin: 12px 0;
 			border-radius: 5px;
 		}
@@ -1345,6 +1383,8 @@
 		}
 
 		.activities {
+			max-width: 100%;
+			min-width: 0;
 			margin-top: 12px;
 		}
 
@@ -2547,6 +2587,11 @@
 			let searchMatches = [];
 			let searchMatchIndex = -1;
 			let mermaidRenderId = 0;
+			let visibleTurnStart = 0;
+			let visibleTurnEnd = 0;
+			let historyExpanded = false;
+			const transcriptWindowSize = 40;
+			const maximumMessageJumpers = 80;
 			const renderedTurns = new Map();
 			const boardStorageKey = 'copilot-monitor-board-v1';
 			const approvalWarningStorageKey = 'copilot-monitor-approval-warning-hidden-v1';
@@ -2647,7 +2692,8 @@
 				const sessions = selectedWindow?.sessions || [];
 				let session = sessions.find(item => item.resource === selectedSessionResource);
 				if (!session) {
-					session = selectedWindow?.activeSession || sessions[0];
+					const activeResource = selectedWindow?.activeSessionResource || selectedWindow?.activeSession?.resource;
+					session = sessions.find(item => item.resource === activeResource) || sessions[0];
 					selectedSessionResource = session?.resource || '';
 				}
 
@@ -2794,7 +2840,8 @@
 				const dot = document.createElement('span'); dot.className = 'mini-dot';
 				const label = document.createElement('span');
 				const statusLabel = session.status === 'working' ? 'Working' : session.status === 'loading' ? 'Loading' : 'Idle';
-				label.textContent = `${statusLabel} · ${session.turns.length} ${session.turns.length === 1 ? 'turn' : 'turns'}`;
+				const turnCount = session.turnCount ?? session.turns.length;
+				label.textContent = `${statusLabel} · ${turnCount} ${turnCount === 1 ? 'turn' : 'turns'}`;
 				meta.append(dot, label); main.append(title, meta);
 				const actions = document.createElement('div'); actions.className = 'session-card-actions';
 				const pin = document.createElement('button'); pin.type = 'button'; pin.className = 'session-action'; pin.textContent = '◆'; pin.title = 'Pin chat'; pin.setAttribute('aria-label', `Pin ${session.title}`); pin.dataset.active = String(isPinned(selectedWindow.windowId, session.resource));
@@ -3075,6 +3122,9 @@
 					renderedSessionId = sessionId;
 					renderedTurns.clear();
 					elements.transcript.replaceChildren();
+					visibleTurnStart = Math.max(0, (session?.turns.length || 0) - transcriptWindowSize);
+					visibleTurnEnd = session?.turns.length || 0;
+					historyExpanded = false;
 				}
 
 				const visiblePendingMessage = windowId === pendingWindowId && session?.resource === pendingSessionResource
@@ -3082,11 +3132,12 @@
 					: '';
 				if ((!session || session.turns.length === 0) && !visiblePendingMessage) {
 					renderedTurns.clear();
-					const emptyKey = session ? 'loading' : 'none';
+					const hasHistory = (session?.turnCount ?? 0) > 0;
+					const emptyKey = session ? hasHistory ? 'fetching' : 'loading' : 'none';
 					if (elements.transcript.firstElementChild?.dataset.emptyKey !== emptyKey) {
 						const empty = createEmptyState(
-							session ? 'Transcript is starting' : 'No active Copilot chat',
-							session ? 'Live turns will appear here as VS Code persists them.' : 'Open a GitHub Copilot chat panel in this VS Code window.',
+							session ? hasHistory ? 'Loading conversation' : 'Transcript is starting' : 'No active Copilot chat',
+							session ? hasHistory ? 'Fetching this chat from its VS Code window.' : 'Live turns will appear here as VS Code persists them.' : 'Open a GitHub Copilot chat panel in this VS Code window.',
 						);
 						empty.dataset.emptyKey = emptyKey;
 						elements.transcript.replaceChildren(empty);
@@ -3101,13 +3152,25 @@
 
 				const turns = session ? session.turns : [];
 				const desired = [];
-				for (let index = 0; index < turns.length; index++) {
+				if (!historyExpanded) {
+					visibleTurnStart = Math.max(0, turns.length - transcriptWindowSize);
+					visibleTurnEnd = turns.length;
+				}
+				visibleTurnStart = Math.min(visibleTurnStart, Math.max(0, turns.length - 1));
+				visibleTurnEnd = Math.max(visibleTurnStart, Math.min(visibleTurnEnd || turns.length, turns.length));
+				if (visibleTurnStart > 0) {
+					desired.push({ key: 'history-earlier', historyCount: visibleTurnStart, direction: 'earlier' });
+				}
+				for (let index = visibleTurnStart; index < visibleTurnEnd; index++) {
 					const isLast = index === turns.length - 1;
 					desired.push({
 						key: `turn:${turns[index].id}`,
 						turn: turns[index],
 						isLast,
 					});
+				}
+				if (visibleTurnEnd < turns.length) {
+					desired.push({ key: 'history-newer', historyCount: turns.length - visibleTurnEnd, direction: 'newer' });
 				}
 
 				if (visiblePendingMessage) {
@@ -3136,14 +3199,16 @@
 
 				for (let index = 0; index < desired.length; index++) {
 					const entry = desired[index];
-					const signature = JSON.stringify([entry.turn, entry.isLast]);
+					const signature = entry.key.startsWith('history-') ? `${entry.key}:${entry.historyCount}` : JSON.stringify([entry.turn, entry.isLast]);
 					let rendered = renderedTurns.get(entry.key);
 					if (!rendered || rendered.signature !== signature) {
-						const element = buildTurn(entry.turn, entry.isLast, {
-							windowId,
-							sessionResource: session?.resource || '',
-							requestId: entry.turn.id,
-						});
+						const element = entry.key.startsWith('history-')
+							? buildHistoryLoader(entry.historyCount, entry.direction, session, windowId)
+							: buildTurn(entry.turn, entry.isLast, {
+								windowId,
+								sessionResource: session?.resource || '',
+								requestId: entry.turn.id,
+							});
 						if (rendered?.element.isConnected) {
 							const thinkingWasOpen = rendered.element.querySelector('.thinking')?.open;
 							const nextThinking = element.querySelector('.thinking');
@@ -3169,10 +3234,36 @@
 				}
 			}
 
+			function buildHistoryLoader(count, direction, session, windowId) {
+				const container = document.createElement('div');
+				container.className = 'history-loader';
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.textContent = `Load ${direction} messages (${count})`;
+				button.addEventListener('click', () => {
+					const anchor = elements.transcript.querySelector('.turn[data-turn-key]');
+					const before = anchor?.getBoundingClientRect().top;
+					if (direction === 'earlier') visibleTurnStart = Math.max(0, visibleTurnStart - transcriptWindowSize);
+					else visibleTurnEnd = Math.min(session.turns.length, visibleTurnEnd + transcriptWindowSize);
+					historyExpanded = true;
+					renderTranscript(session, windowId);
+					if (anchor && before !== undefined) {
+						const after = anchor.getBoundingClientRect().top;
+						elements.transcriptScroll.scrollTop += after - before;
+					}
+				});
+				container.append(button);
+				return container;
+			}
+
 			function renderMessageNavigator(session) {
 				const turns = session?.turns || [];
 				elements.messageRail.hidden = turns.length === 0;
-				elements.railTrack.replaceChildren(...turns.map((turn, index) => {
+				const step = Math.max(1, Math.ceil(turns.length / maximumMessageJumpers));
+				const indexedTurns = turns
+					.map((turn, index) => ({ turn, index }))
+					.filter(({ index }) => index === 0 || index === turns.length - 1 || index % step === 0);
+				elements.railTrack.replaceChildren(...indexedTurns.map(({ turn, index }) => {
 					const button = document.createElement('button');
 					button.type = 'button';
 					button.className = 'message-jump';
@@ -3191,7 +3282,19 @@
 			}
 
 			function jumpToTurn(turnKey) {
-				const turn = elements.transcript.querySelector(`[data-turn-key="${CSS.escape(turnKey)}"]`);
+				let turn = elements.transcript.querySelector(`[data-turn-key="${CSS.escape(turnKey)}"]`);
+				if (!turn) {
+					const session = getSelectedSession();
+					const targetId = turnKey.startsWith('turn:') ? turnKey.slice(5) : '';
+					const index = session?.turns.findIndex(candidate => candidate.id === targetId) ?? -1;
+					if (session && index >= 0) {
+						visibleTurnStart = Math.max(0, index - 3);
+						visibleTurnEnd = Math.min(session.turns.length, visibleTurnStart + transcriptWindowSize);
+						historyExpanded = true;
+						renderTranscript(session, getSelectedWindow()?.windowId);
+						turn = elements.transcript.querySelector(`[data-turn-key="${CSS.escape(turnKey)}"]`);
+					}
+				}
 				turn?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 			}
 
@@ -3348,6 +3451,10 @@
 				let match;
 				while ((match = fence.exec(value)) !== null) {
 					appendTextBlock(root, value.slice(cursor, match.index));
+					if (!match[2].trim()) {
+						cursor = fence.lastIndex;
+						continue;
+					}
 					if (match[1].trim().toLowerCase() === 'mermaid') {
 						root.append(createMermaidDiagram(match[2].replace(/\n$/, '')));
 						cursor = fence.lastIndex;
@@ -3854,7 +3961,14 @@
 				});
 			}, { passive: true });
 			elements.goTop.addEventListener('click', () => elements.transcriptScroll.scrollTo({ top: 0, behavior: 'smooth' }));
-			elements.goBottom.addEventListener('click', () => elements.transcriptScroll.scrollTo({ top: elements.transcriptScroll.scrollHeight, behavior: 'smooth' }));
+			elements.goBottom.addEventListener('click', () => {
+				const session = getSelectedSession();
+				if (session) {
+					historyExpanded = false;
+					renderTranscript(session, getSelectedWindow()?.windowId);
+				}
+				elements.transcriptScroll.scrollTo({ top: elements.transcriptScroll.scrollHeight, behavior: 'smooth' });
+			});
 			elements.searchButton.addEventListener('click', openMessageSearch);
 			elements.sidebarSearchButton.addEventListener('click', openMessageSearch);
 			elements.searchClose.addEventListener('click', closeMessageSearch);

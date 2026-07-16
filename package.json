@@ -3,7 +3,7 @@
   "publisher": "nanoleft",
   "displayName": "Copilot Monitor",
   "description": "Monitor and remotely control local GitHub Copilot Chat sessions from a responsive LAN dashboard.",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -89,7 +89,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "npm run compile && node --test out/test/transcript.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/liveExportTracker.test.js out/test/sessionMatcher.test.js out/test/sessionStateCache.test.js out/test/toolDecision.test.js out/test/windowRegistry.test.js out/test/aggregateMonitor.test.js out/test/gateway.test.js out/test/monitorServer.test.js",
+    "test": "npm run compile && node --test out/test/transcript.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/nativeChatInputState.test.js out/test/liveExportTracker.test.js out/test/sessionMatcher.test.js out/test/sessionStateCache.test.js out/test/toolDecision.test.js out/test/windowRegistry.test.js out/test/aggregateMonitor.test.js out/test/gateway.test.js out/test/monitorServer.test.js",
     "test:integration": "vscode-test",
     "package": "npm run compile && npx --yes @vscode/vsce package --no-dependencies",
     "publish:marketplace": "npm test && npx --yes @vscode/vsce publish --no-dependencies"

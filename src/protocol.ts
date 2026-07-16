@@ -8,6 +8,7 @@ export interface ActiveSessionState {
 	readonly revision: string;
 	readonly updatedAt?: number;
 	readonly turns: readonly TranscriptTurn[];
+	readonly turnCount?: number;
 	readonly model?: SessionModelState;
 	readonly permissionLevel: ChatPermissionLevel;
 }
@@ -75,6 +76,7 @@ export interface MonitorState {
 	readonly models: readonly ChatModelDescriptor[];
 	readonly sessions: readonly ActiveSessionState[];
 	readonly activeSession?: ActiveSessionState;
+	readonly activeSessionResource?: string;
 	readonly outboundMessages: readonly OutboundMessageState[];
 	readonly error?: string;
 }

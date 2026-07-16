@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, it } from 'node:test';
-import { mergeSessionModelState, parseModelCatalog, parseSessionModelState, readLatestModelCatalog, withSelectedModel } from '../modelCatalog';
+import { mergeSessionModelState, parseModelCatalog, parseSessionModelState, readLatestModelCatalog, withNativeModelState, withSelectedModel } from '../modelCatalog';
 
 describe('model catalog', () => {
 	it('filters picker models and derives effort/context options', () => {
@@ -99,5 +99,16 @@ describe('model catalog', () => {
 		assert.equal(merged?.selectedModelId, 'copilot/gpt-test');
 		assert.equal(merged?.lastUsedModelId, 'copilot/gpt-test');
 		assert.equal(merged?.configuration.reasoningEffort, 'high');
+	});
+
+	it('overlays native selected model configuration on the exact session state', () => {
+		const model = parseModelCatalog([{
+			id: 'model-a', name: 'Model A', vendor: 'Provider', version: '1', model_picker_enabled: true,
+			capabilities: { family: 'model-a', limits: {}, supports: { reasoning_effort: ['low', 'high'] } },
+		}]).find(candidate => candidate.id === 'model-a')!;
+		const state = withNativeModelState(undefined, model, { reasoningEffort: 'high' });
+		assert.equal(state.selectedModelId, 'copilot/model-a');
+		assert.equal(state.configuration.reasoningEffort, 'high');
+		assert.equal(state.configurationFields[0].value, 'high');
 	});
 });
