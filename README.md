@@ -100,7 +100,7 @@ All windows publish through the same port and URL. Windows Firewall may ask whet
 - `githubCopilotMonitor.port`: stable LAN gateway port shared by all windows. Default: `43121`.
 
 ## Commands
-
+`ctrl+shift+p` -> 
 - `Copilot Monitor: Start Dashboard`
 - `Copilot Monitor: Stop Dashboard`
 - `Copilot Monitor: Open Dashboard`
