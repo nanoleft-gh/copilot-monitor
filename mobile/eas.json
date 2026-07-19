@@ -1,0 +1,28 @@
+{
+  "cli": {
+    "version": ">= 21.0.2",
+    "appVersionSource": "local",
+    "requireCommit": false
+  },
+  "build": {
+    "github-android": {
+      "distribution": "internal",
+      "credentialsSource": "remote",
+      "node": "24.11.0",
+      "pnpm": "10.26.2",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "github-ios": {
+      "distribution": "internal",
+      "credentialsSource": "remote",
+      "node": "24.11.0",
+      "pnpm": "10.26.2",
+      "ios": {
+        "simulator": false,
+        "buildConfiguration": "Release"
+      }
+    }
+  }
+}

@@ -9,15 +9,20 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "icon": "./assets/images/copilot-monitor-icon.png",
+      "buildNumber": "1000",
       "supportsTablet": true,
       "bundleIdentifier": "com.nanoleft.copilotmonitor",
       "infoPlist": {
         "NSCameraUsageDescription": "Allow Copilot Monitor to scan a pairing code from VS Code.",
         "NSLocalNetworkUsageDescription": "Copilot Monitor connects securely to paired computers on your local network.",
-        "NSMicrophoneUsageDescription": "Allow Copilot Monitor to record voice dictation for transcription on your paired computer."
+        "NSMicrophoneUsageDescription": "Allow Copilot Monitor to record voice dictation for transcription on your paired computer.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
       }
     },
     "android": {
+      "versionCode": 1000,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/copilot-monitor-icon.png",
@@ -26,7 +31,10 @@
       "predictiveBackGestureEnabled": false,
       "package": "com.nanoleft.copilotmonitor",
       "usesCleartextTraffic": true,
-      "allowBackup": false
+      "allowBackup": false,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "output": "static",
@@ -54,6 +62,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "0155609f-9678-47df-b2f1-c82fcb84b9fd"
+      }
+    },
+    "owner": "nanoleft"
   }
 }
