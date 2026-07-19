@@ -1,5 +1,9 @@
 # Mobile Changelog
 
+## [0.1.1]
+
+- Fixed release APK connections to local HTTP gateways by applying Android cleartext traffic permission during every native prebuild.
+
 ## [0.1.0]
 
 - Initial Android and iOS companion application for Copilot Monitor.

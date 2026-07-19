@@ -2,7 +2,7 @@
   "expo": {
     "name": "Copilot Monitor",
     "slug": "copilot-monitor",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "orientation": "default",
     "icon": "./assets/images/copilot-monitor-icon.png",
     "scheme": "copilot-monitor",
@@ -30,17 +30,14 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.nanoleft.copilotmonitor",
-      "usesCleartextTraffic": true,
-      "allowBackup": false,
-      "permissions": [
-        "android.permission.CAMERA"
-      ]
+      "allowBackup": false
     },
     "web": {
       "output": "static",
       "favicon": "./assets/images/copilot-monitor-icon.png"
     },
     "plugins": [
+      "./plugins/with-android-cleartext-traffic",
       "expo-router",
       [
         "expo-camera",
