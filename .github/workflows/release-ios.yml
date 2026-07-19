@@ -1,0 +1,128 @@
+name: Release iOS App (Paused)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-ios
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Check iOS version
+    if: vars.ENABLE_IOS_RELEASE == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.gate.outputs.should_release }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      release_name: ${{ steps.metadata.outputs.releaseName }}
+      changelog: ${{ steps.metadata.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Read release metadata
+        id: metadata
+        run: node .github/scripts/release-metadata.mjs ios
+
+      - name: Check scoped release tag
+        id: gate
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "### Release skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$TAG\` already exists. No EAS build or release was created." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "### Release required" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$TAG\` is not published yet." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    name: Build and release iOS
+    needs: gate
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.26.2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.11.0
+          cache: pnpm
+          cache-dependency-path: mobile/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate mobile app
+        run: pnpm validate
+
+      - name: Verify EAS secrets
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          [[ -n "$EXPO_TOKEN" ]] || { echo "::error::Add the EXPO_TOKEN repository secret."; exit 1; }
+
+      - name: Set up EAS CLI
+        uses: expo/expo-github-action@v9
+        with:
+          eas-version: 21.0.2
+          token: ${{ secrets.EXPO_TOKEN }}
+          packager: npm
+
+      - name: Prepare build version
+        run: node ../.github/scripts/prepare-mobile-build.mjs
+
+      - name: Build signed IPA with EAS
+        run: eas build --platform ios --profile github-ios --wait --json --non-interactive > eas-build.json
+
+      - name: Read EAS artifact metadata
+        id: artifact
+        run: node ../.github/scripts/eas-artifact.mjs eas-build.json "$GITHUB_OUTPUT"
+
+      - name: Download IPA
+        env:
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact_url }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          mkdir -p release
+          curl --fail --location --retry 3 --output "release/copilot-monitor-ios-$VERSION.ipa" "$ARTIFACT_URL"
+          sha256sum "release/copilot-monitor-ios-$VERSION.ipa" > "release/copilot-monitor-ios-$VERSION.ipa.sha256"
+
+      - name: Extract release notes
+        run: node ../.github/scripts/extract-changelog.mjs CHANGELOG.md "${{ needs.gate.outputs.version }}" release/notes.md
+
+      - name: Add distribution notice to notes
+        env:
+          BUILD_ID: ${{ steps.artifact.outputs.build_id }}
+        run: |
+          printf '\n---\n\nAd hoc iOS IPA built by EAS Build (`%s`). It only installs on devices included in its Apple provisioning profile.\n' "$BUILD_ID" >> release/notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.gate.outputs.release_name }}
+          body_path: mobile/release/notes.md
+          fail_on_unmatched_files: true
+          files: |
+            mobile/release/copilot-monitor-ios-${{ needs.gate.outputs.version }}.ipa
+            mobile/release/copilot-monitor-ios-${{ needs.gate.outputs.version }}.ipa.sha256
