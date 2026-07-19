@@ -14,7 +14,7 @@
   },
   "homepage": "https://github.com/nanoleft-gh/copilot-monitor#readme",
   "engines": {
-    "vscode": "^1.128.0"
+    "vscode": "^1.125.0"
   },
   "categories": [
     "Other"
@@ -113,7 +113,7 @@
     "publish:marketplace": "npm test && npx --yes @vscode/vsce publish --no-dependencies"
   },
   "devDependencies": {
-    "@types/vscode": "^1.128.0",
+    "@types/vscode": "^1.125.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
     "typescript-eslint": "^8.61.1",
