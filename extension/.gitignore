@@ -1,0 +1,12 @@
+/out/
+/dist/
+/node_modules/
+/.vscode-test/
+/.research/
+/.playwright-mcp/
+/.vscode/
+/coverage/
+*.vsix
+*.log
+*.tsbuildinfo
+[Nn][Uu][Ll]

@@ -1,9 +1,42 @@
-out
-dist
-node_modules
-.vscode-test/
-.research/
-*.vsix
-.playwright-mcp/
+# Dependencies
+**/node_modules/
+
+# Build and test output
+**/out/
+**/dist/
+**/dist-*/
+**/web-build/
+**/coverage/
+**/.vscode-test/
+**/.expo/
+**/.research/
+**/.playwright-mcp/
+**/*.tsbuildinfo
+
+# Packaged applications
+**/*.vsix
+**/*.apk
+**/*.aab
+
+# Local environment and signing material
+**/.env*.local
+**/*.jks
+**/*.keystore
+**/*.p8
+**/*.p12
+**/*.key
+**/*.mobileprovision
+**/*.pem
+
+# Logs and package-manager diagnostics
+**/*.log
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/pnpm-debug.log*
+
+# Editor and OS files
 .vscode/
-nul
+**/.DS_Store
+**/Thumbs.db
+[Nn][Uu][Ll]

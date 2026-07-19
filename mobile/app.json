@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "Copilot Monitor",
+    "slug": "copilot-monitor",
+    "version": "0.1.0",
+    "orientation": "default",
+    "icon": "./assets/images/copilot-monitor-icon.png",
+    "scheme": "copilot-monitor",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "icon": "./assets/images/copilot-monitor-icon.png",
+      "supportsTablet": true,
+      "bundleIdentifier": "com.nanoleft.copilotmonitor",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Allow Copilot Monitor to scan a pairing code from VS Code.",
+        "NSLocalNetworkUsageDescription": "Copilot Monitor connects securely to paired computers on your local network.",
+        "NSMicrophoneUsageDescription": "Allow Copilot Monitor to record voice dictation for transcription on your paired computer."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/images/copilot-monitor-icon.png",
+        "monochromeImage": "./assets/images/copilot-monitor-icon.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.nanoleft.copilotmonitor",
+      "usesCleartextTraffic": true,
+      "allowBackup": false
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/copilot-monitor-icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Copilot Monitor to scan a pairing code from VS Code.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#111111",
+          "image": "./assets/images/splash-icon.png",
+          "imageWidth": 76
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
