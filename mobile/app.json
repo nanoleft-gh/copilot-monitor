@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "icon": "./assets/images/copilot-monitor-icon.png",
-      "buildNumber": "1000",
+      "buildNumber": "1001",
       "supportsTablet": true,
       "bundleIdentifier": "com.nanoleft.copilotmonitor",
       "infoPlist": {
@@ -22,7 +22,7 @@
       }
     },
     "android": {
-      "versionCode": 1000,
+      "versionCode": 1001,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/copilot-monitor-icon.png",
