@@ -9,7 +9,9 @@ import * as path from 'node:path';
  * replaced — `fs.watch` on Windows reports none of that on the deleted handle itself.
  * Whenever the directory (re)appears, consumers receive a `reconcile` event to catch up.
  * Watcher errors tear down and re-attach after a short delay. There is no polling: the
- * only timer is the recovery delay, and it exists only while broken.
+ * only timer is the recovery delay, armed while broken and once after attaching a fresh
+ * ancestor watch while the directory is still missing (a `mkdir -p` can create it between
+ * the existence check and the watch, and the new watch would never report it).
  */
 
 export type DirectoryEvent =
@@ -72,13 +74,25 @@ export class DirectoryWatcher {
 		}
 
 		const ancestor = nearestExisting(path.dirname(this.directory));
-		if (ancestor !== this.ancestorPath || !this.ancestorWatcher) {
+		const reattached = ancestor !== this.ancestorPath || !this.ancestorWatcher;
+		if (reattached) {
 			this.closeAncestor();
 			if (ancestor) {
 				this.openAncestor(ancestor);
 			}
 		}
 		if (!ancestor || (targetExists && !this.targetWatcher)) {
+			this.scheduleRetry();
+			return;
+		}
+		if (reattached && !this.targetWatcher) {
+			// A fresh ancestor watch cannot report anything created before it was attached. Look
+			// again right away, and once more after the retry delay in case the kernel event was
+			// lost in that gap; the retry re-arms only if this branch runs again.
+			if (existsSync(this.directory)) {
+				this.reconcileWatchers(true);
+				return;
+			}
 			this.scheduleRetry();
 		}
 	}

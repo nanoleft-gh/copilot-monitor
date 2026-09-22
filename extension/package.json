@@ -3,7 +3,7 @@
   "publisher": "nanoleft",
   "displayName": "Copilot Monitor",
   "description": "Monitor and remotely control local GitHub Copilot Chat sessions from a responsive LAN dashboard.",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "license": "MIT",
   "repository": {
     "type": "git",
