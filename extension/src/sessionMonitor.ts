@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import { createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, releaseChatSession, selectChatModel, sendPrompt, setChatPermissionLevel } from './chatBridge';
 import { LiveExportFileSystem, liveExportScheme } from './liveExportFileSystem';
 import { LiveExportTracker } from './liveExportTracker';
-import { mergeConfigurationFields, mergeSessionModelState, parseSessionModelState, readLatestModelCatalog, withNativeModelState, withSelectedModel } from './modelCatalog';
+import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFields, mergeSessionModelState, ModelCatalog, parseCachedLanguageModels, parseSessionModelState, selectedModelValue, withNativeModelState, withSelectedModel } from './modelCatalog';
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
@@ -47,9 +47,8 @@ import { normalizeTranscript, TranscriptTurn } from './transcript';
 
 const maximumMessageLength = 32_000;
 const maximumOutboundHistory = 20;
-const modelCatalogMinimumIntervalMs = 10_000;
 const nativeStateDatabaseFiles = new Set(['state.vscdb', 'state.vscdb-wal', 'state.vscdb-shm']);
-const persistWaitAttempts = 40;
+const persistWaitAttempts = 20;
 const persistWaitDelayMs = 50;
 const maximumProgressiveIndexCacheFiles = 64;
 const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
@@ -73,9 +72,12 @@ export class SessionMonitor implements vscode.Disposable {
 	private readonly core: SessionCore;
 	private readonly sessionDirectories: string[];
 	private readonly copilotTranscriptDirectories: string[];
-	private readonly copilotModelDirectories: string[];
+	private readonly copilotDebugLogDirectories: string[];
 	private readonly languageModelsConfigurationPath: string;
+	/** PROFILE-scoped storage: the panel's selected model. */
 	private readonly profileStateDatabasePath: string;
+	/** APPLICATION-scoped storage: cached model list and per-model configuration. */
+	private readonly applicationStateDatabasePath: string;
 	private readonly progressiveIndexDirectory: string;
 	private readonly progressiveAbortController = new AbortController();
 	private readonly progressiveMutationIndexes = new Map<string, PagedMutationHistoryIndex>();
@@ -86,14 +88,17 @@ export class SessionMonitor implements vscode.Disposable {
 	private readonly nativeInputStateSync: NativeInputStateSync;
 	private readonly createSessionOperations = new Map<string, Promise<CreateSessionResult>>();
 	private nativeStateDatabase: DatabaseSync | undefined;
+	private applicationStateDatabase: DatabaseSync | undefined;
 	private nativeStateDatabaseNeedsReconnect = false;
 	private nativeStateRetryAttempted = false;
 	private lastNativeInputFingerprint: string | undefined;
 	private nativeModelOverride: { resource: string; model: NonNullable<ActiveSessionState['model']> } | undefined;
-	private models: readonly ChatModelDescriptor[] = [];
-	private modelCatalogRevision: string | undefined;
-	private lastModelCatalogScanAt = 0;
-	private modelCatalogRefreshing: Promise<boolean> | undefined;
+	/** The chat VS Code itself has focused, as last observed. */
+	private nativeCurrentSessionResource: string | undefined;
+	private catalog: ModelCatalog = emptyModelCatalog;
+	private catalogRaw: string | undefined;
+	/** Sessions this window created on behalf of a viewer; shown even while still empty. */
+	private readonly createdSessionResources = new Set<string>();
 	private exportSnapshot: ExportSnapshot | undefined;
 	private exportRunning: Promise<void> | undefined;
 	private readonly probedToolCalls = new Set<string>();
@@ -113,18 +118,19 @@ export class SessionMonitor implements vscode.Disposable {
 		this.disposables.push(this.changeEmitter);
 		this.sessionDirectories = resolveSessionDirectories(context);
 		this.copilotTranscriptDirectories = resolveCopilotTranscriptDirectories(context);
-		this.copilotModelDirectories = resolveCopilotModelDirectories(context);
+		this.copilotDebugLogDirectories = resolveCopilotDebugLogDirectories(context);
 		this.progressiveIndexDirectory = path.join(context.globalStorageUri.fsPath, 'progressive-history');
 		this.languageModelsConfigurationPath = path.join(
 			path.dirname(path.dirname(context.globalStorageUri.fsPath)),
 			'chatLanguageModels.json',
 		);
-		this.profileStateDatabasePath = path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
+		this.profileStateDatabasePath = resolveProfileStateDatabasePath(context);
+		this.applicationStateDatabasePath = resolveApplicationStateDatabasePath(context);
 		this.core = new SessionCore({
 			paths: {
 				sessionDirectories: this.sessionDirectories,
 				transcriptDirectories: this.copilotTranscriptDirectories,
-				debugLogDirectories: this.copilotModelDirectories,
+				debugLogDirectories: this.copilotDebugLogDirectories,
 				indexDatabasePath: resolveSessionIndexDatabasePath(context),
 			},
 			log: message => this.log(`[core] ${message}`),
@@ -141,7 +147,9 @@ export class SessionMonitor implements vscode.Disposable {
 
 	getState(): MonitorState {
 		const coreState = this.core.getState();
-		const sessions = coreState.sessions.map(session => this.decorateSession(session));
+		const sessions = coreState.sessions
+			.filter(session => this.isSessionVisible(session, coreState.activeSessionResource))
+			.map(session => this.decorateSession(session));
 		const active = sessions.find(session => session.resource === coreState.activeSessionResource);
 		return {
 			version: 1,
@@ -149,7 +157,7 @@ export class SessionMonitor implements vscode.Disposable {
 			workspaceName: vscode.workspace.name ?? 'Untitled workspace',
 			workspaceFolders: vscode.workspace.workspaceFolders?.map(folder => folder.uri.fsPath) ?? [],
 			startedAt: this.startedAt,
-			models: this.models,
+			models: this.catalog.models,
 			sessions,
 			activeSession: active ? { ...active, turns: [] } : undefined,
 			activeSessionResource: coreState.activeSessionResource,
@@ -158,15 +166,25 @@ export class SessionMonitor implements vscode.Disposable {
 		};
 	}
 
+	/**
+	 * Blank chats VS Code left behind are noise, except the one somebody is actually looking at:
+	 * the viewer's selection, the chat focused in VS Code, or a chat a viewer just created.
+	 */
+	private isSessionVisible(session: ActiveSessionState, activeSessionResource: string | undefined): boolean {
+		if (session.isEmpty !== true || session.status === 'working') {
+			return true;
+		}
+		return session.resource === activeSessionResource
+			|| session.resource === this.nativeCurrentSessionResource
+			|| this.createdSessionResources.has(session.resource);
+	}
+
 	/** Viewers gate all work in the core, the native-state watcher, and the model catalog. */
 	setEventClientCount(count: number): void {
 		const hadClients = this.eventClientCount > 0;
 		this.eventClientCount = count;
 		if (count > 0 && !hadClients) {
-			void this.core.setViewerCount(count).then(() => {
-				void this.refreshModelCatalog(true);
-				this.nativeInputStateSync.start();
-			});
+			void this.startViewing(count);
 		} else if (count === 0 && hadClients) {
 			this.nativeInputStateSync.stop();
 			this.exportSnapshot = undefined;
@@ -175,6 +193,32 @@ export class SessionMonitor implements vscode.Disposable {
 		} else if (count > 0) {
 			void this.core.setViewerCount(count);
 		}
+	}
+
+	/** First viewer: open on the chat VS Code has focused, then let the core attach. */
+	private async startViewing(count: number): Promise<void> {
+		if (!this.core.activeSession) {
+			const focused = await this.readNativeCurrentSession();
+			const sessionId = focused ? sessionIdFromResource(focused) : undefined;
+			if (sessionId) {
+				await this.core.selectSession(sessionId);
+			}
+		}
+		await this.core.setViewerCount(count);
+		this.nativeInputStateSync.start();
+	}
+
+	private async readNativeCurrentSession(): Promise<string | undefined> {
+		try {
+			const resource = await vscode.commands.executeCommand<string | undefined>('_chat.voice.getCurrentSession');
+			if (typeof resource === 'string' && resource) {
+				this.nativeCurrentSessionResource = resource;
+				return resource;
+			}
+		} catch {
+			// Older builds may not expose the command; the core falls back to the newest chat.
+		}
+		return undefined;
 	}
 
 	async sendMessage(request: SendMessageRequest): Promise<SendMessageResult> {
@@ -282,11 +326,12 @@ export class SessionMonitor implements vscode.Disposable {
 
 	async selectModel(request: ModelSelectionRequest): Promise<void> {
 		const targetSession = this.requireIdleSession(request.sessionResource, 'Wait for the active response to finish before changing models.');
-		const model = this.models.find(candidate => candidate.identifier === request.modelId || candidate.id === request.modelId);
+		const model = this.catalog.models.find(candidate => candidate.identifier === request.modelId || candidate.id === request.modelId);
 		if (!model) {
 			throw new MonitorRequestError(409, 'The requested model is no longer available in this VS Code window.');
 		}
 		await selectChatModel(vscode.Uri.parse(targetSession.resource), { id: model.id, vendor: model.vendor });
+		this.nativeCurrentSessionResource = targetSession.resource;
 		this.nativeModelOverride = { resource: targetSession.resource, model: withSelectedModel(targetSession.model, model) };
 		this.emit();
 		this.nativeInputStateSync.requestRefresh(0);
@@ -297,7 +342,7 @@ export class SessionMonitor implements vscode.Disposable {
 		if (targetSession.model?.selectedModelId !== request.modelId) {
 			throw new MonitorRequestError(409, 'The selected model changed before its configuration could be updated.');
 		}
-		const model = this.models.find(candidate => candidate.identifier === request.modelId);
+		const model = this.catalog.models.find(candidate => candidate.identifier === request.modelId);
 		const fields = mergeConfigurationFields(
 			model?.configurationFields ?? [],
 			targetSession.model.configurationFields,
@@ -314,19 +359,37 @@ export class SessionMonitor implements vscode.Disposable {
 		// Opening and closing the session in an editor makes VS Code persist its current state now.
 		await releaseChatSession(resource);
 		try {
-			const persisted = await this.waitForPersistedModel(sessionId, request.modelId);
-			if (!persisted) {
-				throw new MonitorRequestError(409, 'VS Code is still applying the selected model. Try the configuration change again.');
+			const selectedModel = await this.waitForPersistedModel(sessionId, request.modelId)
+				?? this.selectedModelFromCatalog(request.modelId, targetSession.model.configuration);
+			if (!selectedModel) {
+				throw new MonitorRequestError(409, 'VS Code has not persisted the selected model for this chat yet. Try again in a moment.');
 			}
-			const stateLike = { inputState: { selectedModel: persisted } };
-			const mutation = createSessionModelConfigurationMutation(stateLike, request.modelId, request.key, request.value);
+			const mutation = createSessionModelConfigurationMutation({ inputState: { selectedModel } }, request.modelId, request.key, request.value);
 			await this.appendMutation(file.filePath, mutation);
 			await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
 			await this.core.pokeSession(sessionId);
+			if (this.nativeModelOverride?.resource === request.sessionResource) {
+				const current = this.nativeModelOverride.model;
+				const configuration = { ...current.configuration, [request.key]: request.value };
+				this.nativeModelOverride = {
+					resource: request.sessionResource,
+					model: { ...current, configuration, configurationFields: current.configurationFields.map(item => ({ ...item, value: configuration[item.key] ?? item.value })) },
+				};
+			}
 			this.emit();
 		} finally {
 			await focusChatSession(resource);
 		}
+	}
+
+	/**
+	 * VS Code persists `inputState.selectedModel` as the cached catalog entry plus the model
+	 * configuration, so the same value can be produced from the catalog when the session log
+	 * has not caught up with a selection VS Code already made.
+	 */
+	private selectedModelFromCatalog(modelId: string, configuration: Readonly<Record<string, string | number | boolean>>): Record<string, unknown> | undefined {
+		const entry = this.catalog.entries.get(modelId);
+		return entry ? selectedModelValue(entry, configuration) : undefined;
 	}
 
 	async renameSession(request: RenameSessionRequest): Promise<void> {
@@ -422,8 +485,7 @@ export class SessionMonitor implements vscode.Disposable {
 		this.progressiveAbortController.abort();
 		this.nativeInputStateSync.dispose();
 		this.core.dispose();
-		this.nativeStateDatabase?.close();
-		this.nativeStateDatabase = undefined;
+		this.closeNativeStateDatabases();
 		for (const disposable of this.disposables) {
 			disposable.dispose();
 		}
@@ -439,7 +501,6 @@ export class SessionMonitor implements vscode.Disposable {
 			}
 		}
 		this.error = undefined;
-		void this.refreshModelCatalog(false);
 		this.scheduleStallProbe(coreState.sessions.find(session => session.resource === coreState.activeSessionResource));
 		this.emit();
 	}
@@ -576,92 +637,73 @@ export class SessionMonitor implements vscode.Disposable {
 
 	// #region model catalog & native input state
 
-	private refreshModelCatalog(force: boolean): Promise<boolean> {
-		if (this.modelCatalogRefreshing) {
-			return this.modelCatalogRefreshing;
-		}
-		const now = Date.now();
-		if (!force && now - this.lastModelCatalogScanAt < modelCatalogMinimumIntervalMs) {
-			return Promise.resolve(false);
-		}
-		this.lastModelCatalogScanAt = now;
-		this.modelCatalogRefreshing = (async () => {
-			try {
-				const snapshot = await readLatestModelCatalog(this.copilotModelDirectories);
-				if (!snapshot || snapshot.revision === this.modelCatalogRevision) {
-					return false;
-				}
-				this.modelCatalogRevision = snapshot.revision;
-				this.models = snapshot.models;
-				this.nativeInputStateSync.requestRefresh(0);
-				this.emit();
-				return true;
-			} catch (error) {
-				this.log(`model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-				return false;
-			} finally {
-				this.modelCatalogRefreshing = undefined;
-			}
-		})();
-		return this.modelCatalogRefreshing;
-	}
-
 	private createNativeInputStateWatcher(onChange: () => void, onError: () => void): NativeInputStateWatcher {
-		const watcher = watch(path.dirname(this.profileStateDatabasePath), { persistent: false }, (eventType, fileName) => {
-			const name = fileName ? path.basename(String(fileName)) : undefined;
-			if (name && !nativeStateDatabaseFiles.has(name)) {
-				return;
-			}
-			if (!name || (eventType === 'rename' && name === path.basename(this.profileStateDatabasePath))) {
-				this.nativeStateDatabaseNeedsReconnect = true;
-			}
-			onChange();
+		const directories = new Set([path.dirname(this.profileStateDatabasePath), path.dirname(this.applicationStateDatabasePath)]);
+		const watchers = [...directories].map(directory => {
+			const watcher = watch(directory, { persistent: false }, (eventType, fileName) => {
+				const name = fileName ? path.basename(String(fileName)) : undefined;
+				if (name && !nativeStateDatabaseFiles.has(name)) {
+					return;
+				}
+				if (!name || (eventType === 'rename' && name === 'state.vscdb')) {
+					this.nativeStateDatabaseNeedsReconnect = true;
+				}
+				onChange();
+			});
+			watcher.on('error', onError);
+			return watcher;
 		});
-		watcher.on('error', onError);
-		return { dispose: () => watcher.close() };
+		return { dispose: () => watchers.forEach(watcher => watcher.close()) };
 	}
 
+	private closeNativeStateDatabases(): void {
+		this.nativeStateDatabase?.close();
+		this.nativeStateDatabase = undefined;
+		if (this.applicationStateDatabase !== undefined) {
+			this.applicationStateDatabase.close();
+			this.applicationStateDatabase = undefined;
+		}
+	}
+
+	private openNativeStateDatabases(): { profile: DatabaseSync; application: DatabaseSync } {
+		if (this.nativeStateDatabaseNeedsReconnect) {
+			this.closeNativeStateDatabases();
+			this.nativeStateDatabaseNeedsReconnect = false;
+		}
+		const profile = this.nativeStateDatabase ??= new DatabaseSync(this.profileStateDatabasePath, { readOnly: true });
+		const application = this.applicationStateDatabasePath === this.profileStateDatabasePath
+			? profile
+			: this.applicationStateDatabase ??= new DatabaseSync(this.applicationStateDatabasePath, { readOnly: true });
+		return { profile, application };
+	}
+
+	/**
+	 * One read of VS Code's storage answers three questions: which models exist (the picker's
+	 * cached list), which model the panel currently has selected, and how it is configured.
+	 * Runs only on storage file events, so it must never leave stale derived state behind.
+	 */
 	private async refreshNativeInputState(): Promise<void> {
 		try {
-			const resource = await vscode.commands.executeCommand<string | undefined>('_chat.voice.getCurrentSession');
-			if (!resource) {
-				return;
-			}
-			const session = this.getSessions().find(candidate => candidate.resource === resource);
-			if (!session) {
-				return;
-			}
-			if (this.nativeStateDatabaseNeedsReconnect) {
-				this.nativeStateDatabase?.close();
-				this.nativeStateDatabase = undefined;
-				this.nativeStateDatabaseNeedsReconnect = false;
-			}
-			const database = this.nativeStateDatabase ??= new DatabaseSync(this.profileStateDatabasePath, { readOnly: true });
+			const resource = await this.readNativeCurrentSession();
+			const { profile, application } = this.openNativeStateDatabases();
 			try {
-				const rows = database
-					.prepare("SELECT key, value FROM ItemTable WHERE key IN ('chat.currentLanguageModel.panel', 'chat.modelConfiguration.panel')")
-					.all() as Array<{ key: string; value: string }>;
+				const rows = [
+					...profile.prepare("SELECT key, value FROM ItemTable WHERE key = 'chat.currentLanguageModel.panel'").all() as Array<{ key: string; value: string }>,
+					...application.prepare(`SELECT key, value FROM ItemTable WHERE key IN ('chat.modelConfiguration.panel', '${cachedLanguageModelsStorageKey}')`).all() as Array<{ key: string; value: string }>,
+				];
 				this.nativeStateRetryAttempted = false;
+				let changed = this.updateCatalog(rows.find(row => row.key === cachedLanguageModelsStorageKey)?.value);
 				const snapshot = createNativeChatInputStateSnapshot(rows);
-				const fingerprint = JSON.stringify([resource, this.modelCatalogRevision, snapshot.rawModelId, snapshot.rawConfiguration]);
-				if (fingerprint === this.lastNativeInputFingerprint) {
-					return;
+				const fingerprint = JSON.stringify([resource, this.catalogRaw?.length, snapshot.rawModelId, snapshot.rawConfiguration]);
+				if (fingerprint !== this.lastNativeInputFingerprint) {
+					this.lastNativeInputFingerprint = fingerprint;
+					changed = this.updateNativeModelOverride(resource, snapshot.state.modelId, snapshot.state.configuration) || changed;
 				}
-				this.lastNativeInputFingerprint = fingerprint;
-				const model = this.models.find(candidate => candidate.identifier === snapshot.state.modelId);
-				if (!model) {
-					return;
-				}
-				const next = withNativeModelState(session.model, model, snapshot.state.configuration);
-				const changed = session.model?.selectedModelId !== next.selectedModelId
-					|| !configurationEquals(session.model?.configuration ?? {}, next.configuration);
 				if (changed) {
-					this.nativeModelOverride = { resource, model: next };
 					this.emit();
 				}
 			} catch (error) {
-				this.nativeStateDatabase?.close();
-				this.nativeStateDatabase = undefined;
+				this.closeNativeStateDatabases();
 				this.nativeStateDatabaseNeedsReconnect = false;
 				this.lastNativeInputFingerprint = undefined;
 				if (!this.nativeStateRetryAttempted) {
@@ -670,9 +712,46 @@ export class SessionMonitor implements vscode.Disposable {
 				}
 				throw error;
 			}
-		} catch {
-			// Native storage reading is opportunistic; the persisted session log remains the fallback.
+		} catch (error) {
+			// Storage reads are opportunistic; the persisted session log remains the fallback.
+			this.log(`native state read failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private updateCatalog(raw: string | undefined): boolean {
+		if (raw === this.catalogRaw) {
+			return false;
+		}
+		const parsed = raw === undefined ? emptyModelCatalog : parseCachedLanguageModels(raw);
+		if (!parsed) {
+			return false;
+		}
+		this.catalogRaw = raw;
+		this.catalog = parsed;
+		return true;
+	}
+
+	/**
+	 * The panel's stored selection describes the chat VS Code has focused. When it cannot be
+	 * resolved (no focused chat, model unknown) the override is dropped rather than kept, so
+	 * the session log's own value shows instead of a selection that is no longer current.
+	 */
+	private updateNativeModelOverride(resource: string | undefined, modelId: string | undefined, configuration: Readonly<Record<string, string | number | boolean>>): boolean {
+		const session = resource ? this.core.getState().sessions.find(candidate => candidate.resource === resource) : undefined;
+		const model = modelId ? this.catalog.models.find(candidate => candidate.identifier === modelId) : undefined;
+		if (!session || !model) {
+			const had = this.nativeModelOverride !== undefined;
+			this.nativeModelOverride = undefined;
+			return had;
+		}
+		const next = withNativeModelState(session.model, model, configuration);
+		const current = this.nativeModelOverride;
+		if (current && current.resource === resource && current.model.selectedModelId === next.selectedModelId
+			&& configurationEquals(current.model.configuration, next.configuration)) {
+			return false;
+		}
+		this.nativeModelOverride = { resource: session.resource, model: next };
+		return true;
 	}
 
 	private async updateProfileModelConfiguration(
@@ -823,6 +902,8 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 		const resource = await createNewChat(source ? vscode.Uri.parse(source.resource) : undefined);
 		const sessionId = decodeLocalSessionId(resource);
+		this.createdSessionResources.add(resource.toString());
+		this.nativeCurrentSessionResource = resource.toString();
 		await this.core.selectSession(sessionId);
 		await this.core.pokeSession(sessionId);
 		this.emit();
@@ -892,11 +973,30 @@ export function resolveCopilotTranscriptDirectories(context: vscode.ExtensionCon
 	return [path.join(path.dirname(context.storageUri.fsPath), 'GitHub.copilot-chat', 'transcripts')];
 }
 
-export function resolveCopilotModelDirectories(context: vscode.ExtensionContext): string[] {
+export function resolveCopilotDebugLogDirectories(context: vscode.ExtensionContext): string[] {
 	if (!context.storageUri) {
 		return [];
 	}
 	return [path.join(path.dirname(context.storageUri.fsPath), 'GitHub.copilot-chat', 'debug-logs')];
+}
+
+/** PROFILE-scoped storage lives next to the extension's global storage folder. */
+export function resolveProfileStateDatabasePath(context: vscode.ExtensionContext): string {
+	return path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
+}
+
+/**
+ * APPLICATION-scoped storage is always `User/globalStorage/state.vscdb`. For the default
+ * profile that is the profile database; for a custom profile the extension's global storage
+ * sits under `User/profiles/<id>/globalStorage`, so walk back to `User`.
+ */
+export function resolveApplicationStateDatabasePath(context: vscode.ExtensionContext): string {
+	const globalStorage = path.dirname(context.globalStorageUri.fsPath);
+	const profileDirectory = path.dirname(globalStorage);
+	if (path.basename(path.dirname(profileDirectory)) === 'profiles') {
+		return path.join(path.dirname(path.dirname(profileDirectory)), 'globalStorage', 'state.vscdb');
+	}
+	return path.join(globalStorage, 'state.vscdb');
 }
 
 /** Workspace windows keep the chat index in workspace storage; empty windows in application storage. */
@@ -946,9 +1046,9 @@ export function applyExportSnapshot(session: ActiveSessionState, snapshot: Expor
 }
 
 function stateSignature(state: MonitorState): string {
-	const parts: string[] = [state.activeSessionResource ?? '', state.error ?? '', String(state.models.length)];
+	const parts: string[] = [state.activeSessionResource ?? '', state.error ?? '', state.models.map(model => model.identifier).join(',')];
 	for (const session of state.sessions) {
-		parts.push(session.resource, session.revision, session.status, session.title, String(session.updatedAt ?? 0), session.model?.selectedModelId ?? '', JSON.stringify(session.model?.configuration ?? {}));
+		parts.push(session.resource, session.revision, session.status, session.title, String(session.updatedAt ?? 0), String(session.isEmpty), session.model?.selectedModelId ?? '', JSON.stringify(session.model?.configuration ?? {}));
 	}
 	for (const message of state.outboundMessages) {
 		parts.push(message.id, message.status);

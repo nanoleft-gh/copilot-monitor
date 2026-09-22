@@ -203,6 +203,7 @@ function parseSession(value: unknown): SessionSummary[] {
     status: value.status === 'working' || value.status === 'loading' ? value.status : 'idle',
     updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : undefined,
     turnCount: typeof value.turnCount === 'number' ? value.turnCount : undefined,
+    isEmpty: typeof value.isEmpty === 'boolean' ? value.isEmpty : undefined,
     historyUnavailable: value.historyUnavailable === 'archived' || value.historyUnavailable === 'oversized' || value.historyUnavailable === 'indexing'
       ? value.historyUnavailable : undefined,
     historyTruncated: value.historyTruncated === true,
@@ -336,9 +337,31 @@ function createRequestId(kind = 'message'): string {
 
 export function hasVisibleContent(session: SessionSummary): boolean {
   if (session.revision.startsWith('transient:')) return true;
+  // The computer only sends turns for the chat it is tailing; the index flag covers the rest.
+  if (session.isEmpty !== undefined) return !session.isEmpty;
   const count = session.turnCount ?? session.turns.length;
   if (count > 0) return true;
+  if (session.turnCount === undefined && session.turns.length === 0) return true;
   return session.turns.some(turn => turn.userText.trim() || turn.assistantText.trim() || turn.blocks.length > 0);
+}
+
+/** Human description of how much of a chat exists, without inventing a count the computer did not send. */
+export function describeSessionSize(session: SessionSummary, now = Date.now()): string {
+  const count = typeof session.turnCount === 'number' ? session.turnCount : session.turns.length > 0 ? session.turns.length : undefined;
+  if (count === 0 || (count === undefined && session.isEmpty === true)) return 'Ready to chat';
+  if (count !== undefined) return `${count} ${count === 1 ? 'message' : 'messages'}`;
+  return session.updatedAt ? formatRelativeTime(session.updatedAt, now) : 'Not loaded';
+}
+
+export function formatRelativeTime(timestamp: number, now = Date.now()): string {
+  const minutes = Math.round(Math.max(0, now - timestamp) / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days} d ago`;
+  return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
 export async function createSession(

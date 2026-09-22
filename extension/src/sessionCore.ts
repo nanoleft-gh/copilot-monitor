@@ -5,7 +5,7 @@ import { LineTailer } from './lineTailer';
 import { mergeLiveTurns } from './liveMerge';
 import { LiveTurnAccumulator, relevantDebugLogTypes, sniffDebugLogType } from './liveTurns';
 import type { ActiveSessionState, ChatPermissionLevel } from './protocol';
-import { readSessionHeadTitle } from './sessionHeadTitle';
+import { readSessionHead } from './sessionHeadTitle';
 import { readSessionIndex, SessionIndexEntry } from './sessionIndex';
 import { SessionLogProjection } from './sessionLogProjection';
 import { localSessionResource } from './sessionResource';
@@ -69,6 +69,8 @@ interface SessionRecord {
 	mtimeMs: number;
 	index: SessionIndexEntry | undefined;
 	fallbackTitle: string | undefined;
+	/** Whether the log head showed any request, for sessions VS Code has not indexed yet. */
+	fallbackHasRequests: boolean | undefined;
 	fallbackTitleKey: string | undefined;
 	lastActivityAt: number | undefined;
 }
@@ -173,7 +175,8 @@ export class SessionCore {
 		}
 		await this.refreshSessionList(undefined);
 		if (!this.activeSessionId) {
-			this.activeSessionId = this.orderedRecords()[0]?.sessionId;
+			const records = this.orderedRecords();
+			this.activeSessionId = (records.find(record => this.isEmpty(record) !== true) ?? records[0])?.sessionId;
 		}
 		if (this.activeSessionId && this.viewerCount > 0) {
 			if (this.active?.sessionId !== this.activeSessionId) {
@@ -447,6 +450,7 @@ export class SessionCore {
 				mtimeMs: stat.mtimeMs,
 				index: undefined,
 				fallbackTitle: undefined,
+				fallbackHasRequests: undefined,
 				fallbackTitleKey: undefined,
 				lastActivityAt: undefined,
 			};
@@ -475,10 +479,21 @@ export class SessionCore {
 		}
 		record.fallbackTitleKey = key;
 		try {
-			record.fallbackTitle = await readSessionHeadTitle(record.filePath, fallbackTitleBytes);
+			const head = await readSessionHead(record.filePath, fallbackTitleBytes);
+			record.fallbackTitle = head.title;
+			record.fallbackHasRequests = head.hasRequests;
 		} catch {
 			record.fallbackTitle = undefined;
+			record.fallbackHasRequests = undefined;
 		}
+	}
+
+	/** VS Code's index is authoritative; a not-yet-indexed session falls back to its log head. */
+	private isEmpty(record: SessionRecord): boolean | undefined {
+		if (record.index) {
+			return record.index.isEmpty;
+		}
+		return record.fallbackHasRequests === undefined ? undefined : !record.fallbackHasRequests;
 	}
 
 	private orderedRecords(): SessionRecord[] {
@@ -670,6 +685,7 @@ export class SessionCore {
 	private buildSummaryState(record: SessionRecord, now: number): ActiveSessionState {
 		const window = this.options.activityWindowMs ?? defaultActivityWindowMs;
 		const working = record.lastActivityAt !== undefined && now - record.lastActivityAt < window;
+		const isEmpty = working ? false : this.isEmpty(record);
 		return {
 			resource: record.resource,
 			sessionId: record.sessionId,
@@ -678,6 +694,8 @@ export class SessionCore {
 			revision: `meta:${record.size}:${record.mtimeMs}:${this.indexRevision ?? ''}`,
 			updatedAt: this.updatedAt(record),
 			turns: [],
+			...(isEmpty === true ? { turnCount: 0 } : {}),
+			...(isEmpty === undefined ? {} : { isEmpty }),
 			permissionLevel: record.index?.permissionLevel ?? 'default',
 		};
 	}
@@ -698,6 +716,9 @@ export class SessionCore {
 		const permissionLevel: ChatPermissionLevel = snapshot.initialised && !snapshot.oversized
 			? snapshot.permissionLevel
 			: record.index?.permissionLevel ?? snapshot.permissionLevel;
+		const isEmpty = snapshot.initialised || merged.turns.length > 0
+			? merged.turnCount === 0 && merged.turns.length === 0
+			: this.isEmpty(record);
 		return {
 			resource: record.resource,
 			sessionId: record.sessionId,
@@ -707,6 +728,7 @@ export class SessionCore {
 			updatedAt: Math.max(this.updatedAt(record), merged.turns.at(-1)?.timestamp ?? 0),
 			turns: merged.turns,
 			turnCount: merged.turnCount,
+			...(isEmpty === undefined ? {} : { isEmpty }),
 			historyStart: merged.historyStart,
 			historyTruncated: merged.historyStart > 0,
 			...(snapshot.oversized ? { historyUnavailable: 'oversized' as const } : {}),

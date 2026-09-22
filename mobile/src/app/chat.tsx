@@ -410,6 +410,10 @@ export default function ChatScreen() {
                   ? 'Building a compact history index in the background. This can take a few seconds for very large chats.'
                   : displayedSession.historyUnavailable
                   ? 'This conversation history remains in VS Code to protect memory. Open it in its VS Code window.'
+                  : displayedSession.isEmpty === true || displayedSession.turnCount === 0
+                  ? 'Ready to chat. Send a message to start this conversation.'
+                  : displayedSession.status === 'loading' || displayedSession.turnCount === undefined
+                  ? 'Loading this conversation from VS Code…'
                   : 'No persisted messages are available yet.'}
               </Text>
             )}

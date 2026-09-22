@@ -2948,10 +2948,9 @@
 				const dot = document.createElement('span'); dot.className = 'mini-dot';
 				const label = document.createElement('span');
 				const statusLabel = session.status === 'working' ? 'Working' : session.status === 'loading' ? 'Loading' : 'Idle';
-				const turnCount = session.turnCount ?? session.turns.length;
 				label.textContent = session.historyUnavailable
 					? session.historyUnavailable === 'indexing' ? 'Indexing history…' : `${statusLabel} · History in VS Code`
-					: `${statusLabel} · ${turnCount} ${turnCount === 1 ? 'turn' : 'turns'}`;
+					: `${statusLabel} · ${describeSessionSize(session)}`;
 				meta.append(dot, label); main.append(title, meta);
 				const actions = document.createElement('div'); actions.className = 'session-card-actions';
 				const pin = document.createElement('button'); pin.type = 'button'; pin.className = 'session-action'; pin.textContent = '◆'; pin.title = 'Pin chat'; pin.setAttribute('aria-label', `Pin ${session.title}`); pin.dataset.active = String(isPinned(selectedWindow.windowId, session.resource));
@@ -2964,6 +2963,26 @@
 				const move = document.createElement('button'); move.type = 'button'; move.className = 'session-action'; move.textContent = '↪'; move.title = `Move to ${nextColumn.title}`; move.setAttribute('aria-label', `Move ${session.title} to ${nextColumn.title}`);
 				move.addEventListener('click', () => { boardState.assignments[sessionKey(selectedWindow.windowId, session.resource)] = nextColumn.id; saveBoardState(); render(state); });
 				actions.append(pin, move, rename); item.append(rail, main, actions); return item;
+			}
+
+			// Only the selected chat carries an exact count; others are described by what is known.
+			function describeSessionSize(session) {
+				const count = typeof session.turnCount === 'number' ? session.turnCount : session.turns.length > 0 ? session.turns.length : undefined;
+				if (count === 0 || (count === undefined && session.isEmpty === true)) return 'Ready to chat';
+				if (count !== undefined) return `${count} ${count === 1 ? 'turn' : 'turns'}`;
+				return session.updatedAt ? formatRelativeTime(session.updatedAt) : 'Not loaded';
+			}
+
+			function formatRelativeTime(timestamp) {
+				const elapsed = Math.max(0, Date.now() - timestamp);
+				const minutes = Math.round(elapsed / 60_000);
+				if (minutes < 1) return 'just now';
+				if (minutes < 60) return `${minutes} min ago`;
+				const hours = Math.round(minutes / 60);
+				if (hours < 24) return `${hours} h ago`;
+				const days = Math.round(hours / 24);
+				if (days < 30) return `${days} d ago`;
+				return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 			}
 
 			function renderMobilePickers(windows, selectedWindow, sessions, selectedSession) {

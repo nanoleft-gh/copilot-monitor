@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
-import { createSession, fetchGatewaySnapshot, hasVisibleContent, selectSession } from '@/transport/gateway-client';
+import { createSession, describeSessionSize, fetchGatewaySnapshot, hasVisibleContent, selectSession } from '@/transport/gateway-client';
 import { getHost } from '@/transport/host-store';
 import { subscribeToGateway } from '@/transport/gateway-stream';
 import type { GatewaySnapshot, HostProfile, SessionSummary, WindowSnapshot } from '@/transport/types';
@@ -176,9 +176,7 @@ export default function HostOverviewScreen() {
                       <Text numberOfLines={1} style={styles.sessionMeta}>
                         {session.historyUnavailable
 						  ? session.historyUnavailable === 'indexing' ? 'Indexing history…' : 'History available in VS Code'
-                          : (session.turnCount ?? session.turns.length) === 0
-                          ? 'Ready to chat'
-                          : `${session.turnCount ?? session.turns.length} messages${session.modelName ? ` · ${session.modelName}` : ''}`}
+                          : `${describeSessionSize(session)}${session.modelName ? ` · ${session.modelName}` : ''}`}
                       </Text>
                     </View>
                     {opening === session.resource ? <ActivityIndicator color={colors.accentBlue} size="small" /> : <ChevronRight color={colors.textMuted} size={20} />}

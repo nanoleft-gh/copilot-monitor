@@ -79,7 +79,10 @@ export type SessionSummary = {
   title: string;
   status: 'idle' | 'working' | 'loading';
   updatedAt?: number;
+  /** Exact request count; only known for the chat the computer is currently tailing and for empty chats. */
   turnCount?: number;
+  /** Whether the chat has no requests, from VS Code's index; undefined while unknown. */
+  isEmpty?: boolean;
   historyUnavailable?: 'archived' | 'oversized' | 'indexing';
   historyTruncated?: boolean;
   historyStart?: number;

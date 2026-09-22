@@ -150,6 +150,36 @@ describe('SessionCore', () => {
 		await core.selectSession(sessionB);
 		const summary = core.getState().sessions[0];
 		assert.equal(summary.title, 'What is the meaning of this stack trace?');
+		assert.equal(summary.isEmpty, false);
+	});
+
+	it('reports empty chats and does not auto-select one over a chat with content', async () => {
+		const sessionC = 'cccccccc-0000-4000-8000-000000000003';
+		// A is a blank chat VS Code indexed; B has content; C is a brand-new blank chat not indexed yet.
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, []));
+		await fs.writeFile(path.join(fixture.sessions, `${sessionB}.jsonl`), initialLine(sessionB, [request(0, 'real question')]));
+		await fs.writeFile(path.join(fixture.sessions, `${sessionC}.jsonl`), initialLine(sessionC, []));
+		writeIndex(fixture, {
+			[sessionA]: indexEntry(sessionA, 'New Chat', base + 30_000, { isEmpty: true }),
+			[sessionB]: indexEntry(sessionB, 'Real', base + 20_000, { isEmpty: false }),
+		});
+		const core = createCore();
+		await core.setViewerCount(1);
+		const state = core.getState();
+		assert.equal(state.activeSessionResource, localSessionResource(sessionB), 'newest non-empty chat is selected');
+		const byId = new Map(state.sessions.map(session => [session.sessionId, session]));
+		assert.equal(byId.get(sessionA)?.isEmpty, true);
+		assert.equal(byId.get(sessionA)?.turnCount, 0);
+		assert.equal(byId.get(sessionB)?.isEmpty, false);
+		assert.equal(byId.get(sessionB)?.turnCount, 1);
+		assert.equal(byId.get(sessionC)?.isEmpty, true, 'unindexed blank chat is detected from its log head');
+
+		// The blank chat receives its first request: the projection knows before the index does.
+		await core.selectSession(sessionA);
+		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.isEmpty, true);
+		await fs.appendFile(path.join(fixture.sessions, `${sessionA}.jsonl`), JSON.stringify({ kind: 2, k: ['requests'], v: [request(0, 'now it has content', { modelState: { value: 1 } })], i: 0 }) + '\n');
+		await waitFor(() => core.getState().sessions.find(session => session.sessionId === sessionA)?.isEmpty === false);
+		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.turnCount, 1);
 	});
 
 	it('follows appended mutations and transcript progress through file events', async () => {

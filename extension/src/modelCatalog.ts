@@ -1,135 +1,99 @@
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
 import {
 	ChatModelDescriptor,
 	ModelConfigurationField,
-	ModelConfigurationOption,
 	ModelConfigurationValue,
 	SessionModelState,
 } from './protocol';
 import type { JsonObject } from './transcript';
 
-export interface ModelCatalogSnapshot {
+/**
+ * VS Code keeps the exact model list its picker shows under this application-scoped storage
+ * key (`chatInputPart.ts`). It is the only source that knows every model the user can pick,
+ * including newly rolled-out ones, and it carries VS Code's own `configurationSchema`.
+ */
+export const cachedLanguageModelsStorageKey = 'chat.cachedLanguageModels.v2';
+
+/** One entry of the cached list, in the shape VS Code also persists as `inputState.selectedModel`. */
+export interface CachedLanguageModel {
+	readonly identifier: string;
+	readonly metadata: JsonObject;
+}
+
+export interface ModelCatalog {
 	readonly models: readonly ChatModelDescriptor[];
-	readonly revision: string;
+	/** Raw entries by identifier, for reproducing VS Code's `selectedModel` value. */
+	readonly entries: ReadonlyMap<string, CachedLanguageModel>;
 }
 
-const effortDescriptions: Readonly<Record<string, string>> = {
-	none: 'No reasoning applied',
-	minimal: 'Minimal reasoning for fastest responses',
-	low: 'Faster responses with less reasoning',
-	medium: 'Balanced reasoning and speed',
-	high: 'Greater reasoning depth but slower',
-	xhigh: 'Highest reasoning depth but slowest',
-	max: 'Absolute maximum capability with no constraints',
-};
+export const emptyModelCatalog: ModelCatalog = { models: [], entries: new Map() };
 
-const effortLabels: Readonly<Record<string, string>> = {
-	none: 'None',
-	minimal: 'Minimal',
-	low: 'Low',
-	medium: 'Medium',
-	high: 'High',
-	xhigh: 'Extra High',
-	max: 'Max',
-};
-
-export async function readLatestModelCatalog(directories: readonly string[]): Promise<ModelCatalogSnapshot | undefined> {
-	const candidates: Array<{ filePath: string; size: number; mtimeMs: number }> = [];
-	for (const directory of directories) {
-		let entries;
-		try {
-			entries = await fs.readdir(directory, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			const filePath = entry.isDirectory()
-				? path.join(directory, entry.name, 'models.json')
-				: entry.isFile() && entry.name === 'models.json' ? path.join(directory, entry.name) : undefined;
-			if (!filePath) {
-				continue;
-			}
-			try {
-				const stat = await fs.stat(filePath);
-				candidates.push({ filePath, size: stat.size, mtimeMs: stat.mtimeMs });
-			} catch {
-				continue;
-			}
-		}
+/**
+ * Parses the stored `chat.cachedLanguageModels.v2` value into the models a local panel chat
+ * can select. Mirrors VS Code's `filterModelsForSession` for a local session: no session-type
+ * target and not explicitly hidden. Returns `undefined` for an unparseable value.
+ */
+export function parseCachedLanguageModels(raw: string): ModelCatalog | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return undefined;
 	}
-
-	for (const candidate of candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)) {
-		try {
-			const content = await fs.readFile(candidate.filePath, 'utf8');
-			const stat = await fs.stat(candidate.filePath);
-			if (stat.size !== candidate.size || stat.mtimeMs !== candidate.mtimeMs || Buffer.byteLength(content) !== stat.size) {
-				continue;
-			}
-			const value = JSON.parse(content) as unknown;
-			if (!Array.isArray(value)) {
-				continue;
-			}
-			return {
-				models: parseModelCatalog(value),
-				revision: `${candidate.filePath}:${stat.size}:${stat.mtimeMs}`,
-			};
-		} catch {
-			continue;
-		}
-	}
-	return undefined;
-}
-
-export function parseModelCatalog(value: unknown): ChatModelDescriptor[] {
 	if (!Array.isArray(value)) {
-		return [];
+		return undefined;
 	}
-
-	const models: ChatModelDescriptor[] = [createAutoModel()];
+	const entries = new Map<string, CachedLanguageModel>();
+	const models: ChatModelDescriptor[] = [];
 	for (const candidate of value) {
-		if (!isObject(candidate)
-			|| candidate.model_picker_enabled !== true
-			|| stringValue(isObject(candidate.policy) ? candidate.policy.state : undefined) === 'disabled') {
+		if (!isObject(candidate) || !isObject(candidate.metadata)) {
 			continue;
 		}
-		const id = stringValue(candidate.id);
-		const name = stringValue(candidate.name);
-		if (!id || !name) {
+		const identifier = stringValue(candidate.identifier);
+		const metadata = candidate.metadata;
+		if (!identifier || entries.has(identifier)
+			|| metadata.targetChatSessionType !== undefined
+			|| metadata.isUserSelectable === false) {
 			continue;
 		}
-
-		const capabilities = isObject(candidate.capabilities) ? candidate.capabilities : undefined;
-		const limits = isObject(capabilities?.limits) ? capabilities.limits : undefined;
-		const supports = isObject(capabilities?.supports) ? capabilities.supports : undefined;
-		const family = stringValue(capabilities?.family) ?? id;
+		const id = stringValue(metadata.id);
+		const name = stringValue(metadata.name);
+		const vendor = stringValue(metadata.vendor);
+		if (!id || !name || !vendor) {
+			continue;
+		}
+		entries.set(identifier, { identifier, metadata });
+		const capabilities = isObject(metadata.capabilities) ? metadata.capabilities : undefined;
+		const auth = isObject(metadata.auth) ? metadata.auth : undefined;
+		const extension = isObject(metadata.extension) ? metadata.extension : undefined;
 		models.push({
-			identifier: `copilot/${id}`,
+			identifier,
 			id,
 			name,
-			vendor: 'copilot',
-			providerName: stringValue(candidate.vendor) ?? 'GitHub Copilot',
-			family,
-			version: stringValue(candidate.version) ?? id,
-			category: stringValue(candidate.model_picker_category),
-			preview: candidate.preview === true,
-			maxInputTokens: numberValue(limits?.max_prompt_tokens),
-			maxOutputTokens: numberValue(limits?.max_output_tokens),
-			supportsVision: supports?.vision === true,
-			supportsTools: supports?.tool_calls === true,
-			configurationFields: createConfigurationFields(candidate, family),
+			vendor,
+			providerName: stringValue(auth?.providerLabel) ?? stringValue(extension?.value) ?? vendor,
+			family: stringValue(metadata.family) ?? id,
+			version: stringValue(metadata.version) ?? id,
+			category: stringValue(metadata.category),
+			preview: /preview/i.test(name) || /preview/i.test(stringValue(metadata.detail) ?? ''),
+			maxInputTokens: numberValue(metadata.maxInputTokens),
+			maxOutputTokens: numberValue(metadata.maxOutputTokens),
+			supportsVision: capabilities?.vision === true,
+			supportsTools: capabilities?.toolCalling === true,
+			configurationFields: parseConfigurationSchema(isObject(metadata.configurationSchema) ? metadata.configurationSchema : undefined, {}),
 		});
 	}
-
-	return models.sort((left, right) => {
-		if (left.id === 'auto') {
-			return -1;
-		}
-		if (right.id === 'auto') {
-			return 1;
+	models.sort((left, right) => {
+		if ((left.id === 'auto') !== (right.id === 'auto')) {
+			return left.id === 'auto' ? -1 : 1;
 		}
 		return left.name.localeCompare(right.name);
 	});
+	return { models, entries };
+}
+
+/** Builds the `inputState.selectedModel` value VS Code would persist for a cached model. */
+export function selectedModelValue(entry: CachedLanguageModel, configuration: Readonly<Record<string, ModelConfigurationValue>>): JsonObject {
+	return { identifier: entry.identifier, metadata: entry.metadata, modelConfiguration: { ...configuration } };
 }
 
 export function parseSessionModelState(state: JsonObject): SessionModelState | undefined {
@@ -187,72 +151,6 @@ export function withSelectedModel(
 	};
 }
 
-function createAutoModel(): ChatModelDescriptor {
-	return {
-		identifier: 'copilot/auto',
-		id: 'auto',
-		name: 'Auto',
-		vendor: 'copilot',
-		providerName: 'GitHub Copilot',
-		family: 'auto',
-		version: 'auto',
-		preview: false,
-		supportsVision: true,
-		supportsTools: true,
-		configurationFields: [],
-	};
-}
-
-function createConfigurationFields(model: Record<string, unknown>, family: string): ModelConfigurationField[] {
-	const capabilities = isObject(model.capabilities) ? model.capabilities : undefined;
-	const limits = isObject(capabilities?.limits) ? capabilities.limits : undefined;
-	const supports = isObject(capabilities?.supports) ? capabilities.supports : undefined;
-	const fields: ModelConfigurationField[] = [];
-	const efforts = Array.isArray(supports?.reasoning_effort)
-		? supports.reasoning_effort.filter((effort): effort is string => typeof effort === 'string')
-		: [];
-	if (efforts.length > 1) {
-		const defaultValue = efforts.includes(family.toLowerCase().startsWith('claude') ? 'high' : 'medium')
-			? family.toLowerCase().startsWith('claude') ? 'high' : 'medium'
-			: efforts[0];
-		fields.push({
-			key: 'reasoningEffort',
-			title: 'Thinking Effort',
-			group: 'navigation',
-			defaultValue,
-			options: efforts.map(value => ({
-				value,
-				label: effortLabels[value] ?? capitalize(value),
-				description: effortDescriptions[value] ?? value,
-				isDefault: value === defaultValue,
-			})),
-		});
-	}
-
-	const billing = isObject(model.billing) ? model.billing : undefined;
-	const tokenPrices = isObject(billing?.token_prices) ? billing.token_prices : undefined;
-	const defaultPricing = isObject(tokenPrices?.default) ? tokenPrices.default : undefined;
-	const longContext = isObject(tokenPrices?.long_context) ? tokenPrices.long_context : undefined;
-	const defaultMax = numberValue(defaultPricing?.context_max);
-	const fullMax = numberValue(limits?.max_prompt_tokens);
-	if (defaultMax !== undefined && fullMax !== undefined && defaultMax < fullMax) {
-		const options: ModelConfigurationOption[] = longContext
-			? [
-				{ value: defaultMax, label: formatTokenCount(defaultMax), description: 'Default recommended context size', isDefault: true },
-				{ value: fullMax, label: formatTokenCount(fullMax), description: 'Longer sessions', isDefault: false },
-			]
-			: [{ value: fullMax, label: formatTokenCount(fullMax), description: 'Longer sessions', isDefault: true }];
-		fields.push({
-			key: 'contextSize',
-			title: 'Context Size',
-			group: 'tokens',
-			defaultValue: options.find(option => option.isDefault)?.value,
-			options,
-		});
-	}
-	return fields;
-}
-
 function parseConfigurationSchema(
 	schema: Record<string, unknown> | undefined,
 	configuration: Readonly<Record<string, ModelConfigurationValue>>,
@@ -299,20 +197,6 @@ function readConfiguration(value: Record<string, unknown> | undefined): Readonly
 
 function isConfigurationValue(value: unknown): value is ModelConfigurationValue {
 	return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
-}
-
-function formatTokenCount(value: number): string {
-	if (value >= 900_000) {
-		return `${Math.round(value / 1_000_000)}M`;
-	}
-	if (value >= 1_000) {
-		return `${Math.round(value / 1_000)}K`;
-	}
-	return String(value);
-}
-
-function capitalize(value: string): string {
-	return value ? value[0].toUpperCase() + value.slice(1) : value;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

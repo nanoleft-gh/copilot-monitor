@@ -4,6 +4,8 @@
 
 - Consumed the gateway's `eventsV2` delta stream: one snapshot on connect, then compact patches, so streaming responses only transfer their new text and the XHR response buffer grows far more slowly. Older gateways that still send full `state` frames keep working.
 - Reconnected for a fresh snapshot whenever a patch cannot be applied instead of showing stale data.
+- Fixed the conversation list hiding every chat except the selected one: the computer only sends turns for the chat it is tailing, so visibility now follows the `isEmpty` flag from VS Code's index and unknown counts show the last-activity time instead of being treated as empty.
+- Aligned all packages with Expo SDK 57 (`expo install --fix`); the previous `react-native-worklets` / `reanimated` versions crashed Expo Go on launch.
 
 ## [0.1.2]
 

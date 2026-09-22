@@ -68,10 +68,17 @@ that has data for a turn wins:
 | 1 | Copilot **transcript** `<workspaceStorage>/GitHub.copilot-chat/transcripts/<sid>.jsonl` | Copilot Chat extension, only when hooks are configured | Flushed before each hook (≤ 500 ms) | Live turns, tool calls, hook events |
 | 2 | Copilot **debug log** `<workspaceStorage>/GitHub.copilot-chat/debug-logs/<sid>/main.jsonl` | Copilot Chat extension (`chatDebug.fileLogging.enabled`) | Every 4 s | Live turns when no transcript exists |
 | 3 | VS Code **session log** `<workspaceStorage>/chatSessions/<sid>.jsonl` | VS Code core | On the 60 s idle storage flush; compaction rewrites in place above 1024 entries | Authoritative persisted history, titles, model state |
-| — | **Session index** `state.vscdb` key `chat.ChatSessionStore.index` | VS Code core | On flush | Session list, titles, last message dates |
+| — | **Session index** `state.vscdb` key `chat.ChatSessionStore.index` | VS Code core | On flush | Session list, titles, last message dates, `isEmpty` |
+| — | **Model list** `User/globalStorage/state.vscdb` key `chat.cachedLanguageModels.v2` | VS Code core (`chatInputPart`) | When the picker's models change | Every model the panel can select, with VS Code's `configurationSchema` |
+| — | **Panel selection** profile `state.vscdb` keys `chat.currentLanguageModel.panel` (PROFILE) and `chat.modelConfiguration.panel` (APPLICATION) | VS Code core | Immediately on user action | Model and effort/context of the chat VS Code has focused, seconds before the session log flushes |
 
 Sources 1–2 are *live* (seconds), source 3 is *sealed* (tens of seconds). Section 6 explains
 how they are merged.
+
+The model list is filtered exactly like VS Code's own picker for a local chat (no
+`targetChatSessionType`, not `isUserSelectable: false`), so the dashboard offers the same
+models as the panel. Blank chats (`isEmpty`) are hidden unless they are the viewer's
+selection, the chat VS Code has focused, or a chat a viewer just created.
 
 ## 4. Watching: `DirectoryWatcher`
 

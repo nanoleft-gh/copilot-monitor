@@ -12,7 +12,10 @@ export interface ActiveSessionState {
 	readonly revision: string;
 	readonly updatedAt?: number;
 	readonly turns: readonly TranscriptTurn[];
+	/** Exact request count; only known for the selected (tailed) session and for empty chats. */
 	readonly turnCount?: number;
+	/** Whether the chat has no requests, from VS Code's index; undefined while unknown. */
+	readonly isEmpty?: boolean;
 	readonly historyUnavailable?: 'archived' | 'oversized' | 'indexing';
 	readonly historyTruncated?: boolean;
 	readonly historyStart?: number;

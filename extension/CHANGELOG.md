@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.1]
+
+- Read the model list from VS Code's own cached picker list (`chat.cachedLanguageModels.v2`) instead of Copilot's debug `models.json`, so newly rolled-out models appear in the dashboard and mobile app exactly when they appear in VS Code, with VS Code's own effort/context options. The debug-log file was only written with debug logging enabled and had gone stale.
+- Fixed a stale model overlay: when VS Code was switched to a model the dashboard did not know, the previous selection stayed displayed and changing effort/context failed with "VS Code is still applying the selected model". The overlay is now recomputed from VS Code's storage on every change and dropped when it cannot be resolved.
+- Model configuration changes no longer depend on the session log having caught up with VS Code's selection; the persisted value is reproduced from the catalog entry VS Code itself stores.
+- Hid blank "New Chat" sessions VS Code leaves behind, except the chat that is selected, focused in VS Code, or was just created from a phone; the session list carries `isEmpty` so clients can tell an empty chat from one whose count is simply not loaded.
+- The first viewer now opens on the chat VS Code has focused (falling back to the newest chat with content) instead of the most recently touched blank chat.
+- Session lists no longer claim "0 turns" for chats that are not being tailed; they show the exact count when known, "Ready to chat" for empty chats, and the last-activity time otherwise.
+
 ## [1.2.0]
 
 Event-driven core. The extension no longer polls, schedules exports, or re-reads whole chat logs; every piece of work is triggered by a file-system event, a connection event, or a user action. This fixes the machine-wide hangs caused by the previous 2-second live exports and full-file re-reads of large chats.
