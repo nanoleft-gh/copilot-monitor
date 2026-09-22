@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.0]
+
+Event-driven core. The extension no longer polls, schedules exports, or re-reads whole chat logs; every piece of work is triggered by a file-system event, a connection event, or a user action. This fixes the machine-wide hangs caused by the previous 2-second live exports and full-file re-reads of large chats.
+
+- Replaced the session watcher with `SessionCore`: non-recursive `fs.watch` on the exact `chatSessions`, `transcripts`, `debug-logs` and `state.vscdb` directories, with Windows-safe ancestor watching so a deleted-and-recreated directory is picked up again.
+- Added `LineTailer`, which reads only new bytes from a remembered offset and verifies file identity (inode, size, anchor hash) so VS Code's in-place session log compaction, Copilot's debug log truncation, and rotations are detected and replayed instead of producing corrupt transcripts.
+- Added `SessionLogProjection`, an incremental projection of VS Code's mutation log that keeps the newest 40 turns and compact summaries for the rest; verified byte-identical against a full replay on real 2 MB and 46 MB logs.
+- Read the session list from VS Code's own SQLite session index instead of scanning and parsing every log file; locked reads are retried with backoff.
+- Merged live transcript and debug log turns with persisted turns by user text and timestamp, never overriding sealed history; tools outstanding for two seconds become approvable and trigger a single stall-probe export.
+- Removed the periodic live export entirely; exports now happen only on demand (`POST /api/sessions/sync`), for a stall probe, or after a model-state command.
+- Made everything viewer-gated: with no dashboard or phone connected there are no watchers, no tailers, and no timers.
+- Replaced 2-second window registry heartbeats with a publish-once descriptor that self-heals through `fs.watch`; the gateway discovers windows from registry events and treats its connection to each window as the liveness signal, purging descriptors of crashed windows after bounded reconnects.
+- Removed the gateway lease heartbeat and the 2-second coordinator loop; leases are validated by the gateway's health nonce and followers hold an idle `GET /api/presence` stream whose closure triggers immediate re-election.
+- Made the sidebar QR view re-render on address-change events instead of refreshing every 2 seconds, with an explicit Start state after the monitor is stopped.
+- Ran SSE keepalive intervals only while a stream is open.
+- Native model/effort/context synchronization no longer polls while its SQLite watcher is healthy.
+- Bumped the gateway/bridge `apiVersion` to 4 and added the `sessionSync` capability; the `MonitorState` and `GatewayState` payloads are unchanged, so existing dashboards and mobile apps keep working.
+- Removed the progressive transcript, session state cache, and bounded file read modules that the new core made unnecessary.
+
 ## [1.1.3]
 
 - Made machine-wide window registry heartbeats atomic and serialized so concurrent VS Code Insiders windows cannot expose empty or stale descriptors.
