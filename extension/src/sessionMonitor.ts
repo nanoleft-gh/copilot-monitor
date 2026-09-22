@@ -3,7 +3,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import * as vscode from 'vscode';
-import { buildLocalSessionResource, createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, releaseChatSession, selectChatModel, sendPrompt } from './chatBridge';
+import { readStableUtf8 } from './boundedFileRead';
+import { buildLocalSessionResource, createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, releaseChatSession, selectChatModel, sendPrompt, setChatPermissionLevel } from './chatBridge';
 import { LiveExportFileSystem, liveExportScheme } from './liveExportFileSystem';
 import { LiveExportTracker } from './liveExportTracker';
 import { mergeConfigurationFields, mergeSessionModelState, parseSessionModelState, readLatestModelCatalog, withNativeModelState, withSelectedModel } from './modelCatalog';
@@ -11,7 +12,28 @@ import { createSessionModelConfigurationMutation, createSessionValueMutation, up
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
 import { findMatchingSession } from './sessionMatcher';
-import { SessionStateCache } from './sessionStateCache';
+import {
+	isPersistedSessionWithinMemoryBudget,
+	maximumPersistedSessionBytes,
+	maximumWorkspaceSessionBytes,
+	SessionStateCache,
+} from './sessionStateCache';
+import { planSessionLoads } from './sessionLoadPolicy';
+import {
+	indexProgressiveTranscript,
+	loadProgressiveTranscriptPage,
+	ProgressiveTranscriptIndex,
+} from './progressiveTranscript';
+import {
+	deserializePagedMutationHistoryIndex,
+	PagedMutationHistoryIndex,
+	serializePagedMutationHistoryIndex,
+	SerializedPagedMutationHistoryIndex,
+} from './pagedMutationHistory';
+import { indexPagedMutationHistoryInWorker, loadPagedMutationHistoryInWorker } from './pagedMutationHistoryWorkerClient';
+import { readProgressiveMutationSummary } from './progressiveMutationSummary';
+import { readProgressiveMutationValue } from './progressiveMutationValue';
+import { shouldPreserveProgressiveSession } from './progressiveSessionPolicy';
 import { isActivePendingTool } from './toolDecision';
 import {
 	ActiveSessionState,
@@ -20,6 +42,8 @@ import {
 	CreateSessionResult,
 	EditTurnRequest,
 	EditTurnResult,
+	HistoryPageRequest,
+	HistoryPageResult,
 	ModelConfigurationRequest,
 	ModelSelectionRequest,
 	MonitorRequestError,
@@ -40,13 +64,14 @@ import {
 } from './transcript';
 
 const fallbackPollIntervalMs = 1_000;
-const liveExportIntervalMs = 500;
+const liveExportIntervalMs = 2_000;
 const fileEventDebounceMs = 20;
-const partialWriteRetryMs = 50;
+const partialWriteRetryMs = 500;
 const maximumMessageLength = 32_000;
 const maximumOutboundHistory = 20;
 const modelCatalogRefreshIntervalMs = 10_000;
-const connectedIdleLiveExportIntervalMs = 1_000;
+const maximumProgressiveIndexCacheFiles = 64;
+const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
 const nativeStateDatabaseFiles = new Set(['state.vscdb', 'state.vscdb-wal', 'state.vscdb-shm']);
 
 export class SessionMonitor implements vscode.Disposable {
@@ -82,15 +107,26 @@ export class SessionMonitor implements vscode.Disposable {
 	private models: readonly ChatModelDescriptor[] = [];
 	private modelCatalogRevision: string | undefined;
 	private nextModelCatalogScanAt = 0;
-	private nextConnectedIdleLiveExportAt = 0;
 	private eventClientCount = 0;
+	private readonly progressiveIndexes = new Map<string, ProgressiveTranscriptIndex>();
+	private readonly progressiveMutationIndexes = new Map<string, PagedMutationHistoryIndex>();
+	private readonly progressiveMutationIndexing = new Map<string, Promise<PagedMutationHistoryIndex>>();
+	private readonly progressiveMutationLoading = new Set<string>();
+	private readonly progressiveSupplementMissingSince = new Map<string, number>();
+	private readonly progressiveIndexDirectory: string;
+	private readonly progressiveAbortController = new AbortController();
+	private readonly diagnosticSessionSignatures = new Map<string, string>();
+	private readonly createSessionOperations = new Map<string, Promise<CreateSessionResult>>();
+	private disposed = false;
 
 	readonly onDidChange = this.changeEmitter.event;
 
 	constructor(
 		context: vscode.ExtensionContext,
 		private readonly windowId: string,
+		private readonly log: (message: string) => void = () => undefined,
 	) {
+		this.progressiveIndexDirectory = path.join(context.globalStorageUri.fsPath, 'progressive-history');
 		this.disposables.push(this.changeEmitter);
 		this.sessionDirectories = resolveSessionDirectories(context);
 		this.copilotTranscriptDirectories = resolveCopilotTranscriptDirectories(context);
@@ -134,8 +170,8 @@ export class SessionMonitor implements vscode.Disposable {
 		const sessions = this.getSessions();
 		const activeResource = this.activeSession?.resource;
 		const serializedSessions = sessions.map(session => activeResource === session.resource
-			? { ...session, turnCount: session.turns.length }
-			: { ...session, turnCount: session.turns.length, turns: [] });
+			? session
+			: { ...session, turns: [] });
 		return {
 			version: 1,
 			windowId: this.windowId,
@@ -144,7 +180,7 @@ export class SessionMonitor implements vscode.Disposable {
 			startedAt: this.startedAt,
 			models: this.models,
 			sessions: serializedSessions,
-			activeSession: this.activeSession ? { ...this.activeSession, turnCount: this.activeSession.turns.length, turns: [] } : undefined,
+			activeSession: this.activeSession ? { ...this.activeSession, turns: [] } : undefined,
 			activeSessionResource: activeResource,
 			outboundMessages: [...this.outboundMessages.values()],
 			error: this.error,
@@ -209,9 +245,33 @@ export class SessionMonitor implements vscode.Disposable {
 		if (targetSession.revision !== request.sessionRevision) {
 			throw new MonitorRequestError(409, 'The conversation changed before the edited request could be submitted.');
 		}
-		const requestIndex = targetSession.turns.findIndex(turn => turn.id === request.requestId && turn.editable);
+		const usesEventTranscript = this.progressiveIndexes.has(request.sessionResource);
+		const localRequestIndex = usesEventTranscript
+			? -1
+			: targetSession.turns.findIndex(turn => turn.id === request.requestId && turn.editable);
+		let requestIndex = localRequestIndex < 0 ? -1 : (targetSession.historyStart ?? 0) + localRequestIndex;
+		let progressiveMutationIndex = this.progressiveMutationIndexes.get(request.sessionResource);
+		if (usesEventTranscript && request.sourceText) {
+			const sessionFile = await this.requireSessionFile(request.sessionResource);
+			progressiveMutationIndex ??= await this.getProgressiveMutationIndex(sessionFile);
+			this.progressiveMutationIndexes.set(request.sessionResource, progressiveMutationIndex);
+			requestIndex = findProgressiveRequestIndex(
+				progressiveMutationIndex.requests,
+				request.sourceText,
+				request.sourceTimestamp,
+			);
+		}
+		if (requestIndex < 0 && progressiveMutationIndex) {
+			requestIndex = progressiveMutationIndex.requests.findIndex(value => value.requestId === request.requestId);
+		}
 		if (requestIndex < 0) {
 			throw new MonitorRequestError(409, 'The selected request is no longer editable.');
+		}
+		const nativeRequestId = progressiveMutationIndex && usesEventTranscript
+			? progressiveMutationIndex.requests[requestIndex]?.requestId
+			: request.requestId;
+		if (typeof nativeRequestId !== 'string' || !nativeRequestId) {
+			throw new MonitorRequestError(409, 'The selected request could not be resolved in VS Code.');
 		}
 		if (this.outboundMessages.has(request.id)) {
 			return { id: request.id, accepted: true };
@@ -228,7 +288,7 @@ export class SessionMonitor implements vscode.Disposable {
 		void editAndResubmitPrompt(
 			vscode.Uri.parse(request.sessionResource),
 			requestIndex,
-			targetSession.turns.length,
+			targetSession.turnCount ?? targetSession.turns.length,
 			text,
 		).then(() => this.refreshLiveExportWhenIdle()).catch(error => {
 			this.liveExportTracker.cancel(request.id);
@@ -241,15 +301,78 @@ export class SessionMonitor implements vscode.Disposable {
 	}
 
 	async selectSession(sessionResource: string): Promise<void> {
-		const targetSession = this.getSessions().find(session => session.resource === sessionResource);
+		let targetSession = this.getSessions().find(session => session.resource === sessionResource);
 		if (!targetSession) {
 			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
+		}
+		let mutationFileToIndex: SessionFile | undefined;
+		if (targetSession.revision.startsWith('placeholder:')) {
+			const file = (await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories))
+				.find(candidate => buildLocalSessionResource(candidate.sessionId).toString() === sessionResource);
+			if (file && isPersistedSessionWithinMemoryBudget(file.size + file.supplementSize)) {
+				this.fileFingerprints.delete(file.filePath);
+				await this.refreshSession(file, true);
+				targetSession = this.getSessions().find(session => session.resource === sessionResource) ?? targetSession;
+			} else if (file && file.supplementSize === 0) {
+				mutationFileToIndex = file;
+			}
 		}
 		await focusChatSession(vscode.Uri.parse(targetSession.resource));
 		this.activeSession = targetSession;
 		this.liveExportTargetResource = targetSession.resource;
 		this.emit();
+		if (mutationFileToIndex) {
+			this.markProgressiveMutationIndexing(mutationFileToIndex);
+			void this.loadProgressiveMutationSession(mutationFileToIndex).catch(error => {
+				if (this.disposed) {return;}
+				this.restoreProgressiveMutationPlaceholder(mutationFileToIndex);
+				this.error = error instanceof Error ? error.message : String(error);
+				this.emit();
+			});
+			return;
+		}
 		void this.refreshLiveExport(true);
+	}
+
+	async loadHistory(request: HistoryPageRequest): Promise<HistoryPageResult> {
+		const session = this.getSessions().find(candidate => candidate.resource === request.sessionResource);
+		if (!session) {
+			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
+		}
+		if (session.revision !== request.sessionRevision) {
+			throw new MonitorRequestError(409, 'The conversation changed before history could be loaded. Refresh and try again.');
+		}
+		let index = this.progressiveIndexes.get(request.sessionResource);
+		let mutationIndex = this.progressiveMutationIndexes.get(request.sessionResource);
+		if (!index && !mutationIndex) {
+			const file = (await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories))
+				.find(candidate => buildLocalSessionResource(candidate.sessionId).toString() === request.sessionResource);
+			if (file) {
+				const supplementPath = await findExistingFile(this.copilotTranscriptDirectories, `${file.sessionId}.jsonl`);
+				if (supplementPath) {
+					index = await indexProgressiveTranscript(supplementPath);
+					if (index.complete) {
+						this.progressiveIndexes.set(request.sessionResource, index);
+					}
+				} else {
+					mutationIndex = await this.getProgressiveMutationIndex(file);
+					this.progressiveMutationIndexes.set(request.sessionResource, mutationIndex);
+				}
+			}
+		}
+		if (!index && !mutationIndex) {
+			throw new MonitorRequestError(409, 'Earlier history remains available only in VS Code.');
+		}
+		const totalCount = index?.turnOffsets.length ?? mutationIndex!.requests.length;
+		const end = Math.max(0, Math.min(Math.floor(request.before), totalCount));
+		const limit = Math.max(1, Math.min(Math.floor(request.limit ?? 40), 40));
+		const start = Math.max(0, end - limit);
+		const page = index
+			? await loadProgressiveTranscriptPage(index, start, end - start)
+			: await loadPagedMutationHistoryInWorker(
+				mutationIndex!, start, end - start, session.revision, this.progressiveAbortController.signal,
+			);
+		return { ...page, revision: session.revision };
 	}
 
 	async selectModel(request: ModelSelectionRequest): Promise<void> {
@@ -297,7 +420,7 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(400, 'The requested model configuration value is unavailable.');
 		}
 
-		const sessionFile = (await findSessionFiles(this.sessionDirectories))
+		const sessionFile = (await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories))
 			.find(file => buildLocalSessionResource(file.sessionId).toString() === request.sessionResource);
 		if (!sessionFile) {
 			throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
@@ -307,10 +430,35 @@ export class SessionMonitor implements vscode.Disposable {
 		this.liveExportTargetResource = request.sessionResource;
 		await releaseChatSession(resource);
 		try {
-			const content = await fs.readFile(sessionFile.filePath, 'utf8');
-			const snapshot = parseMutationLogSnapshot(content);
-			if (!snapshot.complete) {
-				throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try the configuration change again.');
+			let content = '';
+			let snapshot: ReturnType<typeof parseMutationLogSnapshot> | undefined;
+			for (let attempt = 0; attempt < 40; attempt++) {
+				const currentStat = await fs.stat(sessionFile.filePath);
+				if (isPersistedSessionWithinMemoryBudget(currentStat.size + sessionFile.supplementSize)) {
+					const sessionRead = await readStableUtf8(sessionFile.filePath, currentStat);
+					if (sessionRead.stable) {
+						const candidate = parseMutationLogSnapshot(sessionRead.content);
+						if (candidate.complete && selectedModelMatches(candidate.state, request.modelId)) {
+							content = sessionRead.content;
+							snapshot = candidate;
+							break;
+						}
+					}
+				} else {
+					const candidate = await readProgressiveMutationValue(
+						sessionFile.filePath,
+						['inputState', 'selectedModel'],
+					);
+					const state = { inputState: { selectedModel: candidate.value } };
+					if (candidate.complete && candidate.stable && selectedModelMatches(state, request.modelId)) {
+						snapshot = { state, complete: true };
+						break;
+					}
+				}
+				await new Promise(resolve => setTimeout(resolve, 50));
+			}
+			if (!snapshot) {
+				throw new MonitorRequestError(409, 'VS Code is still applying the selected model. Try the configuration change again.');
 			}
 			const mutation = createSessionModelConfigurationMutation(
 				snapshot.state,
@@ -318,7 +466,7 @@ export class SessionMonitor implements vscode.Disposable {
 				request.key,
 				request.value,
 			);
-			const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+			const separator = content.length === 0 || !content.endsWith('\n') ? '\n' : '';
 			await fs.appendFile(sessionFile.filePath, `${separator}${JSON.stringify(mutation)}\n`, 'utf8');
 			await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
 			this.fileFingerprints.delete(sessionFile.filePath);
@@ -350,6 +498,23 @@ export class SessionMonitor implements vscode.Disposable {
 	}
 
 	async createSession(request: CreateSessionRequest): Promise<CreateSessionResult> {
+		if (!request.id) {return this.createSessionOnce(request);}
+		const existing = this.createSessionOperations.get(request.id);
+		if (existing) {return existing;}
+		const operation = this.createSessionOnce(request).catch(error => {
+			this.createSessionOperations.delete(request.id!);
+			throw error;
+		});
+		this.createSessionOperations.set(request.id, operation);
+		while (this.createSessionOperations.size > 32) {
+			const oldest = this.createSessionOperations.keys().next().value as string | undefined;
+			if (!oldest || oldest === request.id) {break;}
+			this.createSessionOperations.delete(oldest);
+		}
+		return operation;
+	}
+
+	private async createSessionOnce(request: CreateSessionRequest): Promise<CreateSessionResult> {
 		const source = request.sourceSessionResource
 			? this.getSessions().find(session => session.resource === request.sourceSessionResource)
 			: undefined;
@@ -357,24 +522,22 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(404, 'The source Copilot session is no longer available.');
 		}
 		const previousResources = new Set(this.getSessions().map(session => session.resource));
+		const previousSessionIds = new Set(
+			(await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories)).map(file => file.sessionId),
+		);
 		let resource: vscode.Uri;
 		try {
 			resource = await createNewChat(source ? vscode.Uri.parse(source.resource) : undefined);
 		} catch (error) {
-			let created: ActiveSessionState | undefined;
-			for (let attempt = 0; attempt < 40 && !created; attempt++) {
-				await this.poll();
-				created = this.getSessions()
-					.filter(session => !previousResources.has(session.resource))
-					.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0];
-				if (!created) {
-					await new Promise(resolve => setTimeout(resolve, 50));
-				}
+			let createdFile: SessionFile | undefined;
+			for (let attempt = 0; attempt < 100 && !createdFile; attempt++) {
+				createdFile = (await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories))
+					.find(file => !previousSessionIds.has(file.sessionId));
+				if (!createdFile) {await new Promise(resolve => setTimeout(resolve, 100));}
 			}
-			if (!created) {
-				throw error;
-			}
-			resource = vscode.Uri.parse(created.resource);
+			if (!createdFile) {throw error;}
+			resource = buildLocalSessionResource(createdFile.sessionId);
+			await this.refreshSession(createdFile, true);
 		}
 		const persisted = this.getSessions().find(session => session.resource === resource.toString());
 		if (persisted) {
@@ -404,8 +567,13 @@ export class SessionMonitor implements vscode.Disposable {
 
 	async setPermissionLevel(request: PermissionLevelRequest): Promise<void> {
 		const target = this.requireIdleSession(request.sessionResource);
-		const sessionFile = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
+		if (await setChatPermissionLevel(resource, request.permissionLevel)) {
+			this.liveExportTargetResource = request.sessionResource;
+			void this.refreshLiveExportWhenIdle();
+			return;
+		}
+		const sessionFile = await this.requireSessionFile(request.sessionResource);
 		await releaseChatSession(resource);
 		try {
 			await this.appendSessionMutation(
@@ -446,6 +614,8 @@ export class SessionMonitor implements vscode.Disposable {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		this.progressiveAbortController.abort();
 		clearInterval(this.fallbackPollTimer);
 		clearInterval(this.liveExportTimer);
 		this.nativeInputStateSync.dispose();
@@ -524,7 +694,7 @@ export class SessionMonitor implements vscode.Disposable {
 		if (changed) {
 			this.nativeInputStateSync.requestRefresh(0);
 		}
-		const files = await findSessionFiles(this.sessionDirectories);
+		const files = await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories);
 		const currentPaths = new Set(files.map(file => file.filePath));
 		changed = this.sessionStateCache.removeMissingPaths(currentPaths) || changed;
 		for (const filePath of this.fileFingerprints.keys()) {
@@ -532,9 +702,27 @@ export class SessionMonitor implements vscode.Disposable {
 				this.fileFingerprints.delete(filePath);
 			}
 		}
+		const activeSessionIds = new Set(files.map(file => file.sessionId));
+		for (const sessionId of this.progressiveSupplementMissingSince.keys()) {
+			if (!activeSessionIds.has(sessionId)) {
+				this.progressiveSupplementMissingSince.delete(sessionId);
+			}
+		}
 
-		for (const file of files) {
-			changed = await this.refreshSession(file) || changed;
+		const candidates = files.map(file => ({
+			resource: buildLocalSessionResource(file.sessionId).toString(),
+			size: file.size + file.supplementSize,
+		}));
+		const loadPlan = planSessionLoads(
+			candidates,
+			this.activeSession?.resource,
+			maximumPersistedSessionBytes,
+			maximumWorkspaceSessionBytes,
+		);
+		for (let index = 0; index < files.length; index++) {
+			const file = files[index];
+			const shouldLoad = loadPlan[index];
+			changed = await this.refreshSession(file, shouldLoad) || changed;
 		}
 
 		const sessions = this.getSessions();
@@ -545,40 +733,101 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 		if (changed) {
 			this.error = undefined;
-			this.emit();
+			this.emit('poll');
 		}
 	}
 
-	private async refreshSession(file: SessionFile): Promise<boolean> {
+	private async refreshSession(file: SessionFile, shouldLoad = true): Promise<boolean> {
 		try {
 			const statBefore = await fs.stat(file.filePath);
 			const supplementPath = await findExistingFile(
 				this.copilotTranscriptDirectories,
 				`${file.sessionId}.jsonl`,
 			);
+			if (supplementPath) {
+				this.progressiveSupplementMissingSince.delete(file.sessionId);
+			} else if (!this.progressiveSupplementMissingSince.has(file.sessionId)) {
+				this.progressiveSupplementMissingSince.set(file.sessionId, Date.now());
+			}
 			const supplementStatBefore = supplementPath ? await fs.stat(supplementPath) : undefined;
+			const totalSessionBytes = statBefore.size + (supplementStatBefore?.size ?? 0);
+			const resource = buildLocalSessionResource(file.sessionId).toString();
+			const currentSession = this.getSessions().find(session => session.resource === resource);
+			if (shouldPreserveProgressiveSession({
+				currentRevision: currentSession?.revision,
+				primarySize: file.size,
+				primaryMtimeMs: file.mtimeMs,
+				supplementPresent: supplementPath !== undefined,
+				supplementMissingSince: this.progressiveSupplementMissingSince.get(file.sessionId),
+				now: Date.now(),
+				mutationIndexing: this.progressiveMutationLoading.has(file.sessionId),
+			})) {
+				this.logProgressive('preserve', file, currentSession, {
+					supplementPresent: supplementPath !== undefined,
+					supplementMissingMs: supplementPath ? 0 : Date.now() - (this.progressiveSupplementMissingSince.get(file.sessionId) ?? Date.now()),
+					mutationLoading: this.progressiveMutationLoading.has(file.sessionId),
+				});
+				return false;
+			}
+			if (!shouldLoad || !isPersistedSessionWithinMemoryBudget(totalSessionBytes)) {
+				const isOversized = !isPersistedSessionWithinMemoryBudget(totalSessionBytes);
+				if (isOversized && supplementPath && supplementStatBefore) {
+					const progressive = await this.loadProgressiveSession(file, supplementPath, supplementStatBefore);
+					return progressive.changed;
+				}
+				const mutationRevision = `mutation-progressive:${file.size}:${file.mtimeMs}`;
+				if (isOversized && !supplementPath && this.progressiveMutationIndexes.has(resource)
+					&& this.fileFingerprints.get(file.filePath) === mutationRevision) {
+					return false;
+				}
+				if (isOversized && !supplementPath && this.fileFingerprints.get(file.filePath) !== mutationRevision) {
+					this.progressiveMutationIndexes.delete(resource);
+				}
+				const summary = isOversized && !supplementPath
+					? await readProgressiveMutationSummary(file.filePath)
+					: undefined;
+				const revision = `placeholder:${createFingerprint(statBefore, supplementStatBefore)}`;
+				if (revision === this.fileFingerprints.get(file.filePath)) {
+					return false;
+				}
+				this.fileFingerprints.set(file.filePath, revision);
+				this.sessionStateCache.upsertPersisted(file.filePath, {
+					resource,
+					sessionId: summary?.sessionId || file.sessionId,
+					title: summary?.title || `${isOversized ? 'Large' : 'Archived'} chat · open in VS Code (${formatBytes(totalSessionBytes)})`,
+					status: 'idle',
+					revision,
+					updatedAt: Math.max(statBefore.mtimeMs, supplementStatBefore?.mtimeMs ?? 0),
+					turns: [],
+					historyUnavailable: isOversized ? 'oversized' : 'archived',
+					permissionLevel: 'default',
+				});
+				this.logProgressive('placeholder', file, this.getSessions().find(session => session.resource === resource), {
+					supplementPresent: supplementPath !== undefined,
+					oversized: isOversized,
+				});
+				return true;
+			}
 			const fingerprint = createFingerprint(statBefore, supplementStatBefore);
 			if (fingerprint === this.fileFingerprints.get(file.filePath)) {
 				return false;
 			}
 
-			const content = await fs.readFile(file.filePath, 'utf8');
-			const statAfter = await fs.stat(file.filePath);
-			const stableRead = statBefore.size === statAfter.size
-				&& statBefore.mtimeMs === statAfter.mtimeMs
-				&& Buffer.byteLength(content) === statAfter.size;
+			const primaryRead = await readStableUtf8(file.filePath, statBefore);
+			const content = primaryRead.content;
+			const statAfter = primaryRead.statAfter;
+			const stableRead = primaryRead.stable;
 			const snapshot = parseMutationLogSnapshot(content);
 			let transcript = normalizeTranscript(snapshot.state);
 			let supplementComplete = true;
 			let supplementStable = true;
 			let supplementStatAfter = supplementStatBefore;
 
-			if (supplementPath && supplementStatBefore) {
-				const supplementContent = await fs.readFile(supplementPath, 'utf8');
-				supplementStatAfter = await fs.stat(supplementPath);
-				supplementStable = supplementStatBefore.size === supplementStatAfter.size
-					&& supplementStatBefore.mtimeMs === supplementStatAfter.mtimeMs
-					&& Buffer.byteLength(supplementContent) === supplementStatAfter.size;
+			if (supplementPath && supplementStatBefore && isPersistedSessionWithinMemoryBudget(supplementStatBefore.size)) {
+				const supplementRead = await readStableUtf8(supplementPath, supplementStatBefore);
+				const supplementContent = supplementRead.content;
+				supplementStatAfter = supplementRead.statAfter;
+				supplementStable = supplementRead.stable;
 				const supplement = parseCopilotTranscriptLog(supplementContent);
 				supplementComplete = supplement.complete;
 				transcript = mergeTranscriptSupplement(transcript, supplement);
@@ -613,21 +862,159 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 	}
 
+	private async loadProgressiveSession(
+		file: SessionFile,
+		supplementPath: string,
+		supplementStat: { size: number; mtimeMs: number },
+	): Promise<{ readonly handled: true; readonly changed: boolean }> {
+		const resource = buildLocalSessionResource(file.sessionId).toString();
+		const revision = `progressive:${file.size}:${file.mtimeMs}|${supplementStat.size}:${supplementStat.mtimeMs}`;
+		if (revision === this.fileFingerprints.get(file.filePath)) {
+			return { handled: true, changed: false };
+		}
+		let index = this.progressiveIndexes.get(resource);
+		if (!index || index.filePath !== supplementPath || index.size !== supplementStat.size || index.mtimeMs !== supplementStat.mtimeMs) {
+			index = await indexProgressiveTranscript(supplementPath);
+			if (!index.complete) {
+				this.schedulePoll(partialWriteRetryMs);
+				return { handled: true, changed: false };
+			}
+			this.progressiveIndexes.set(resource, index);
+		}
+		const start = Math.max(0, index.turnOffsets.length - 40);
+		const page = await loadProgressiveTranscriptPage(index, start, 40);
+		this.fileFingerprints.set(file.filePath, revision);
+		this.sessionStateCache.upsertPersisted(file.filePath, {
+			resource,
+			sessionId: index.sessionId || file.sessionId,
+			title: index.title,
+			status: page.turns.some(turn => turn.status === 'working') ? 'working' : 'idle',
+			revision,
+			updatedAt: Math.max(file.mtimeMs, supplementStat.mtimeMs),
+			turns: page.turns,
+			turnCount: page.totalCount,
+			historyStart: page.start,
+			historyTruncated: page.hasEarlier,
+			permissionLevel: 'default',
+		});
+		this.logProgressive('transcript-page-ready', file, this.getSessions().find(session => session.resource === resource), {
+			supplementPresent: true,
+			indexTurns: index.turnOffsets.length,
+		});
+		return { handled: true, changed: true };
+	}
+
+	private async loadProgressiveMutationSession(file: SessionFile): Promise<void> {
+		this.progressiveMutationLoading.add(file.sessionId);
+		this.logProgressive('mutation-load-start', file, this.getSessions().find(session => session.sessionId === file.sessionId));
+		try {
+			const resource = buildLocalSessionResource(file.sessionId).toString();
+			let index = this.progressiveMutationIndexes.get(resource);
+			if (!index || index.size !== file.size || index.mtimeMs !== file.mtimeMs) {
+				index = await this.getProgressiveMutationIndex(file);
+				this.progressiveMutationIndexes.set(resource, index);
+			}
+			const revision = `mutation-progressive:${file.size}:${file.mtimeMs}`;
+			const start = Math.max(0, index.requests.length - 40);
+			const page = await loadPagedMutationHistoryInWorker(index, start, 40, revision, this.progressiveAbortController.signal);
+			this.fileFingerprints.set(file.filePath, revision);
+			this.sessionStateCache.upsertPersisted(file.filePath, {
+				resource,
+				sessionId: index.sessionId || file.sessionId,
+				title: index.title,
+				status: page.turns.some(turn => turn.status === 'working') ? 'working' : 'idle',
+				revision,
+				updatedAt: file.mtimeMs,
+				turns: page.turns,
+				turnCount: page.totalCount,
+				historyStart: page.start,
+				historyTruncated: page.hasEarlier,
+				permissionLevel: 'default',
+			});
+			this.logProgressive('mutation-page-ready', file, this.getSessions().find(session => session.resource === resource), {
+				indexTurns: index.requests.length,
+			});
+			this.activeSession = this.getSessions().find(session => session.resource === resource) ?? this.activeSession;
+			this.error = undefined;
+			this.emit();
+		} finally {
+			this.progressiveMutationLoading.delete(file.sessionId);
+			this.logProgressive('mutation-load-finish', file, this.getSessions().find(session => session.sessionId === file.sessionId));
+		}
+	}
+
+	private markProgressiveMutationIndexing(file: SessionFile): void {
+		const resource = buildLocalSessionResource(file.sessionId).toString();
+		const current = this.getSessions().find(session => session.resource === resource);
+		if (!current) {return;}
+		this.sessionStateCache.upsertPersisted(file.filePath, {
+			...current,
+			status: 'loading',
+			historyUnavailable: 'indexing',
+		});
+		this.logProgressive('mutation-indexing', file, this.getSessions().find(session => session.resource === resource));
+		this.activeSession = this.getSessions().find(session => session.resource === resource) ?? current;
+		this.emit();
+	}
+
+	private restoreProgressiveMutationPlaceholder(file: SessionFile): void {
+		const resource = buildLocalSessionResource(file.sessionId).toString();
+		const current = this.getSessions().find(session => session.resource === resource);
+		if (!current) {return;}
+		this.sessionStateCache.upsertPersisted(file.filePath, {
+			...current,
+			status: 'idle',
+			historyUnavailable: 'oversized',
+		});
+		this.activeSession = this.getSessions().find(session => session.resource === resource) ?? current;
+	}
+
+	private async getProgressiveMutationIndex(file: SessionFile): Promise<PagedMutationHistoryIndex> {
+		const existing = this.progressiveMutationIndexing.get(file.sessionId);
+		if (existing) {return existing;}
+		const indexing = this.loadOrBuildProgressiveMutationIndex(file);
+		this.progressiveMutationIndexing.set(file.sessionId, indexing);
+		try {
+			return await indexing;
+		} finally {
+			this.progressiveMutationIndexing.delete(file.sessionId);
+		}
+	}
+
+	private async loadOrBuildProgressiveMutationIndex(file: SessionFile): Promise<PagedMutationHistoryIndex> {
+		const cachePath = path.join(this.progressiveIndexDirectory, `${file.sessionId}.json`);
+		try {
+			const cached = JSON.parse(await fs.readFile(cachePath, 'utf8')) as SerializedPagedMutationHistoryIndex;
+			if (cached.filePath === file.filePath && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
+				return deserializePagedMutationHistoryIndex(cached);
+			}
+		} catch {
+			// Missing or stale cache is rebuilt below.
+		}
+		const index = await indexPagedMutationHistoryInWorker(file.filePath, this.progressiveAbortController.signal);
+		await fs.mkdir(this.progressiveIndexDirectory, { recursive: true });
+		const temporaryPath = `${cachePath}.${process.pid}.tmp`;
+		await fs.writeFile(temporaryPath, JSON.stringify(serializePagedMutationHistoryIndex(index)), 'utf8');
+		await fs.rename(temporaryPath, cachePath).catch(async () => {
+			await fs.rm(cachePath, { force: true });
+			await fs.rename(temporaryPath, cachePath);
+		});
+		await pruneProgressiveIndexCache(this.progressiveIndexDirectory, cachePath);
+		return index;
+	}
+
 	private async refreshLiveExport(force = false): Promise<void> {
 		const targetSession = this.liveExportTargetResource
 			? this.getSessions().find(session => session.resource === this.liveExportTargetResource)
 			: this.activeSession;
 		const now = Date.now();
-		const sampleForConnectedClient = this.eventClientCount > 0 && now >= this.nextConnectedIdleLiveExportAt;
 		if (this.liveExportRunning
 			|| !targetSession
-			|| !(force
-				|| sampleForConnectedClient
-				|| this.liveExportTracker.shouldSample(force, targetSession.status, now))) {
+			|| targetSession.revision.startsWith('placeholder:')
+			|| targetSession.revision.startsWith('progressive:')
+			|| targetSession.revision.startsWith('mutation-progressive:')
+			|| !this.liveExportTracker.shouldSample(force, targetSession.status, now)) {
 			return;
-		}
-		if (sampleForConnectedClient) {
-			this.nextConnectedIdleLiveExportAt = now + connectedIdleLiveExportIntervalMs;
 		}
 
 		this.liveExportRunning = true;
@@ -638,7 +1025,8 @@ export class SessionMonitor implements vscode.Disposable {
 			if (bytes.byteLength === 0) {
 				return;
 			}
-			const exported = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
+			const serialized = Buffer.from(bytes).toString('utf8');
+			const exported = JSON.parse(serialized) as unknown;
 			if (!isRecord(exported)) {
 				return;
 			}
@@ -653,7 +1041,6 @@ export class SessionMonitor implements vscode.Disposable {
 			}
 			const transcript = this.liveExportTracker.stabilize(matchedSession.resource, rawTranscript);
 			this.completePendingTurn(matchedSession.resource, transcript.turns);
-			const serialized = JSON.stringify(exported);
 			const revision = `live:${serialized.length}:${hashString(serialized)}`;
 			if (revision === matchedSession.revision) {
 				return;
@@ -799,14 +1186,20 @@ export class SessionMonitor implements vscode.Disposable {
 	}
 
 	private async requireSessionFile(resource: string): Promise<SessionFile> {
-		const file = (await findSessionFiles(this.sessionDirectories))
+		const file = (await findSessionFiles(this.sessionDirectories, this.copilotTranscriptDirectories))
 			.find(candidate => buildLocalSessionResource(candidate.sessionId).toString() === resource);
 		if (!file) {throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');}
 		return file;
 	}
 
 	private async appendSessionMutation(file: SessionFile, mutation: unknown): Promise<void> {
-		const content = await fs.readFile(file.filePath, 'utf8');
+		const statBefore = await fs.stat(file.filePath);
+		if (!isPersistedSessionWithinMemoryBudget(statBefore.size + file.supplementSize)) {
+			throw new MonitorRequestError(413, 'This chat is too large for safe mobile changes. Open it in VS Code.');
+		}
+		const read = await readStableUtf8(file.filePath, statBefore);
+		if (!read.stable) {throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try again.');}
+		const content = read.content;
 		const snapshot = parseMutationLogSnapshot(content);
 		if (!snapshot.complete) {throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try again.');}
 		const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
@@ -843,8 +1236,33 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 	}
 
-	private emit(): void {
-		this.changeEmitter.fire(this.getState());
+	private emit(reason = 'update'): void {
+		const state = this.getState();
+		for (const session of state.sessions) {
+			const signature = diagnosticSessionSignature(session);
+			const previous = this.diagnosticSessionSignatures.get(session.resource);
+			if (previous !== signature) {
+				this.log(`[state:${reason}] ${diagnosticSessionLabel(session)} ${previous ?? '(new)'} -> ${signature}`);
+				this.diagnosticSessionSignatures.set(session.resource, signature);
+			}
+		}
+		const visibleResources = new Set(state.sessions.map(session => session.resource));
+		for (const resource of this.diagnosticSessionSignatures.keys()) {
+			if (!visibleResources.has(resource)) {
+				this.log(`[state:${reason}] ${shortResourceId(resource)} removed`);
+				this.diagnosticSessionSignatures.delete(resource);
+			}
+		}
+		this.changeEmitter.fire(state);
+	}
+
+	private logProgressive(
+		event: string,
+		file: SessionFile,
+		session?: ActiveSessionState,
+		details: Record<string, unknown> = {},
+	): void {
+		this.log(`[history:${event}] session=${file.sessionId.slice(-8)} primary=${file.size} supplement=${file.supplementSize} ${session ? diagnosticSessionSignature(session) : 'state=missing'} ${JSON.stringify(details)}`);
 	}
 
 	private getSessions(): ActiveSessionState[] {
@@ -864,9 +1282,14 @@ interface SessionFile {
 	readonly filePath: string;
 	readonly sessionId: string;
 	readonly mtimeMs: number;
+	readonly size: number;
+	readonly supplementSize: number;
 }
 
-async function findSessionFiles(directories: readonly string[]): Promise<SessionFile[]> {
+async function findSessionFiles(
+	directories: readonly string[],
+	supplementDirectories: readonly string[] = [],
+): Promise<SessionFile[]> {
 	const files: SessionFile[] = [];
 
 	for (const directory of directories) {
@@ -884,10 +1307,14 @@ async function findSessionFiles(directories: readonly string[]): Promise<Session
 			const filePath = path.join(directory, entry);
 			try {
 				const stat = await fs.stat(filePath);
+				const supplementPath = await findExistingFile(supplementDirectories, entry);
+				const supplementSize = supplementPath ? (await fs.stat(supplementPath)).size : 0;
 				files.push({
 					filePath,
 					sessionId: entry.slice(0, -'.jsonl'.length),
 					mtimeMs: stat.mtimeMs,
+					size: stat.size,
+					supplementSize,
 				});
 			} catch {
 				continue;
@@ -905,6 +1332,73 @@ function isFileNotFound(error: unknown): boolean {
 function summarize(value: string, length: number): string {
 	const singleLine = value.replace(/\s+/g, ' ').trim();
 	return singleLine.length > length ? `${singleLine.slice(0, length - 1)}…` : singleLine;
+}
+
+function findProgressiveRequestIndex(
+	requests: readonly Record<string, unknown>[],
+	sourceText: string,
+	sourceTimestamp: number | undefined,
+): number {
+	const expected = normalizeComparablePrompt(sourceText);
+	let bestIndex = -1;
+	let bestDistance = Number.POSITIVE_INFINITY;
+	for (let index = 0; index < requests.length; index++) {
+		const request = requests[index];
+		const message = request.message && typeof request.message === 'object' && !Array.isArray(request.message)
+			? request.message as Record<string, unknown>
+			: undefined;
+		if (normalizeComparablePrompt(typeof message?.text === 'string' ? message.text : '') !== expected) {continue;}
+		const timestamp = typeof request.timestamp === 'number' ? request.timestamp : undefined;
+		const distance = sourceTimestamp !== undefined && timestamp !== undefined
+			? Math.abs(timestamp - sourceTimestamp)
+			: index;
+		if (distance < bestDistance) {
+			bestDistance = distance;
+			bestIndex = index;
+		}
+	}
+	return bestIndex;
+}
+
+function normalizeComparablePrompt(value: string): string {
+	return value.replace(/^User:\s*/i, '').replace(/\s+/g, ' ').trim();
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes >= 1024 * 1024) {
+		return `${Math.round(bytes / (1024 * 1024))} MB`;
+	}
+	return `${Math.round(bytes / 1024)} KB`;
+}
+
+async function pruneProgressiveIndexCache(directory: string, retainedPath: string): Promise<void> {
+	let entries: Array<{ path: string; size: number; mtimeMs: number }> = [];
+	try {
+		entries = await Promise.all((await fs.readdir(directory))
+			.filter(name => name.endsWith('.json'))
+			.map(async name => {
+				const filePath = path.join(directory, name);
+				const stat = await fs.stat(filePath);
+				return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs };
+			}));
+	} catch {
+		return;
+	}
+	entries.sort((left, right) => right.mtimeMs - left.mtimeMs);
+	let retainedBytes = 0;
+	let retainedFiles = 0;
+	for (const entry of entries) {
+		const keep = entry.path === retainedPath || (
+			retainedFiles < maximumProgressiveIndexCacheFiles
+			&& retainedBytes + entry.size <= maximumProgressiveIndexCacheBytes
+		);
+		if (keep) {
+			retainedFiles++;
+			retainedBytes += entry.size;
+		} else {
+			await fs.rm(entry.path, { force: true }).catch(() => undefined);
+		}
+	}
 }
 
 function decodeLocalSessionId(resource: vscode.Uri): string {
@@ -952,8 +1446,38 @@ function createFingerprint(
 	return `${primary.size}:${primary.mtimeMs}|${supplement?.size ?? 0}:${supplement?.mtimeMs ?? 0}`;
 }
 
+function diagnosticSessionSignature(session: ActiveSessionState): string {
+	const revision = session.revision.split(':', 1)[0] || 'none';
+	const rangeStart = session.historyStart ?? Math.max(0, (session.turnCount ?? session.turns.length) - session.turns.length);
+	return [
+		`revision=${revision}`,
+		`status=${session.status}`,
+		`history=${session.historyUnavailable ?? (session.historyTruncated ? 'paged' : 'loaded')}`,
+		`range=${rangeStart}-${rangeStart + session.turns.length}`,
+		`count=${session.turnCount ?? session.turns.length}`,
+		`titleLength=${session.title.length}`,
+	].join(' ');
+}
+
+function diagnosticSessionLabel(session: ActiveSessionState): string {
+	return `session=${session.sessionId.slice(-8)} resource=${shortResourceId(session.resource)}`;
+}
+
+function shortResourceId(resource: string): string {
+	return resource.length <= 20 ? resource : resource.slice(-20);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function selectedModelMatches(state: Record<string, unknown>, requestedIdentifier: string): boolean {
+	const inputState = isRecord(state.inputState) ? state.inputState : undefined;
+	const selectedModel = isRecord(inputState?.selectedModel) ? inputState.selectedModel : undefined;
+	const persistedIdentifier = selectedModel?.identifier;
+	return typeof persistedIdentifier === 'string'
+		&& (persistedIdentifier === requestedIdentifier
+			|| persistedIdentifier.split('/').at(-1) === requestedIdentifier.split('/').at(-1));
 }
 
 function parsePermissionLevel(state: Record<string, unknown>): 'default' | 'autoApprove' | 'autopilot' {

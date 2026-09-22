@@ -170,9 +170,10 @@ describe('MonitorServer', () => {
 
 			assert.equal((await fetch(`${baseUrl}/api/sessions/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionResource: 'session-2', title: 'Renamed' }) })).status, 204);
 			assert.deepEqual(backend.renames, [{ sessionResource: 'session-2', title: 'Renamed' }]);
-			const newResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceSessionResource: 'session-2' }) });
+			const newResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'new-1', sourceSessionResource: 'session-2' }) });
 			assert.equal(newResponse.status, 201);
 			assert.deepEqual(await newResponse.json(), { sessionResource: 'new-session' });
+			assert.deepEqual(backend.created, [{ id: 'new-1', sourceSessionResource: 'session-2' }]);
 			assert.equal((await fetch(`${baseUrl}/api/sessions/permission`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionResource: 'session-2', permissionLevel: 'autopilot' }) })).status, 204);
 			assert.deepEqual(backend.permissions, [{ sessionResource: 'session-2', permissionLevel: 'autopilot' }]);
 

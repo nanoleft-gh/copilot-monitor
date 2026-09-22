@@ -2,6 +2,7 @@ import * as http from 'node:http';
 import {
 	GatewayCreateSessionRequest,
 	GatewayEditTurnRequest,
+	GatewayHistoryPageRequest,
 	GatewayPermissionLevelRequest,
 	GatewayRenameSessionRequest,
 	GatewayModelSelectionRequest,
@@ -11,6 +12,7 @@ import {
 	GatewayState,
 	GatewayToolDecisionRequest,
 	GatewayWindowState,
+	HistoryPageResult,
 	MonitorRequestError,
 	MonitorState,
 	SendMessageResult,
@@ -75,6 +77,8 @@ export class AggregateMonitor {
 			sessionRevision: request.sessionRevision,
 			requestId: request.requestId,
 			text: request.text,
+			...(request.sourceText !== undefined ? { sourceText: request.sourceText } : {}),
+			...(request.sourceTimestamp !== undefined ? { sourceTimestamp: request.sourceTimestamp } : {}),
 		});
 	}
 
@@ -88,6 +92,16 @@ export class AggregateMonitor {
 		});
 	}
 
+	async loadHistory(request: GatewayHistoryPageRequest): Promise<HistoryPageResult> {
+		const connection = this.requireConnection(request.windowId);
+		return connection.postJson<HistoryPageResult>('/api/sessions/history', {
+			sessionResource: request.sessionResource,
+			sessionRevision: request.sessionRevision,
+			before: request.before,
+			limit: request.limit,
+		});
+	}
+
 	async renameSession(request: GatewayRenameSessionRequest): Promise<void> {
 		const connection = this.requireConnection(request.windowId);
 		await connection.postJson('/api/sessions/rename', { sessionResource: request.sessionResource, title: request.title });
@@ -95,7 +109,10 @@ export class AggregateMonitor {
 
 	async createSession(request: GatewayCreateSessionRequest): Promise<CreateSessionResult> {
 		const connection = this.requireConnection(request.windowId);
-		return connection.postJson<CreateSessionResult>('/api/sessions/new', { sourceSessionResource: request.sourceSessionResource });
+		return connection.postJson<CreateSessionResult>('/api/sessions/new', {
+			...(request.id !== undefined ? { id: request.id } : {}),
+			...(request.sourceSessionResource !== undefined ? { sourceSessionResource: request.sourceSessionResource } : {}),
+		});
 	}
 
 	async setPermissionLevel(request: GatewayPermissionLevelRequest): Promise<void> {

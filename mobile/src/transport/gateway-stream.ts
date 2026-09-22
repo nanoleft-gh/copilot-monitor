@@ -1,5 +1,5 @@
 import type { GatewaySnapshot, HostProfile } from './types';
-import { parseGatewaySnapshot } from './gateway-client';
+import { fetchGatewaySnapshot, parseGatewaySnapshot } from './gateway-client';
 
 type StreamHandlers = {
   onSnapshot: (snapshot: GatewaySnapshot) => void;
@@ -39,7 +39,14 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
     handlers.onStatus?.('connecting');
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
-      connect();
+      void fetchGatewaySnapshot(host)
+        .then(snapshot => {
+          if (!closed) handlers.onSnapshot(snapshot);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (!closed) connect();
+        });
     }, reconnectDelayMs);
   };
 

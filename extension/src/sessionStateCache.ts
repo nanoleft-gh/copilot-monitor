@@ -1,12 +1,20 @@
 import type { ActiveSessionState, SessionModelState } from './protocol';
 
+export const maximumRetainedTurns = 120;
+export const maximumPersistedSessionBytes = 16 * 1024 * 1024;
+export const maximumWorkspaceSessionBytes = 32 * 1024 * 1024;
+
+export function isPersistedSessionWithinMemoryBudget(bytes: number): boolean {
+	return Number.isFinite(bytes) && bytes >= 0 && bytes <= maximumPersistedSessionBytes;
+}
+
 export class SessionStateCache {
 	private readonly persistedByPath = new Map<string, ActiveSessionState>();
 	private readonly liveByResource = new Map<string, ActiveSessionState>();
 	private readonly transientByResource = new Map<string, ActiveSessionState>();
 
 	upsertPersisted(filePath: string, session: ActiveSessionState): void {
-		this.persistedByPath.set(filePath, session);
+		this.persistedByPath.set(filePath, compactSession(session));
 		this.transientByResource.delete(session.resource);
 		const live = this.liveByResource.get(session.resource);
 		if (live && persistedCaughtUp(session, live)) {
@@ -16,7 +24,7 @@ export class SessionStateCache {
 
 	upsertTransient(session: ActiveSessionState): void {
 		if (!this.getPersistedByResource(session.resource)) {
-			this.transientByResource.set(session.resource, session);
+			this.transientByResource.set(session.resource, compactSession(session));
 		}
 	}
 
@@ -40,12 +48,12 @@ export class SessionStateCache {
 		if (!persisted) {
 			return false;
 		}
-		this.liveByResource.set(session.resource, {
+		this.liveByResource.set(session.resource, compactSession({
 			...session,
 			resource: persisted.resource,
 			sessionId: persisted.sessionId,
 			title: persisted.title,
-		});
+		}));
 		return true;
 	}
 
@@ -124,4 +132,18 @@ function persistedCaughtUp(persisted: ActiveSessionState, live: ActiveSessionSta
 	return persistedLast !== undefined
 		&& persistedLast.timestamp > liveLast.timestamp
 		&& !live.turns.some(turn => turn.id === persistedLast.id);
+}
+
+export function compactSession(session: ActiveSessionState): ActiveSessionState {
+	const turnCount = Math.max(session.turnCount ?? session.turns.length, session.turns.length);
+	const turns = session.turns.length > maximumRetainedTurns
+		? session.turns.slice(-maximumRetainedTurns)
+		: session.turns;
+	return {
+		...session,
+		turnCount,
+		turns,
+		historyTruncated: turnCount > turns.length,
+		historyStart: Math.max(0, turnCount - turns.length),
+	};
 }

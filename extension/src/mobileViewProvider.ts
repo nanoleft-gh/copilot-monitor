@@ -13,6 +13,7 @@ export interface MobileViewRuntime {
 export class MobileViewProvider implements vscode.WebviewViewProvider {
 	private view: vscode.WebviewView | undefined;
 	private refreshTimer: NodeJS.Timeout | undefined;
+	private refreshRunning: Promise<void> | undefined;
 	private renderedUrl: string | undefined;
 
 	constructor(
@@ -22,6 +23,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 
 	resolveWebviewView(view: vscode.WebviewView): void {
 		this.view = view;
+		this.renderedUrl = undefined;
 		view.webview.options = {
 			enableScripts: true,
 			localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media', 'vendor')],
@@ -54,6 +56,18 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async refresh(): Promise<void> {
+		if (this.refreshRunning) {
+			return this.refreshRunning;
+		}
+		this.refreshRunning = this.refreshNow();
+		try {
+			await this.refreshRunning;
+		} finally {
+			this.refreshRunning = undefined;
+		}
+	}
+
+	private async refreshNow(): Promise<void> {
 		const view = this.view;
 		if (!view) {
 			return;

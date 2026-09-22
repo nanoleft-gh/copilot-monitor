@@ -80,6 +80,9 @@ export type SessionSummary = {
   status: 'idle' | 'working' | 'loading';
   updatedAt?: number;
   turnCount?: number;
+  historyUnavailable?: 'archived' | 'oversized' | 'indexing';
+  historyTruncated?: boolean;
+  historyStart?: number;
   turns: TranscriptTurn[];
   modelName?: string;
   model?: SessionModelState;
@@ -100,4 +103,13 @@ export type GatewaySnapshot = {
   version: 2;
   gatewayStartedAt: number;
   windows: WindowSnapshot[];
+};
+
+export type HistoryPage = {
+  turns: TranscriptTurn[];
+  totalCount: number;
+  start: number;
+  end: number;
+  hasEarlier: boolean;
+  revision: string;
 };

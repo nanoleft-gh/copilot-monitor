@@ -90,7 +90,11 @@ class MonitorRuntime implements vscode.Disposable {
 		if (!this.gateway) {
 			return this.start(false);
 		}
-		const address = await this.gateway.resolveAddress();
+		const resolved = await this.gateway.resolveAddress();
+		const address = {
+			...resolved,
+			url: `http://${findLanAddress()}:${resolved.port}/`,
+		};
 		this.address = address;
 		this.statusBar.tooltip = `Copilot Monitor · ${address.url}`;
 		return address;
@@ -110,12 +114,16 @@ class MonitorRuntime implements vscode.Disposable {
 			: defaultGatewayPort;
 
 		const html = await fs.readFile(this.context.asAbsolutePath('media/dashboard.html'), 'utf8');
-		const mermaidScript = await fs.readFile(
+		const mermaidScript = (await fs.readFile(
 			this.context.asAbsolutePath('media/vendor/mermaid-11.16.0.min.js'),
 			'utf8',
-		);
+		)).replaceAll('Function("return this")()', 'globalThis');
 		const iconSvg = await fs.readFile(this.context.asAbsolutePath('public/icon.svg'), 'utf8');
-		const monitor = new SessionMonitor(this.context, this.windowId);
+		const monitor = new SessionMonitor(
+			this.context,
+			this.windowId,
+			message => this.output.appendLine(message),
+		);
 		const localServer = new MonitorServer(monitor, {
 			host: '127.0.0.1',
 			port: 0,
@@ -160,8 +168,8 @@ class MonitorRuntime implements vscode.Disposable {
 			this.statusBar.tooltip = `Copilot Monitor · ${address.url}`;
 			this.statusBar.show();
 			await vscode.commands.executeCommand('setContext', 'githubCopilotMonitor.running', true);
-			this.output.appendLine(`Window bridge listening at http://127.0.0.1:${localAddress.port}/`);
-			this.output.appendLine(`Shared dashboard available at ${address.url}`);
+			this.output.appendLine(`Internal bridge for this window: http://127.0.0.1:${localAddress.port}/ (not a pairing address)`);
+			this.output.appendLine(`Machine-wide pairing address: ${address.url}`);
 			return address;
 		} catch (error) {
 			await registry.stop();

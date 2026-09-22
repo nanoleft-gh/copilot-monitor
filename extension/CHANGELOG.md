@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.3]
+
+- Made machine-wide window registry heartbeats atomic and serialized so concurrent VS Code Insiders windows cannot expose empty or stale descriptors.
+- Recovered a briefly missing lease from the healthy same-host gateway during rolling extension updates instead of replacing it on a random port.
+- Clarified that each window's random loopback bridge is internal while all windows share one stable machine-wide pairing gateway.
+- Refreshed the advertised LAN address for QR, open, and copy actions after Wi-Fi or hotspot changes without restarting VS Code.
+- Replaced large-chat placeholders with progressive 40-turn history pages using compact transcript indexes or background mutation-log workers.
+- Preserved real titles, prompts, assistant responses, completion state, and editable request IDs while discarding giant tool/result payloads from remote history.
+- Cached compact mutation indexes by source fingerprint and bounded cache growth; first indexing stays off the extension-host event loop and later opens use the cache.
+- Limited startup transcript parsing to 32 MB per workspace and retained only the newest 120 turns per loaded chat while preserving total counts.
+- Added Earlier/Newer paging on desktop and Android with constant client memory and variable-page boundary safety.
+- Added explicit indexing and truncated-history states so background work never appears as indefinite loading or missing history.
+- Fixed a poll fallthrough that alternated unchanged progressive pages with large-chat placeholders, causing visible flashing.
+- Added change-only, privacy-safe history transition diagnostics in the Copilot Monitor output channel and browser console.
+- Used bounded stable reads and combined primary/supplement budgets so concurrently growing transcript files cannot bypass memory limits.
+- Rejected oversized live-export payloads before cloning, parsing, or retaining them in the monitor.
+- Serialized sidebar refreshes so slow gateway startup cannot accumulate overlapping asynchronous work.
+
 ## [1.1.0]
 
 - Fixed a Stable VS Code race where a blank chat was created successfully but its asynchronously persisted identity appeared just after the New Chat request returned an error.

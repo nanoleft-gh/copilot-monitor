@@ -1,7 +1,13 @@
 import * as assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { ActiveSessionState } from '../protocol';
-import { SessionStateCache } from '../sessionStateCache';
+import {
+	isPersistedSessionWithinMemoryBudget,
+	maximumPersistedSessionBytes,
+	maximumRetainedTurns,
+	maximumWorkspaceSessionBytes,
+	SessionStateCache,
+} from '../sessionStateCache';
 import type { TranscriptTurn } from '../transcript';
 
 function turn(id: string, timestamp: number, status: TranscriptTurn['status'] = 'completed'): TranscriptTurn {
@@ -139,5 +145,21 @@ describe('SessionStateCache', () => {
 		assert.deepEqual(cache.getVisibleSessions().map(candidate => candidate.resource), ['new-resource']);
 		cache.upsertPersisted('new.jsonl', session('new-resource', 'Persisted chat', [turn('n1', 2)], 'disk'));
 		assert.deepEqual(cache.getVisibleSessions().map(candidate => candidate.title), ['Persisted chat']);
+	});
+
+	it('retains only recent turns while preserving the total count', () => {
+		const cache = new SessionStateCache();
+		const turns = Array.from({ length: maximumRetainedTurns + 30 }, (_, index) => turn(`turn-${index}`, index));
+		cache.upsertPersisted('large.jsonl', session('large-resource', 'Large', turns, 'disk'));
+		const visible = cache.getVisibleSessions()[0];
+		assert.equal(visible.turnCount, maximumRetainedTurns + 30);
+		assert.equal(visible.turns.length, maximumRetainedTurns);
+		assert.equal(visible.turns[0].id, 'turn-30');
+	});
+
+	it('rejects persisted session files above the memory budget', () => {
+		assert.equal(isPersistedSessionWithinMemoryBudget(maximumPersistedSessionBytes), true);
+		assert.equal(isPersistedSessionWithinMemoryBudget(maximumPersistedSessionBytes + 1), false);
+		assert.ok(maximumWorkspaceSessionBytes >= maximumPersistedSessionBytes);
 	});
 });

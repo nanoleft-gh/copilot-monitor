@@ -8,11 +8,14 @@ interface MonitorAddress {
 
 suite('Copilot Monitor extension', () => {
 	teardown(async () => {
-		await vscode.commands.executeCommand('githubCopilotMonitor.stop', false);
+		const commands = await vscode.commands.getCommands(true);
+		if (commands.includes('githubCopilotMonitor.stop')) {
+			await vscode.commands.executeCommand('githubCopilotMonitor.stop', false);
+		}
 	});
 
 	test('activates and serves its tokenless aggregate dashboard', async () => {
-		const extension = vscode.extensions.getExtension('maheshdoiphode.githubcopilot-monitor');
+		const extension = vscode.extensions.getExtension('nanoleft.githubcopilot-monitor');
 		assert.ok(extension, 'Extension is installed in the development host.');
 		await extension.activate();
 

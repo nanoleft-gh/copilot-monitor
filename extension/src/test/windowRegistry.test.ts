@@ -65,4 +65,47 @@ describe('WindowRegistry', () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it('does not recreate a descriptor when stopped during queued heartbeats', async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-registry-'));
+		const registry = new WindowRegistry(root, 'window-queued');
+		try {
+			await registry.start({
+				hostId: 'host-1',
+				productName: 'Visual Studio Code - Insiders',
+				productVersion: '1.130.0-insider',
+				localPort: 32124,
+				workspaceName: 'Queued',
+				workspaceFolders: [],
+				startedAt: 100,
+				pid: 1234,
+			});
+			const writer = registry as unknown as { writeHeartbeat(): Promise<void> };
+			const writes = Array.from({ length: 20 }, () => writer.writeHeartbeat());
+			await registry.stop();
+			await Promise.all(writes);
+			assert.deepEqual(await readActiveWindowDescriptors(root), []);
+			await assert.rejects(fs.stat(path.join(root, 'window-queued.json')));
+		} finally {
+			await registry.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it('prunes stale malformed descriptors and abandoned temporary writes', async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-registry-'));
+		try {
+			const malformed = path.join(root, 'broken.json');
+			const temporary = path.join(root, 'window.json.123.tmp');
+			await fs.writeFile(malformed, Buffer.alloc(64));
+			await fs.writeFile(temporary, '{}');
+			await fs.utimes(malformed, 1, 1);
+			await fs.utimes(temporary, 1, 1);
+			assert.deepEqual(await readActiveWindowDescriptors(root, 10_000, 1_000), []);
+			await assert.rejects(fs.stat(malformed));
+			await assert.rejects(fs.stat(temporary));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

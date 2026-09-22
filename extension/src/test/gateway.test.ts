@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { GatewayBackend, GatewayServer } from '../gatewayServer';
 import { GatewayCoordinator } from '../gatewayCoordinator';
-import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewayToolDecisionRequest } from '../protocol';
+import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewayToolDecisionRequest } from '../protocol';
 
 const emptyState: GatewayState = { version: 2, gatewayStartedAt: 1, windows: [] };
 
@@ -14,6 +14,7 @@ class TestGatewayBackend implements GatewayBackend {
 	messages: GatewaySendMessageRequest[] = [];
 	edits: GatewayEditTurnRequest[] = [];
 	selections: GatewaySelectSessionRequest[] = [];
+	historyRequests: GatewayHistoryPageRequest[] = [];
 	clientCounts: number[] = [];
 	toolDecisions: GatewayToolDecisionRequest[] = [];
 	modelSelections: GatewayModelSelectionRequest[] = [];
@@ -44,6 +45,11 @@ class TestGatewayBackend implements GatewayBackend {
 
 	async selectSession(request: GatewaySelectSessionRequest): Promise<void> {
 		this.selections.push(request);
+	}
+
+	async loadHistory(request: GatewayHistoryPageRequest) {
+		this.historyRequests.push(request);
+		return { turns: [], totalCount: 80, start: 0, end: 40, hasEarlier: false, revision: request.sessionRevision };
 	}
 
 	setEventClientCount(count: number): void {
@@ -120,6 +126,14 @@ describe('GatewayServer', () => {
 			})).status, 204);
 			assert.deepEqual(backend.selections, [selection]);
 
+			const history = { windowId: 'w1', sessionResource: 's1', sessionRevision: 'rev-1', before: 40, limit: 40 };
+			const historyResponse = await fetch(`${baseUrl}/api/sessions/history`, {
+				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(history),
+			});
+			assert.equal(historyResponse.status, 200);
+			assert.equal((await historyResponse.json() as { revision: string }).revision, 'rev-1');
+			assert.deepEqual(backend.historyRequests, [history]);
+
 			const decision = { windowId: 'w1', sessionResource: 's1', requestId: 'r1', toolCallId: 't1', decision: 'allow' };
 			assert.equal((await fetch(`${baseUrl}/api/tools/decision`, {
 				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(decision),
@@ -143,7 +157,7 @@ describe('GatewayServer', () => {
 			const rename = { windowId: 'w1', sessionResource: 's1', title: 'Renamed' };
 			assert.equal((await fetch(`${baseUrl}/api/sessions/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rename) })).status, 204);
 			assert.deepEqual(backend.renames, [rename]);
-			const created = { windowId: 'w2', sourceSessionResource: 's2' };
+			const created = { id: 'new-1', windowId: 'w2', sourceSessionResource: 's2' };
 			const createdResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(created) });
 			assert.equal(createdResponse.status, 201);
 			assert.deepEqual(await createdResponse.json(), { sessionResource: 'new-session' });
@@ -229,7 +243,7 @@ describe('GatewayCoordinator', () => {
 		}
 	});
 
-	it('converges when a healthy foreign lease replaces a live leader lease', async () => {
+	it('recovers a missing lease without replacing the healthy preferred gateway', async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-gateway-'));
 		const port = await findFreePort();
 		const options = {
@@ -242,20 +256,20 @@ describe('GatewayCoordinator', () => {
 			html: '<!doctype html>',
 			mermaidScript: 'globalThis.mermaid = {};',
 		};
-		const first = new GatewayCoordinator({ ...options, ownerId: 'window-1', retryIntervalMs: 500 });
+		const first = new GatewayCoordinator({ ...options, ownerId: 'window-1', retryIntervalMs: 25 });
 		const second = new GatewayCoordinator({ ...options, ownerId: 'window-2', retryIntervalMs: 25 });
 		try {
 			assert.equal((await first.start()).port, port);
 			await fs.rm(path.join(root, 'gateway.json'), { force: true });
 			const secondAddress = await second.start();
-			assert.notEqual(secondAddress.port, port);
+			assert.equal(secondAddress.port, port);
 			assert.equal(first.isLeader, true);
-			assert.equal(second.isLeader, true);
-
-			await waitFor(() => !first.isLeader, 2_000);
-			assert.equal(second.isLeader, true);
-			assert.equal((await first.resolveAddress()).port, secondAddress.port);
-			await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`));
+			assert.equal(second.isLeader, false);
+			assert.equal((await first.resolveAddress()).port, port);
+			assert.equal((await fetch(`http://127.0.0.1:${port}/api/health`)).status, 200);
+			const restoredLease = JSON.parse(await fs.readFile(path.join(root, 'gateway.json'), 'utf8')) as { port: number; nonce: string };
+			assert.equal(restoredLease.port, port);
+			assert.ok(restoredLease.nonce);
 		} finally {
 			await first.stop();
 			await second.stop();

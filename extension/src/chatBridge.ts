@@ -78,12 +78,18 @@ export async function editAndResubmitPrompt(
 export async function focusChatSession(resource: vscode.Uri, availableCommands?: readonly string[]): Promise<void> {
 	const commands = availableCommands ?? await vscode.commands.getCommands(true);
 	if (commands.includes(internalSwitchSessionCommand)) {
+		const expectedResource = resource.toString();
 		const switched = await vscode.commands.executeCommand<boolean>(
 			internalSwitchSessionCommand,
-			resource.toString(),
+			expectedResource,
 		);
 		if (switched) {
-			return;
+			if (!commands.includes(getCurrentSessionCommand)) {return;}
+			for (let attempt = 0; attempt < 40; attempt++) {
+				const activeResource = await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand);
+				if (activeResource === expectedResource) {return;}
+				await new Promise(resolve => setTimeout(resolve, 25));
+			}
 		}
 	}
 
@@ -159,13 +165,29 @@ export async function createNewChat(sourceResource?: vscode.Uri): Promise<vscode
 	if (sourceResource) {
 		await focusChatSession(sourceResource, commands);
 	}
+	const previousResource = commands.includes(getCurrentSessionCommand)
+		? await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand)
+		: undefined;
 	await vscode.commands.executeCommand(newLocalChatCommand);
 	if (commands.includes(getCurrentSessionCommand)) {
-		for (let attempt = 0; attempt < 20; attempt++) {
+		for (let attempt = 0; attempt < 80; attempt++) {
 			const value = await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand);
-			if (value && value !== sourceResource?.toString()) {return vscode.Uri.parse(value);}
+			if (value && value !== previousResource && value !== sourceResource?.toString()) {return vscode.Uri.parse(value);}
 			await new Promise(resolve => setTimeout(resolve, 25));
 		}
 	}
 	throw new Error('VS Code created a chat but did not expose its session identity.');
+}
+
+export type ChatPermissionLevel = 'default' | 'autoApprove' | 'autopilot';
+
+export async function setChatPermissionLevel(resource: vscode.Uri, level: ChatPermissionLevel): Promise<boolean> {
+	const commands = await vscode.commands.getCommands(true);
+	if (!commands.includes(submitChatRequestCommand)) {return false;}
+	await focusChatSession(resource, commands);
+	const slashCommand = level === 'autoApprove'
+		? '/autoApprove'
+		: level === 'autopilot' ? '/autopilot' : '/disableAutoApprove';
+	await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: slashCommand });
+	return true;
 }

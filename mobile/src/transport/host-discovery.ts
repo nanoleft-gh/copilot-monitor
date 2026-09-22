@@ -1,7 +1,7 @@
 import * as Network from 'expo-network';
 import type { HostProfile } from './types';
+import { discoveryPorts } from './host-discovery-ports';
 
-const gatewayPort = 43121;
 const probeTimeoutMs = 650;
 const probeConcurrency = 24;
 
@@ -10,7 +10,15 @@ export async function discoverHostEndpoint(host: HostProfile): Promise<string | 
   const prefix = ipv4Prefix(localAddress);
   if (!prefix) return undefined;
 
-  const candidates = Array.from({ length: 254 }, (_, index) => `http://${prefix}.${index + 1}:${gatewayPort}/`);
+  for (const port of discoveryPorts(host.endpoint)) {
+    const found = await discoverOnPort(prefix, port, host.id);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function discoverOnPort(prefix: string, port: number, hostId: string): Promise<string | undefined> {
+  const candidates = Array.from({ length: 254 }, (_, index) => `http://${prefix}.${index + 1}:${port}/`);
   let cursor = 0;
   let found: string | undefined;
 
@@ -18,7 +26,7 @@ export async function discoverHostEndpoint(host: HostProfile): Promise<string | 
     while (!found) {
       const endpoint = candidates[cursor++];
       if (!endpoint) return;
-      if (await endpointMatchesHost(endpoint, host.id)) {
+      if (await endpointMatchesHost(endpoint, hostId)) {
         found = endpoint;
         return;
       }

@@ -9,6 +9,9 @@ export interface ActiveSessionState {
 	readonly updatedAt?: number;
 	readonly turns: readonly TranscriptTurn[];
 	readonly turnCount?: number;
+	readonly historyUnavailable?: 'archived' | 'oversized' | 'indexing';
+	readonly historyTruncated?: boolean;
+	readonly historyStart?: number;
 	readonly model?: SessionModelState;
 	readonly permissionLevel: ChatPermissionLevel;
 }
@@ -98,12 +101,30 @@ export interface EditTurnRequest {
 	readonly sessionRevision: string;
 	readonly requestId: string;
 	readonly text: string;
+	readonly sourceText?: string;
+	readonly sourceTimestamp?: number;
 }
 
 export type EditTurnResult = SendMessageResult;
 
 export interface SelectSessionRequest {
 	readonly sessionResource: string;
+}
+
+export interface HistoryPageRequest {
+	readonly sessionResource: string;
+	readonly sessionRevision: string;
+	readonly before: number;
+	readonly limit?: number;
+}
+
+export interface HistoryPageResult {
+	readonly turns: readonly TranscriptTurn[];
+	readonly totalCount: number;
+	readonly start: number;
+	readonly end: number;
+	readonly hasEarlier: boolean;
+	readonly revision: string;
 }
 
 export interface GatewayWindowState extends MonitorState {
@@ -118,6 +139,10 @@ export interface GatewayState {
 }
 
 export interface GatewaySendMessageRequest extends SendMessageRequest {
+	readonly windowId: string;
+}
+
+export interface GatewayHistoryPageRequest extends HistoryPageRequest {
 	readonly windowId: string;
 }
 
@@ -172,6 +197,7 @@ export interface GatewayRenameSessionRequest extends RenameSessionRequest {
 }
 
 export interface CreateSessionRequest {
+	readonly id?: string;
 	readonly sourceSessionResource?: string;
 }
 
@@ -200,4 +226,23 @@ export class MonitorRequestError extends Error {
 		super(message);
 		this.name = 'MonitorRequestError';
 	}
+}
+
+export interface HistoryPageRequest {
+	readonly sessionResource: string;
+	readonly before: number;
+	readonly limit?: number;
+}
+
+export interface HistoryPageResult {
+	readonly turns: readonly TranscriptTurn[];
+	readonly totalCount: number;
+	readonly start: number;
+	readonly end: number;
+	readonly hasEarlier: boolean;
+	readonly revision: string;
+}
+
+export interface GatewayHistoryPageRequest extends HistoryPageRequest {
+	readonly windowId: string;
 }

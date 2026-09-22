@@ -174,7 +174,9 @@ export default function HostOverviewScreen() {
                         {session.status === 'working' && <Text style={styles.workingBadge}>Working</Text>}
                       </View>
                       <Text numberOfLines={1} style={styles.sessionMeta}>
-                        {(session.turnCount ?? session.turns.length) === 0
+                        {session.historyUnavailable
+						  ? session.historyUnavailable === 'indexing' ? 'Indexing history…' : 'History available in VS Code'
+                          : (session.turnCount ?? session.turns.length) === 0
                           ? 'Ready to chat'
                           : `${session.turnCount ?? session.turns.length} messages${session.modelName ? ` · ${session.modelName}` : ''}`}
                       </Text>

@@ -38,6 +38,14 @@ describe('model configuration update', () => {
 		);
 	});
 
+	it('accepts the persisted model id when the catalog uses a vendor-qualified identifier', () => {
+		const mutation = createSessionModelConfigurationMutation({
+			inputState: { selectedModel: { identifier: 'gpt-test', modelConfiguration: {} } },
+		}, 'copilot/gpt-test', 'reasoningEffort', 'high');
+		assert.equal(mutation.v.identifier, 'gpt-test');
+		assert.deepEqual(mutation.v.modelConfiguration, { reasoningEffort: 'high' });
+	});
+
 	it('creates exact title and permission mutations', () => {
 		const content = [
 			JSON.stringify({ kind: 0, v: { customTitle: 'Old', inputState: { permissionLevel: 'default' } } }),

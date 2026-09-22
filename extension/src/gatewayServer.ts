@@ -4,6 +4,7 @@ import {
 	CreateSessionResult,
 	GatewayCreateSessionRequest,
 	GatewayEditTurnRequest,
+	GatewayHistoryPageRequest,
 	GatewayPermissionLevelRequest,
 	GatewayRenameSessionRequest,
 	GatewayModelSelectionRequest,
@@ -12,6 +13,7 @@ import {
 	GatewaySendMessageRequest,
 	GatewayState,
 	GatewayToolDecisionRequest,
+	HistoryPageResult,
 	MonitorRequestError,
 	SendMessageResult,
 } from './protocol';
@@ -30,6 +32,7 @@ export interface GatewayBackend {
 	sendMessage(request: GatewaySendMessageRequest): Promise<SendMessageResult>;
 	editTurn(request: GatewayEditTurnRequest): Promise<SendMessageResult>;
 	selectSession(request: GatewaySelectSessionRequest): Promise<void>;
+	loadHistory(request: GatewayHistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel(request: GatewayModelSelectionRequest): Promise<void>;
 	configureModel(request: GatewayModelConfigurationRequest): Promise<void>;
 	renameSession(request: GatewayRenameSessionRequest): Promise<void>;
@@ -46,6 +49,7 @@ export interface GatewayServerOptions {
 	readonly registryId: string;
 	readonly hostId?: string;
 	readonly leaseNonce?: string;
+	readonly ownerId?: string;
 	readonly html: string;
 	readonly mermaidScript?: string;
 	readonly iconSvg?: string;
@@ -152,6 +156,7 @@ export class GatewayServer {
 					registryId: this.options.registryId,
 					...(this.options.hostId ? { hostId: this.options.hostId } : {}),
 					...(this.options.leaseNonce ? { leaseNonce: this.options.leaseNonce } : {}),
+					...(this.options.ownerId ? { ownerId: this.options.ownerId } : {}),
 					apiVersion: 3,
 					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
 				});
@@ -185,6 +190,8 @@ export class GatewayServer {
 					sessionRevision: typeof body.sessionRevision === 'string' ? body.sessionRevision : '',
 					requestId: typeof body.requestId === 'string' ? body.requestId : '',
 					text: typeof body.text === 'string' ? body.text : '',
+					...(typeof body.sourceText === 'string' ? { sourceText: body.sourceText } : {}),
+					...(typeof body.sourceTimestamp === 'number' ? { sourceTimestamp: body.sourceTimestamp } : {}),
 				});
 				this.sendJson(response, 202, result);
 				return;
@@ -198,6 +205,24 @@ export class GatewayServer {
 				}
 				await this.backend.selectSession({ windowId, sessionResource });
 				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/history') {
+				const body = await this.readJsonBody(request) as Partial<GatewayHistoryPageRequest>;
+				const windowId = typeof body.windowId === 'string' ? body.windowId : '';
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				const sessionRevision = typeof body.sessionRevision === 'string' ? body.sessionRevision : '';
+				if (!windowId || !sessionResource || !sessionRevision) {
+					throw new MonitorRequestError(400, 'Window id, session resource, and revision are required.');
+				}
+				const result = await this.backend.loadHistory({
+					windowId,
+					sessionResource,
+					sessionRevision,
+					before: typeof body.before === 'number' ? body.before : 0,
+					limit: typeof body.limit === 'number' ? body.limit : undefined,
+				});
+				this.sendJson(response, 200, result);
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/sessions/rename') {
@@ -216,7 +241,8 @@ export class GatewayServer {
 				if (!windowId) {throw new MonitorRequestError(400, 'Window id is required.');}
 				const result = await this.backend.createSession({
 					windowId,
-					sourceSessionResource: typeof body.sourceSessionResource === 'string' ? body.sourceSessionResource : undefined,
+					...(typeof body.id === 'string' ? { id: body.id } : {}),
+					...(typeof body.sourceSessionResource === 'string' ? { sourceSessionResource: body.sourceSessionResource } : {}),
 				});
 				this.sendJson(response, 201, result);
 				return;

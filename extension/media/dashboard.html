@@ -507,21 +507,52 @@
 		}
 
 		.request-edit-button {
-			display: grid;
-			place-items: center;
-			width: 30px;
+			display: inline-flex;
+			align-items: center;
 			height: 30px;
-			padding: 0;
+			padding: 0 9px;
 			border: 1px solid var(--line);
 			border-radius: 4px;
 			background: var(--surface);
 			color: var(--muted);
 			cursor: pointer;
-			font-size: 13px;
+			font-size: 12px;
+			font-weight: 650;
 		}
 
 		.request-edit-button:hover,
 		.request-edit-button:focus-visible { border-color: var(--line-strong); color: var(--ink); outline: none; }
+
+		.response-actions {
+			display: flex;
+			margin-top: 10px;
+		}
+
+		.retry-button {
+			padding: 6px 10px;
+			border: 1px solid var(--line-strong);
+			border-radius: 4px;
+			background: var(--surface);
+			color: var(--ink);
+			cursor: pointer;
+			font: inherit;
+			font-size: 12px;
+			font-weight: 650;
+		}
+
+		.retry-button:hover,
+		.retry-button:focus-visible { background: var(--surface-raised); outline: none; }
+		.retry-button:disabled { cursor: wait; opacity: .55; }
+
+		.response-error {
+			margin-top: 10px;
+			padding: 9px 11px;
+			border-left: 2px solid var(--danger);
+			background: color-mix(in srgb, var(--danger) 8%, transparent);
+			color: var(--ink);
+			font-size: 13px;
+			line-height: 1.45;
+		}
 
 		.user-message {
 			max-width: min(76%, 650px);
@@ -2613,6 +2644,7 @@
 			};
 			let state;
 			let sending = false;
+			let creatingChat = false;
 			let pendingMessage = '';
 			let pendingWindowId = '';
 			let pendingSessionResource = '';
@@ -2625,6 +2657,8 @@
 			let modelOperationSessionResource = '';
 			let modelOperationMessage = '';
 			let modelOperationError = false;
+			const pendingModelConfiguration = new Map();
+			const pendingPermissionLevels = new Map();
 			let searchMatches = [];
 			let searchMatchIndex = -1;
 			let mermaidRenderId = 0;
@@ -2634,6 +2668,9 @@
 			const transcriptWindowSize = 40;
 			const maximumMessageJumpers = 80;
 			const renderedTurns = new Map();
+			let progressiveHistory;
+			let historyLoading = false;
+			let diagnosticSelectionSignature = '';
 			const boardStorageKey = 'copilot-monitor-board-v1';
 			const approvalWarningStorageKey = 'copilot-monitor-approval-warning-hidden-v1';
 			let gatewayCapabilities = new Set();
@@ -2707,14 +2744,24 @@
 
 			async function createChat() {
 				const selectedWindow = getSelectedWindow();
-				if (!selectedWindow?.connected) return;
+				if (!selectedWindow?.connected || creatingChat) return;
+				creatingChat = true;
+				elements.newChatButton.disabled = true;
+				elements.composerStatus.textContent = 'Creating chat in VS Code';
+				elements.composerStatus.dataset.error = 'false';
 				try {
-					const response = await fetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ windowId: selectedWindow.windowId, sourceSessionResource: getSelectedSession()?.resource }) });
+					const response = await fetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: globalThis.crypto?.randomUUID?.() || `new-${Date.now()}-${Math.random()}`, windowId: selectedWindow.windowId, sourceSessionResource: getSelectedSession()?.resource }) });
 					const result = await response.json();
 					if (!response.ok) throw new Error(result.error || `New chat failed (${response.status})`);
 					selectedSessionResource = result.sessionResource;
 					elements.composerStatus.textContent = 'New chat created'; elements.composerStatus.dataset.error = 'false';
-				} catch (error) { elements.composerStatus.textContent = error instanceof Error ? error.message : String(error); elements.composerStatus.dataset.error = 'true'; }
+				} catch (error) {
+					elements.composerStatus.textContent = error instanceof Error ? error.message : String(error);
+					elements.composerStatus.dataset.error = 'true';
+				} finally {
+					creatingChat = false;
+					elements.newChatButton.disabled = false;
+				}
 			}
 
 			function render(nextState) {
@@ -2774,8 +2821,26 @@
 				renderSessionList(sessions, session, selectedWindow);
 				renderMobilePickers(windows, selectedWindow, sessions, session);
 				renderModelControls(selectedWindow, session);
-				renderTranscript(session, selectedWindow?.windowId);
-				renderMessageNavigator(session);
+				const renderedSession = withProgressiveHistory(session, selectedWindow?.windowId);
+				const nextDiagnosticSignature = renderedSession && selectedWindow
+					? JSON.stringify({
+						windowId: selectedWindow.windowId.slice(-8),
+						sessionId: renderedSession.sessionId.slice(-8),
+						revision: renderedSession.revision.split(':', 1)[0],
+						status: renderedSession.status,
+						history: renderedSession.historyUnavailable || (renderedSession.historyTruncated ? 'paged' : 'loaded'),
+						start: renderedSession.historyStart || 0,
+						turns: renderedSession.turns.length,
+						count: renderedSession.turnCount || renderedSession.turns.length,
+						titleLength: renderedSession.title.length,
+					})
+					: 'none';
+				if (nextDiagnosticSignature !== diagnosticSelectionSignature) {
+					console.info('[Copilot Monitor state]', nextDiagnosticSignature);
+					diagnosticSelectionSignature = nextDiagnosticSignature;
+				}
+				renderTranscript(renderedSession, selectedWindow?.windowId);
+				renderMessageNavigator(renderedSession);
 				renderError(selectedWindow?.error);
 				renderOutbound(selectedWindow?.outboundMessages || []);
 				if (elements.connection.dataset.state === 'connected') {
@@ -2884,7 +2949,9 @@
 				const label = document.createElement('span');
 				const statusLabel = session.status === 'working' ? 'Working' : session.status === 'loading' ? 'Loading' : 'Idle';
 				const turnCount = session.turnCount ?? session.turns.length;
-				label.textContent = `${statusLabel} · ${turnCount} ${turnCount === 1 ? 'turn' : 'turns'}`;
+				label.textContent = session.historyUnavailable
+					? session.historyUnavailable === 'indexing' ? 'Indexing history…' : `${statusLabel} · History in VS Code`
+					: `${statusLabel} · ${turnCount} ${turnCount === 1 ? 'turn' : 'turns'}`;
 				meta.append(dot, label); main.append(title, meta);
 				const actions = document.createElement('div'); actions.className = 'session-card-actions';
 				const pin = document.createElement('button'); pin.type = 'button'; pin.className = 'session-action'; pin.textContent = '◆'; pin.title = 'Pin chat'; pin.setAttribute('aria-label', `Pin ${session.title}`); pin.dataset.active = String(isPinned(selectedWindow.windowId, session.resource));
@@ -2958,7 +3025,11 @@
 				const configurationDisabled = controlsDisabled || modelState.configurationWritable !== true;
 				renderConfigurationField(elements.effortField, elements.effortSelect, fields.find(field => field.key === 'reasoningEffort'), configurationDisabled);
 				renderConfigurationField(elements.contextField, elements.contextSelect, fields.find(field => field.key === 'contextSize'), configurationDisabled);
-				elements.permissionSelect.value = session.permissionLevel || 'default';
+				const permissionKey = `${selectedWindow.windowId}:${session.resource}`;
+				const persistedPermission = session.permissionLevel || 'default';
+				const pendingPermission = pendingPermissionLevels.get(permissionKey);
+				if (pendingPermission === persistedPermission) pendingPermissionLevels.delete(permissionKey);
+				elements.permissionSelect.value = pendingPermission || persistedPermission;
 				elements.permissionSelect.disabled = controlsDisabled;
 				syncCustomSelect(elements.permissionSelect);
 
@@ -2992,10 +3063,15 @@
 						options: field.options?.length ? field.options : catalogField?.options || [],
 					});
 				}
-				return [...fields.values()].map(field => ({
-					...field,
-					value: modelState.configuration?.[field.key] ?? field.value ?? field.defaultValue,
-				}));
+				return [...fields.values()].map(field => {
+					const persistedValue = modelState.configuration?.[field.key] ?? field.value ?? field.defaultValue;
+					const pendingKey = `${selectedWindow?.windowId || ''}:${session?.resource || ''}:${field.key}`;
+					const pendingValue = pendingModelConfiguration.get(pendingKey);
+					if (pendingValue !== undefined && persistedValue === pendingValue) {
+						pendingModelConfiguration.delete(pendingKey);
+					}
+					return { ...field, value: pendingValue ?? persistedValue };
+				});
 			}
 
 			function renderConfigurationField(container, select, field, disabled) {
@@ -3190,12 +3266,13 @@
 					: '';
 				if ((!session || session.turns.length === 0) && !visiblePendingMessage) {
 					renderedTurns.clear();
+					const historyUnavailable = session?.historyUnavailable;
 					const hasHistory = (session?.turnCount ?? 0) > 0;
-					const emptyKey = session ? hasHistory ? 'fetching' : 'loading' : 'none';
+					const emptyKey = session ? historyUnavailable || (hasHistory ? 'fetching' : 'loading') : 'none';
 					if (elements.transcript.firstElementChild?.dataset.emptyKey !== emptyKey) {
 						const empty = createEmptyState(
-							session ? hasHistory ? 'Loading conversation' : 'Transcript is starting' : 'No active Copilot chat',
-							session ? hasHistory ? 'Fetching this chat from its VS Code window.' : 'Live turns will appear here as VS Code persists them.' : 'Open a GitHub Copilot chat panel in this VS Code window.',
+							session ? historyUnavailable === 'indexing' ? 'Indexing conversation history' : historyUnavailable ? 'History available in VS Code' : hasHistory ? 'Loading conversation' : 'Transcript is starting' : 'No active Copilot chat',
+							session ? historyUnavailable === 'indexing' ? 'Building a compact history index in the background. VS Code remains responsive.' : historyUnavailable ? 'This conversation was not loaded remotely to protect VS Code memory. Open it in its VS Code window.' : hasHistory ? 'Fetching this chat from its VS Code window.' : 'Live turns will appear here as VS Code persists them.' : 'Open a GitHub Copilot chat panel in this VS Code window.',
 						);
 						empty.dataset.emptyKey = emptyKey;
 						elements.transcript.replaceChildren(empty);
@@ -3210,6 +3287,9 @@
 
 				const turns = session ? session.turns : [];
 				const desired = [];
+				if (session?.historyTruncated) {
+					desired.push({ key: 'history-limited', historyLimited: 'earlier' });
+				}
 				if (!historyExpanded) {
 					visibleTurnStart = Math.max(0, turns.length - transcriptWindowSize);
 					visibleTurnEnd = turns.length;
@@ -3229,6 +3309,9 @@
 				}
 				if (visibleTurnEnd < turns.length) {
 					desired.push({ key: 'history-newer', historyCount: turns.length - visibleTurnEnd, direction: 'newer' });
+				}
+				if (session?.historyHasNewer) {
+					desired.push({ key: 'history-page-newer', historyLimited: 'newer' });
 				}
 
 				if (visiblePendingMessage) {
@@ -3257,16 +3340,19 @@
 
 				for (let index = 0; index < desired.length; index++) {
 					const entry = desired[index];
-					const signature = entry.key.startsWith('history-') ? `${entry.key}:${entry.historyCount}` : JSON.stringify([entry.turn, entry.isLast]);
+					const signature = entry.historyLimited ? entry.key : entry.key.startsWith('history-') ? `${entry.key}:${entry.historyCount}` : JSON.stringify([entry.turn, entry.isLast]);
 					let rendered = renderedTurns.get(entry.key);
 					if (!rendered || rendered.signature !== signature) {
-						const element = entry.key.startsWith('history-')
+						const element = entry.historyLimited
+							? buildHistoryLimitNotice(session, entry.historyLimited)
+							: entry.key.startsWith('history-')
 							? buildHistoryLoader(entry.historyCount, entry.direction, session, windowId)
 							: buildTurn(entry.turn, entry.isLast, {
 								windowId,
 								sessionResource: session?.resource || '',
 								sessionRevision: session?.revision || '',
 								requestId: entry.turn.id,
+								sessionWorking: session?.status === 'working',
 							});
 						if (rendered?.element.isConnected) {
 							const thinkingWasOpen = rendered.element.querySelector('.thinking')?.open;
@@ -3290,6 +3376,83 @@
 					if (atIndex !== rendered.element) {
 						elements.transcript.insertBefore(rendered.element, atIndex || null);
 					}
+				}
+			}
+
+			function withProgressiveHistory(session, windowId) {
+				if (!session || !windowId) return session;
+				const key = sessionKey(windowId, session.resource);
+				const cached = progressiveHistory?.key === key ? progressiveHistory : undefined;
+				if (!cached || cached.revision !== session.revision) return session;
+				return {
+					...session,
+					turns: cached.turns,
+					historyStart: cached.start,
+					historyTruncated: cached.start > 0,
+					historyHasNewer: cached.end < (session.turnCount || 0),
+				};
+			}
+
+			function buildHistoryLimitNotice(session, direction) {
+				const container = document.createElement('div');
+				container.className = 'history-loader';
+				const hiddenCount = direction === 'earlier'
+					? Math.max(0, session.historyStart ?? 0)
+					: Math.max(0, (session.turnCount || 0) - ((session.historyStart || 0) + session.turns.length));
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.disabled = historyLoading;
+				button.textContent = historyLoading ? 'Loading messages…' : `Load ${direction} messages (${hiddenCount})`;
+				button.addEventListener('click', () => void loadHistoryPage(session, direction));
+				container.append(button);
+				return container;
+			}
+
+			async function loadHistoryPage(session, direction) {
+				const windowState = getSelectedWindow();
+				if (!windowState || historyLoading) return;
+				const currentStart = session.historyStart ?? Math.max(0, (session.turnCount || 0) - session.turns.length);
+				const currentEnd = currentStart + session.turns.length;
+				const before = direction === 'earlier'
+					? currentStart
+					: Math.min(session.turnCount || 0, currentEnd + transcriptWindowSize);
+				if (before <= 0 || (direction === 'newer' && currentEnd >= (session.turnCount || 0))) return;
+				historyLoading = true;
+				const anchor = elements.transcript.querySelector('.turn[data-turn-key]');
+				const anchorTop = anchor?.getBoundingClientRect().top;
+				try {
+					const response = await fetch('/api/sessions/history', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							windowId: windowState.windowId,
+							sessionResource: session.resource,
+							sessionRevision: session.revision,
+							before,
+							limit: transcriptWindowSize,
+						}),
+					});
+					const result = await response.json();
+					if (!response.ok) throw new Error(result.error || `History load failed (${response.status})`);
+					const key = sessionKey(windowState.windowId, session.resource);
+					progressiveHistory = {
+						key,
+						revision: result.revision,
+						start: result.start,
+						end: result.end,
+						turns: result.turns,
+					};
+					if (state) render(state);
+					if (anchor && anchorTop !== undefined) {
+						const nextTop = anchor.getBoundingClientRect().top;
+						elements.transcriptScroll.scrollTop += nextTop - anchorTop;
+					}
+				} catch (error) {
+					elements.composerStatus.textContent = error instanceof Error ? error.message : String(error);
+					elements.composerStatus.dataset.error = 'true';
+				} finally {
+					historyLoading = false;
+					if (state) render(state);
 				}
 			}
 
@@ -3435,11 +3598,11 @@
 				if (turn.userText) {
 					const userRow = document.createElement('div');
 					userRow.className = 'user-row';
-					if (turn.editable && activityContext.windowId && activityContext.sessionResource && activityContext.sessionRevision) {
+					if (turn.editable && !activityContext.sessionWorking && activityContext.windowId && activityContext.sessionResource && activityContext.sessionRevision) {
 						const edit = document.createElement('button');
 						edit.type = 'button';
 						edit.className = 'request-edit-button';
-						edit.textContent = '✎';
+						edit.textContent = 'Edit & Resubmit';
 						edit.title = 'Edit and replace from this request';
 						edit.setAttribute('aria-label', 'Edit and replace from this request');
 						edit.addEventListener('click', () => openRequestEditor(turn, activityContext));
@@ -3453,7 +3616,7 @@
 				}
 
 				const working = turn.status === 'working';
-				if (turn.thinking || turn.assistantText || turn.activities.length || working) {
+				if (turn.thinking || turn.assistantText || turn.activities.length || working || turn.status === 'cancelled' || turn.status === 'failed') {
 					const assistantRow = document.createElement('div');
 					assistantRow.className = 'assistant-row';
 					const mark = document.createElement('div');
@@ -3483,6 +3646,23 @@
 						content.append(renderActivities(turn.activities, activityContext));
 					} else if (!turn.assistantText && !turn.thinking && working) {
 						content.append(renderActivities([{ id: 'working', label: 'Copilot is working', status: 'running' }], activityContext));
+					}
+					if (turn.status === 'failed' && turn.error) {
+						const error = document.createElement('div');
+						error.className = 'response-error';
+						error.textContent = turn.error;
+						content.append(error);
+					}
+					if (!activityContext.sessionWorking && (turn.status === 'failed' || turn.status === 'cancelled') && turn.editable && turn.userText) {
+						const actions = document.createElement('div');
+						actions.className = 'response-actions';
+						const retry = document.createElement('button');
+						retry.type = 'button';
+						retry.className = 'retry-button';
+						retry.textContent = 'Try Again';
+						retry.addEventListener('click', () => void retryTurn(turn, activityContext, retry));
+						actions.append(retry);
+						content.append(actions);
 					}
 					assistantRow.append(mark, content);
 					article.append(assistantRow);
@@ -4137,6 +4317,8 @@
 					}
 				}
 				modelConfigurationChanging = true;
+				const permissionKey = `${selectedWindow.windowId}:${session.resource}`;
+				pendingPermissionLevels.set(permissionKey, permissionLevel);
 				renderModelControls(selectedWindow, session);
 				try {
 					const response = await fetch('/api/sessions/permission', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ windowId: selectedWindow.windowId, sessionResource: session.resource, permissionLevel }) });
@@ -4147,7 +4329,9 @@
 					}
 					elements.composerStatus.textContent = 'Approval mode changed in VS Code'; elements.composerStatus.dataset.error = 'false';
 				} catch (error) {
+					pendingPermissionLevels.delete(permissionKey);
 					elements.permissionSelect.value = session.permissionLevel || 'default';
+					syncCustomSelect(elements.permissionSelect);
 					elements.composerStatus.textContent = error instanceof Error ? error.message : String(error); elements.composerStatus.dataset.error = 'true';
 				} finally { modelConfigurationChanging = false; if (state) render(state); }
 			}
@@ -4178,7 +4362,12 @@
 			}
 
 			function openRequestEditor(turn, context) {
-				requestEditTarget = { requestId: turn.id, sessionRevision: context.sessionRevision };
+				requestEditTarget = {
+					requestId: turn.id,
+					sessionRevision: context.sessionRevision,
+					sourceText: turn.userText,
+					sourceTimestamp: turn.timestamp,
+				};
 				elements.requestEditText.value = turn.userText;
 				elements.requestEditSubmit.disabled = false;
 				elements.requestEditDialog.showModal();
@@ -4211,6 +4400,8 @@
 							sessionRevision: requestEditTarget.sessionRevision,
 							requestId: requestEditTarget.requestId,
 							text,
+							sourceText: requestEditTarget.sourceText,
+							sourceTimestamp: requestEditTarget.sourceTimestamp,
 							id: globalThis.crypto?.randomUUID?.() || `edit-${Date.now()}-${Math.random()}`,
 						}),
 					});
@@ -4228,6 +4419,37 @@
 				}
 			}
 
+			async function retryTurn(turn, context, button) {
+				const selectedWindow = getSelectedWindow();
+				const session = getSelectedSession();
+				if (!selectedWindow?.connected || !session || !turn.userText || button.disabled) return;
+				button.disabled = true;
+				elements.composerStatus.textContent = 'Retrying request in VS Code';
+				elements.composerStatus.dataset.error = 'false';
+				try {
+					const response = await fetch('/api/turns/edit', {
+						method: 'POST', headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							windowId: selectedWindow.windowId,
+							sessionResource: session.resource,
+							sessionRevision: context.sessionRevision,
+							requestId: turn.id,
+							text: turn.userText,
+							sourceText: turn.userText,
+							sourceTimestamp: turn.timestamp,
+							id: globalThis.crypto?.randomUUID?.() || `retry-${Date.now()}-${Math.random()}`,
+						}),
+					});
+					const result = await response.json();
+					if (!response.ok) throw new Error(result.error || `Retry failed (${response.status})`);
+					elements.composerStatus.textContent = 'Retry accepted by VS Code';
+				} catch (error) {
+					button.disabled = false;
+					elements.composerStatus.textContent = error instanceof Error ? error.message : String(error);
+					elements.composerStatus.dataset.error = 'true';
+				}
+			}
+
 			async function changeModelConfiguration(key, rawValue) {
 				const selectedWindow = getSelectedWindow();
 				const session = getSelectedSession();
@@ -4242,6 +4464,8 @@
 				modelOperationSessionResource = session.resource;
 				modelOperationMessage = `Changing ${field.title.toLowerCase()} in VS Code`;
 				modelOperationError = false;
+				const pendingKey = `${selectedWindow.windowId}:${session.resource}:${key}`;
+				pendingModelConfiguration.set(pendingKey, option.value);
 				renderModelControls(selectedWindow, session);
 				try {
 					const response = await fetch('/api/models/configure', {
@@ -4261,6 +4485,7 @@
 					}
 					modelOperationMessage = `${field.title} changed in VS Code`;
 				} catch (error) {
+					pendingModelConfiguration.delete(pendingKey);
 					modelOperationMessage = error instanceof Error ? error.message : String(error);
 					modelOperationError = true;
 				} finally {

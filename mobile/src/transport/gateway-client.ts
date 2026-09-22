@@ -1,6 +1,7 @@
 import type {
   ChatModelDescriptor,
   GatewaySnapshot,
+  HistoryPage,
   HostProfile,
   ModelConfigurationField,
   ModelConfigurationOption,
@@ -22,26 +23,16 @@ export async function fetchGatewaySnapshot(host: HostProfile): Promise<GatewaySn
   let value: unknown;
   try {
     value = await requestJson(new URL('/api/state', currentHost.endpoint));
-  } catch (error) {
-    const recoveryEndpoint = preferredPortEndpoint(currentHost.endpoint);
-    if (recoveryEndpoint === currentHost.endpoint) throw error;
-    try {
-      const recovered = await pairGateway(recoveryEndpoint);
-      currentHost = { ...recovered, name: host.name };
-      await replaceHost(host.id, currentHost);
-      Object.assign(host, currentHost);
-      value = await requestJson(new URL('/api/state', currentHost.endpoint));
-    } catch {
-      const discoveredEndpoint = await discoverHostEndpoint(host);
-      if (!discoveredEndpoint) {
-        throw new Error(`Cannot find ${host.name} on this local network. Confirm VS Code is running, then try again or scan its current QR code.`);
-      }
-      const discovered = await pairGateway(discoveredEndpoint);
-      currentHost = { ...discovered, name: host.name };
-      await replaceHost(host.id, currentHost);
-      Object.assign(host, currentHost);
-      value = await requestJson(new URL('/api/state', currentHost.endpoint));
+  } catch {
+    const discoveredEndpoint = await discoverHostEndpoint(host);
+    if (!discoveredEndpoint) {
+      throw new Error(`Cannot find ${host.name} on this local network. Confirm VS Code is running and both devices are on the same network.`);
     }
+    const discovered = await pairGateway(discoveredEndpoint);
+    currentHost = { ...discovered, name: host.name };
+    await replaceHost(host.id, currentHost);
+    Object.assign(host, currentHost);
+    value = await requestJson(new URL('/api/state', currentHost.endpoint));
   }
   if (!isRecord(value) || value.version !== 2 || !Array.isArray(value.windows)) {
     throw new Error('The computer returned an unsupported monitor state.');
@@ -212,6 +203,9 @@ function parseSession(value: unknown): SessionSummary[] {
     status: value.status === 'working' || value.status === 'loading' ? value.status : 'idle',
     updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : undefined,
     turnCount: typeof value.turnCount === 'number' ? value.turnCount : undefined,
+    historyUnavailable: value.historyUnavailable === 'archived' || value.historyUnavailable === 'oversized' || value.historyUnavailable === 'indexing'
+      ? value.historyUnavailable : undefined,
+    historyTruncated: value.historyTruncated === true,
     turns: Array.isArray(value.turns) ? value.turns.flatMap(parseTurn) : [],
     modelName: model && typeof model.selectedModelName === 'string' ? model.selectedModelName : undefined,
     model: parseModelState(model),
@@ -347,15 +341,6 @@ export function hasVisibleContent(session: SessionSummary): boolean {
   return session.turns.some(turn => turn.userText.trim() || turn.assistantText.trim() || turn.blocks.length > 0);
 }
 
-function preferredPortEndpoint(endpoint: string): string {
-  const url = new URL(endpoint);
-  url.port = '43121';
-  url.pathname = '/';
-  url.search = '';
-  url.hash = '';
-  return url.toString();
-}
-
 export async function createSession(
   host: HostProfile,
   windowId: string,
@@ -383,4 +368,30 @@ export async function createSession(
     }
     throw error;
   }
+}
+
+export async function loadHistoryPage(
+  host: HostProfile,
+  windowId: string,
+  sessionResource: string,
+  sessionRevision: string,
+  before: number,
+  limit = 40,
+): Promise<HistoryPage> {
+  const value = await requestJson(new URL('/api/sessions/history', host.endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ windowId, sessionResource, sessionRevision, before, limit }),
+  });
+  if (!isRecord(value) || !Array.isArray(value.turns) || typeof value.revision !== 'string') {
+    throw new Error('The computer returned an invalid history page.');
+  }
+  return {
+    turns: value.turns.flatMap(parseTurn),
+    totalCount: numberValue(value.totalCount),
+    start: numberValue(value.start),
+    end: numberValue(value.end),
+    hasEarlier: value.hasEarlier === true,
+    revision: value.revision,
+  };
 }

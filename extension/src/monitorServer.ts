@@ -1,6 +1,6 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, ToolDecisionRequest } from './protocol';
+import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, ToolDecisionRequest } from './protocol';
 
 const maximumRequestBytes = 64 * 1024;
 
@@ -17,6 +17,7 @@ export interface MonitorBackend {
 	sendMessage(request: SendMessageRequest): Promise<SendMessageResult>;
 	editTurn?(request: EditTurnRequest): Promise<EditTurnResult>;
 	selectSession?(sessionResource: string): Promise<void>;
+	loadHistory?(request: HistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel?(request: ModelSelectionRequest): Promise<void>;
 	configureModel?(request: ModelConfigurationRequest): Promise<void>;
 	renameSession?(request: RenameSessionRequest): Promise<void>;
@@ -184,6 +185,8 @@ export class MonitorServer {
 					sessionRevision: typeof body.sessionRevision === 'string' ? body.sessionRevision : '',
 					requestId: typeof body.requestId === 'string' ? body.requestId : '',
 					text: typeof body.text === 'string' ? body.text : '',
+					...(typeof body.sourceText === 'string' ? { sourceText: body.sourceText } : {}),
+					...(typeof body.sourceTimestamp === 'number' ? { sourceTimestamp: body.sourceTimestamp } : {}),
 				});
 				this.sendJson(response, 202, result);
 				return;
@@ -201,6 +204,23 @@ export class MonitorServer {
 				this.sendJson(response, 204, undefined);
 				return;
 			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/history') {
+				if (!this.backend.loadHistory) {throw new MonitorRequestError(501, 'Progressive history loading is unavailable.');}
+				const body = await this.readJsonBody(request) as Partial<HistoryPageRequest>;
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				const sessionRevision = typeof body.sessionRevision === 'string' ? body.sessionRevision : '';
+				if (!sessionResource || !sessionRevision) {
+					throw new MonitorRequestError(400, 'Session resource and revision are required.');
+				}
+				const result = await this.backend.loadHistory({
+					sessionResource,
+					sessionRevision,
+					before: typeof body.before === 'number' ? body.before : 0,
+					limit: typeof body.limit === 'number' ? body.limit : undefined,
+				});
+				this.sendJson(response, 200, result);
+				return;
+			}
 			if (request.method === 'POST' && url.pathname === '/api/sessions/rename') {
 				const body = await this.readJsonBody(request) as Partial<RenameSessionRequest>;
 				if (!this.backend.renameSession) {throw new MonitorRequestError(501, 'Chat rename is unavailable.');}
@@ -215,7 +235,8 @@ export class MonitorServer {
 				const body = await this.readJsonBody(request) as Partial<CreateSessionRequest>;
 				if (!this.backend.createSession) {throw new MonitorRequestError(501, 'New chat is unavailable.');}
 				const result = await this.backend.createSession({
-					sourceSessionResource: typeof body.sourceSessionResource === 'string' ? body.sourceSessionResource : undefined,
+					...(typeof body.id === 'string' ? { id: body.id } : {}),
+					...(typeof body.sourceSessionResource === 'string' ? { sourceSessionResource: body.sourceSessionResource } : {}),
 				});
 				this.sendJson(response, 201, result);
 				return;

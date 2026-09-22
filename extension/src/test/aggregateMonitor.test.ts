@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { AggregateMonitor } from '../aggregateMonitor';
 import { MonitorBackend, MonitorServer } from '../monitorServer';
-import { CreateSessionRequest, EditTurnRequest, ModelConfigurationRequest, ModelSelectionRequest, MonitorState, PermissionLevelRequest, RenameSessionRequest, SendMessageRequest, ToolDecisionRequest } from '../protocol';
+import { CreateSessionRequest, EditTurnRequest, HistoryPageRequest, ModelConfigurationRequest, ModelSelectionRequest, MonitorState, PermissionLevelRequest, RenameSessionRequest, SendMessageRequest, ToolDecisionRequest } from '../protocol';
 import { WindowRegistry } from '../windowRegistry';
 
 class TestWindowBackend implements MonitorBackend {
@@ -18,6 +18,7 @@ class TestWindowBackend implements MonitorBackend {
 	renames: RenameSessionRequest[] = [];
 	created: CreateSessionRequest[] = [];
 	permissions: PermissionLevelRequest[] = [];
+	historyRequests: HistoryPageRequest[] = [];
 	eventClientCounts: number[] = [];
 	private readonly listeners = new Set<(state: MonitorState) => void>();
 
@@ -40,6 +41,11 @@ class TestWindowBackend implements MonitorBackend {
 
 	async selectSession(resource: string): Promise<void> {
 		this.selected.push(resource);
+	}
+
+	async loadHistory(request: HistoryPageRequest) {
+		this.historyRequests.push(request);
+		return { turns: [], totalCount: 100, start: 20, end: 40, hasEarlier: true, revision: request.sessionRevision };
 	}
 
 	setEventClientCount(count: number): void {
@@ -102,6 +108,13 @@ describe('AggregateMonitor', () => {
 			assert.deepEqual(firstBackend.selected, ['session-1']);
 			assert.equal(secondBackend.selected.length, 0);
 
+			const history = await aggregate.loadHistory({
+				windowId: 'window-2', sessionResource: 'session-2', sessionRevision: 'rev-2', before: 40, limit: 20,
+			});
+			assert.deepEqual(history, { turns: [], totalCount: 100, start: 20, end: 40, hasEarlier: true, revision: 'rev-2' });
+			assert.equal(firstBackend.historyRequests.length, 0);
+			assert.deepEqual(secondBackend.historyRequests, [{ sessionResource: 'session-2', sessionRevision: 'rev-2', before: 40, limit: 20 }]);
+
 			await aggregate.decideTool({
 				windowId: 'window-2',
 				sessionResource: 'session-2',
@@ -128,8 +141,8 @@ describe('AggregateMonitor', () => {
 
 			await aggregate.renameSession({ windowId: 'window-1', sessionResource: 'session-1', title: 'Renamed' });
 			assert.deepEqual(firstBackend.renames, [{ sessionResource: 'session-1', title: 'Renamed' }]);
-			assert.deepEqual(await aggregate.createSession({ windowId: 'window-2', sourceSessionResource: 'session-2' }), { sessionResource: 'new-session' });
-			assert.deepEqual(secondBackend.created, [{ sourceSessionResource: 'session-2' }]);
+			assert.deepEqual(await aggregate.createSession({ id: 'new-1', windowId: 'window-2', sourceSessionResource: 'session-2' }), { sessionResource: 'new-session' });
+			assert.deepEqual(secondBackend.created, [{ id: 'new-1', sourceSessionResource: 'session-2' }]);
 			await aggregate.setPermissionLevel({ windowId: 'window-1', sessionResource: 'session-1', permissionLevel: 'autoApprove' });
 			assert.deepEqual(firstBackend.permissions, [{ sessionResource: 'session-1', permissionLevel: 'autoApprove' }]);
 

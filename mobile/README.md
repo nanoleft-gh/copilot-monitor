@@ -154,6 +154,10 @@ The shared Expo configuration lives in `app.json`.
   networking exception for the HTTP gateway.
 - Camera permission is used only to scan pairing QR codes.
 - Persistent paired hosts are stored with AsyncStorage.
+- After one successful pairing, the app matches the persistent host ID and
+  rediscovers a changed LAN IP on the saved gateway port. Another QR scan is
+  needed only when the desktop identity is reset, the gateway port changes, or
+  the phone and computer are no longer on the same local `/24` network.
 
 ## iOS Compatibility Status
 

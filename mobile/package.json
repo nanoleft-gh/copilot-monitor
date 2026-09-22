@@ -1,7 +1,7 @@
 {
   "name": "copilot-monitor-mobile",
   "main": "expo-router/entry",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packageManager": "pnpm@10.26.2",
   "dependencies": {
     "@expo/ui": "~57.0.7",
@@ -49,8 +49,9 @@
     "web": "expo start --web",
     "go": "expo start --port 18086",
     "lint": "expo lint",
+    "test": "node --experimental-strip-types --test scripts/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "validate": "pnpm typecheck && pnpm lint"
+    "validate": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "private": true
 }

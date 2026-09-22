@@ -1,14 +1,14 @@
 import { router, useLocalSearchParams } from 'expo-router';
 import { Check, ChevronLeft, Pencil, Send, X } from 'lucide-react-native';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Keyboard, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { PickerField, type PickerOption } from '@/components/ui/picker-field';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
-import { configureModel, decideTool, editTurn, fetchGatewaySnapshot, selectModel, selectSession, sendMessage, setPermissionLevel } from '@/transport/gateway-client';
+import { configureModel, decideTool, editTurn, fetchGatewaySnapshot, loadHistoryPage, selectModel, selectSession, sendMessage, setPermissionLevel } from '@/transport/gateway-client';
 import { getHost } from '@/transport/host-store';
 import { subscribeToGateway } from '@/transport/gateway-stream';
-import type { ChatModelDescriptor, HostProfile, ModelConfigurationField, SessionSummary, TranscriptActivity, WindowSnapshot } from '@/transport/types';
+import type { ChatModelDescriptor, HistoryPage, HostProfile, ModelConfigurationField, SessionSummary, TranscriptActivity, WindowSnapshot } from '@/transport/types';
 
 const permissionOptions: PickerOption[] = [
   { value: 'default', label: 'Default Approvals', hint: 'Ask before running tools' },
@@ -57,6 +57,8 @@ export default function ChatScreen() {
   const [sending, setSending] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyPage, setHistoryPage] = useState<HistoryPage>();
   const [editTarget, setEditTarget] = useState<{ requestId: string; text: string }>();
   const [editText, setEditText] = useState('');
   const [error, setError] = useState<string>();
@@ -112,6 +114,7 @@ export default function ChatScreen() {
         optimisticPermissionRef.current = undefined;
         setOptimisticPermission(current => current?.sequence === pendingPermission.sequence ? undefined : current);
       }
+      setHistoryPage(current => current?.revision === nextSession.revision ? current : undefined);
       setSession(nextSession);
       setError(undefined);
     } else if (loadedRef.current) {
@@ -147,6 +150,42 @@ export default function ChatScreen() {
     })();
     return () => { active = false; unsubscribe?.(); };
   }, [applySnapshot, params.hostId, params.sessionResource, params.windowId]);
+
+  const displayedSession = useMemo(() => session && historyPage?.revision === session.revision
+    ? {
+        ...session,
+        turns: historyPage.turns,
+        historyStart: historyPage.start,
+        historyTruncated: historyPage.start > 0,
+      }
+    : session, [historyPage, session]);
+
+  const loadHistory = useCallback(async (direction: 'earlier' | 'newer') => {
+    if (!host || !displayedSession || historyLoading || !params.windowId || !params.sessionResource) return;
+    const currentStart = historyPage?.start
+      ?? displayedSession.historyStart
+      ?? Math.max(0, (displayedSession.turnCount ?? 0) - displayedSession.turns.length);
+    const currentEnd = historyPage?.end ?? (currentStart + displayedSession.turns.length);
+    const totalCount = displayedSession.turnCount ?? displayedSession.turns.length;
+    if ((direction === 'earlier' && currentStart <= 0) || (direction === 'newer' && currentEnd >= totalCount)) return;
+    const before = direction === 'earlier' ? currentStart : Math.min(totalCount, currentEnd + 40);
+    setHistoryLoading(true);
+    setError(undefined);
+    try {
+      setHistoryPage(await loadHistoryPage(
+        host,
+        params.windowId,
+        params.sessionResource,
+        displayedSession.revision,
+        before,
+        40,
+      ));
+    } catch (historyError) {
+      setError(historyError instanceof Error ? historyError.message : String(historyError));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [displayedSession, historyLoading, historyPage, host, params.sessionResource, params.windowId]);
 
   const submit = useCallback(async () => {
     const text = draft.trim();
@@ -204,7 +243,7 @@ export default function ChatScreen() {
     }
   }, [editTarget, editText, editing, host, params.sessionResource, params.windowId, session]);
 
-  const working = session?.status === 'working';
+  const working = displayedSession?.status === 'working';
 
   const changeModel = useCallback(async (modelId: string) => {
     if (!host || !params.windowId || !params.sessionResource) return;
@@ -360,8 +399,21 @@ export default function ChatScreen() {
             onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: false })}
             ref={scrollRef}
           >
-            {session?.turns.length === 0 && <Text style={styles.empty}>No persisted messages are available yet.</Text>}
-            {session?.turns.map((turn, turnIndex) => (
+			{displayedSession?.historyTruncated && (
+			  <Pressable disabled={historyLoading} onPress={() => void loadHistory('earlier')} style={styles.historyButton}>
+				{historyLoading ? <ActivityIndicator color={colors.accentBlue} size="small" /> : <Text style={styles.historyButtonText}>Load earlier messages ({displayedSession.historyStart ?? 0})</Text>}
+			  </Pressable>
+			)}
+            {displayedSession?.turns.length === 0 && (
+              <Text style={styles.empty}>
+                {displayedSession.historyUnavailable === 'indexing'
+                  ? 'Building a compact history index in the background. This can take a few seconds for very large chats.'
+                  : displayedSession.historyUnavailable
+                  ? 'This conversation history remains in VS Code to protect memory. Open it in its VS Code window.'
+                  : 'No persisted messages are available yet.'}
+              </Text>
+            )}
+            {displayedSession?.turns.map((turn, turnIndex) => (
               <View key={`${turn.id}:${turnIndex}`} style={styles.turn}>
                 {!!turn.userText && (
                   <View style={styles.userRow}>
@@ -402,6 +454,11 @@ export default function ChatScreen() {
                   )}
               </View>
             ))}
+      {historyPage && historyPage.end < historyPage.totalCount && (
+        <Pressable disabled={historyLoading} onPress={() => void loadHistory('newer')} style={styles.historyButton}>
+        {historyLoading ? <ActivityIndicator color={colors.accentBlue} size="small" /> : <Text style={styles.historyButtonText}>Load newer messages ({historyPage.totalCount - historyPage.end})</Text>}
+        </Pressable>
+      )}
           </ScrollView>
         )}
         {error && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
@@ -492,6 +549,8 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   transcript: { padding: spacing.lg, paddingBottom: spacing.xl, gap: spacing.xl },
   empty: { color: colors.textMuted, textAlign: 'center', marginTop: 80 },
+  historyButton: { alignItems: 'center', alignSelf: 'center', borderColor: colors.borderSubtle, borderRadius: radii.button, borderWidth: 1, minWidth: 200, paddingHorizontal: spacing.lg, paddingVertical: spacing.sm },
+  historyButtonText: { color: colors.accentBlue, fontSize: typography.metaSize, fontWeight: '600' },
   turn: { gap: spacing.md },
   userRow: { alignSelf: 'flex-end', maxWidth: '92%', flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   userBubble: { alignSelf: 'flex-end', maxWidth: '88%', paddingHorizontal: spacing.md, paddingVertical: 10, borderRadius: radii.card, backgroundColor: colors.bgRaised },

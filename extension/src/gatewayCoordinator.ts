@@ -142,6 +142,12 @@ export class GatewayCoordinator {
 				this.currentAddress = this.addressForPort(leaseAfterLock.port);
 				return;
 			}
+			const recoveredLease = await this.recoverPreferredGatewayLease();
+			if (recoveredLease) {
+				await this.leaseStore.publish(recoveredLease);
+				this.currentAddress = this.addressForPort(recoveredLease.port);
+				return;
+			}
 			await this.startOwnedGateway(required);
 		} finally {
 			await electionLock.release();
@@ -200,6 +206,7 @@ export class GatewayCoordinator {
 			registryId: this.options.registryId,
 			hostId: this.options.hostId,
 			leaseNonce: nonce,
+			ownerId: this.options.ownerId,
 			html: this.options.html,
 			mermaidScript: this.options.mermaidScript,
 			iconSvg: this.options.iconSvg,
@@ -229,6 +236,21 @@ export class GatewayCoordinator {
 		return { host: '0.0.0.0', port, url: `http://${this.options.advertisedHost}:${port}/` };
 	}
 
+	private async recoverPreferredGatewayLease(): Promise<GatewayLease | undefined> {
+		const health = await readExpectedGateway(this.options.port, this.options.hostId);
+		if (!health) {
+			return undefined;
+		}
+		return {
+			version: 1,
+			hostId: this.options.hostId,
+			nonce: health.leaseNonce,
+			ownerId: health.ownerId ?? `recovered-${health.leaseNonce}`,
+			port: this.options.port,
+			heartbeatAt: Date.now(),
+		};
+	}
+
 	private async stopOwnedGateway(): Promise<void> {
 		const server = this.ownedServer;
 		const monitor = this.ownedMonitor;
@@ -247,19 +269,43 @@ export class GatewayCoordinator {
 }
 
 async function isExpectedGateway(port: number, registryId: string, leaseNonce: string): Promise<boolean> {
+	const health = await readGatewayHealth(port);
+	return health?.registryId === registryId && health.leaseNonce === leaseNonce;
+}
+
+interface GatewayHealth {
+	readonly registryId: string;
+	readonly hostId?: string;
+	readonly leaseNonce: string;
+	readonly ownerId?: string;
+}
+
+async function readExpectedGateway(port: number, hostId: string): Promise<GatewayHealth | undefined> {
+	const health = await readGatewayHealth(port);
+	return health && (health.hostId ?? health.registryId) === hostId ? health : undefined;
+}
+
+async function readGatewayHealth(port: number): Promise<GatewayHealth | undefined> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 500);
 	try {
 		const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: controller.signal });
 		if (!response.ok) {
-			return false;
+			return undefined;
 		}
-		const value = await response.json() as { service?: string; registryId?: string; leaseNonce?: string };
+		const value = await response.json() as Partial<GatewayHealth> & { service?: string };
 		return value.service === 'githubcopilot-monitor-gateway'
-			&& value.registryId === registryId
-			&& value.leaseNonce === leaseNonce;
+			&& typeof value.registryId === 'string'
+			&& typeof value.leaseNonce === 'string'
+			? {
+				registryId: value.registryId,
+				leaseNonce: value.leaseNonce,
+				...(typeof value.hostId === 'string' ? { hostId: value.hostId } : {}),
+				...(typeof value.ownerId === 'string' ? { ownerId: value.ownerId } : {}),
+			}
+			: undefined;
 	} catch {
-		return false;
+		return undefined;
 	} finally {
 		clearTimeout(timer);
 	}

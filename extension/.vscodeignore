@@ -4,6 +4,7 @@
 .research/**
 public/icon-png-source.svg
 src/**
+test-fixtures/**
 out/test/**
 .gitignore
 .yarnrc
