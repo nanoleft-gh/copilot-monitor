@@ -1,5 +1,12 @@
 # Mobile Changelog
 
+## [0.2.0]
+
+- Assistant replies render as GitHub-flavoured markdown (headings, lists, code blocks, inline code, links, quotes, tables) via `react-native-marked`; each text block is memoised so a streaming reply re-parses only the block that changed.
+- Pairing now carries the computer's secret (read from the QR/link fragment) and sends it as a bearer token on every request and on the event stream. Secrets live in the device keystore (`expo-secure-store`), never in the host list. Hosts paired before 1.3.0 show "Needs re-pairing" and prompt for one scan.
+- Connection resilience: the phone stores every address the computer advertises (all LAN interfaces plus its remote URL). When the last-good address fails it probes LAN candidates in parallel, then remote ones, then scans the subnet, and remembers the winner. Reconnects back off exponentially with jitter, a socket that goes silent past the gateway's keepalive is dropped and reopened, and a network change or the app returning to the foreground retries immediately. Newly advertised addresses (e.g. a tunnel URL added later in VS Code) are learned on the next successful connection.
+- The header shows "Reconnecting…" while the stream is down and a clear message when the computer stopped accepting this phone's pairing.
+
 ## [0.1.3]
 
 - Consumed the gateway's `eventsV2` delta stream: one snapshot on connect, then compact patches, so streaming responses only transfer their new text and the XHR response buffer grows far more slowly. Older gateways that still send full `state` frames keep working.

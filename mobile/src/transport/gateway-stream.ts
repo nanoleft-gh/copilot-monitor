@@ -1,13 +1,21 @@
+import * as Network from 'expo-network';
+import { AppState, type AppStateStatus } from 'react-native';
 import type { GatewaySnapshot, HostProfile } from './types';
-import { fetchGatewaySnapshot, parseGatewaySnapshot } from './gateway-client';
+import { fetchGatewaySnapshot, GatewayHttpError, parseGatewaySnapshot } from './gateway-client';
+import { authHeaders } from './pairing';
 import { applyPatch, isPatch } from './state-delta';
+
+export type StreamStatus = 'connecting' | 'live' | 'offline' | 'unpaired';
 
 type StreamHandlers = {
   onSnapshot: (snapshot: GatewaySnapshot) => void;
-  onStatus?: (status: 'connecting' | 'live' | 'offline') => void;
+  onStatus?: (status: StreamStatus) => void;
 };
 
-const reconnectDelayMs = 1_500;
+/** Reconnect delays after consecutive failures; the last value repeats. A little jitter avoids thundering herds. */
+const reconnectDelaysMs = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+/** The gateway comments the stream every 15 s; silence beyond this means the socket died without telling us. */
+const staleAfterMs = 45_000;
 
 // React Native's XMLHttpRequest retains the full response text for the life of
 // the request. On a long-lived SSE stream that text grows without bound (every
@@ -28,31 +36,70 @@ const responseTextResetBytes = 256 * 1024;
  * the previous state (see `state-delta.ts`); older gateways answer with full
  * `state` frames, which are accepted as-is. A patch that cannot be applied means
  * the stream is out of sync, and the fix is simply to reconnect for a snapshot.
+ *
+ * Connection loss is survived without user action: reconnects back off
+ * exponentially, a silent socket is detected through the gateway's keepalives,
+ * and a network change or the app returning to the foreground retries at once.
+ * Before each retry the host is re-located, so a new IP, a different Wi-Fi, or
+ * the computer's remote (tunnel) address are all picked up automatically.
  */
 export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers): () => void {
   let closed = false;
   let request: XMLHttpRequest | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let staleTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconnecting = false;
+  let failures = 0;
   let processedLength = 0;
   let buffer = '';
   let recycling = false;
   // Raw (unparsed) gateway state the next patch applies to; undefined until a snapshot arrives.
   let base: unknown;
 
-  const scheduleReconnect = () => {
-    if (closed || reconnectTimer) return;
+  const clearTimers = () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (staleTimer) clearTimeout(staleTimer);
+    reconnectTimer = undefined;
+    staleTimer = undefined;
+  };
+
+  const armStaleTimer = () => {
+    if (staleTimer) clearTimeout(staleTimer);
+    staleTimer = setTimeout(() => {
+      staleTimer = undefined;
+      if (!closed) recycle();
+    }, staleAfterMs);
+  };
+
+  // Re-locate the host, push a fresh snapshot, then reopen the stream.
+  const reconnectNow = () => {
+    if (closed || reconnecting) return;
+    reconnecting = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
     handlers.onStatus?.('connecting');
+    void fetchGatewaySnapshot(host)
+      .then(snapshot => {
+        if (!closed) handlers.onSnapshot(snapshot);
+      })
+      .catch(error => {
+        if (error instanceof GatewayHttpError && error.status === 401) handlers.onStatus?.('unpaired');
+      })
+      .finally(() => {
+        reconnecting = false;
+        if (!closed) connect();
+      });
+  };
+
+  const scheduleReconnect = () => {
+    if (closed || reconnectTimer || reconnecting) return;
+    handlers.onStatus?.('connecting');
+    const delay = reconnectDelaysMs[Math.min(failures, reconnectDelaysMs.length - 1)];
+    failures++;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
-      void fetchGatewaySnapshot(host)
-        .then(snapshot => {
-          if (!closed) handlers.onSnapshot(snapshot);
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (!closed) connect();
-        });
-    }, reconnectDelayMs);
+      reconnectNow();
+    }, delay + Math.random() * delay * 0.25);
   };
 
   // Tear down and immediately reopen the connection to release the accumulated
@@ -93,6 +140,7 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
           continue;
         }
         const snapshot = parseGatewaySnapshot(eventName === 'state' ? payload : base);
+        failures = 0;
         handlers.onStatus?.('live');
         handlers.onSnapshot(snapshot);
       } catch {
@@ -116,9 +164,12 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
     try {
       xhr.open('GET', new URL('/api/events?v=2', host.endpoint).toString());
       xhr.setRequestHeader('Accept', 'text/event-stream');
+      for (const [name, value] of Object.entries(authHeaders(host))) xhr.setRequestHeader(name, value);
       xhr.onreadystatechange = () => {
         if (recycling || xhr !== request) return;
         if (xhr.readyState >= 3 && typeof xhr.responseText === 'string') {
+          // Any byte, including a keepalive comment, proves the socket is alive.
+          armStaleTimer();
           const fresh = xhr.responseText.slice(processedLength);
           processedLength = xhr.responseText.length;
           if (fresh) handleChunk(fresh);
@@ -128,6 +179,12 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
           }
         }
         if (xhr.readyState === 4 && !closed) {
+          if (staleTimer) clearTimeout(staleTimer);
+          staleTimer = undefined;
+          if (xhr.status === 401) {
+            handlers.onStatus?.('unpaired');
+            failures = reconnectDelaysMs.length;
+          }
           scheduleReconnect();
         }
       };
@@ -138,11 +195,28 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
     }
   };
 
+  // A pending backoff wait is pointless once the network or the app's foreground state changes.
+  const nudge = () => {
+    if (closed || reconnecting || !reconnectTimer) return;
+    failures = 0;
+    reconnectNow();
+  };
+  const appStateSubscription = AppState.addEventListener('change', (state: AppStateStatus) => {
+    if (state === 'active') nudge();
+  });
+  const networkSubscription = typeof Network.addNetworkStateListener === 'function'
+    ? Network.addNetworkStateListener(state => {
+      if (state.isConnected !== false) nudge();
+    })
+    : undefined;
+
   connect();
 
   return () => {
     closed = true;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+    clearTimers();
+    appStateSubscription.remove();
+    networkSubscription?.remove();
     handlers.onStatus?.('offline');
     try {
       request?.abort();

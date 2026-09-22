@@ -21,8 +21,11 @@ import {
 	SendMessageResult,
 } from './protocol';
 import { StateStreamHub } from './stateStream';
+import { authCookie, clearedAuthCookie, presentedToken, requestIsHttps, tokensMatch } from './gatewayAuth';
 
 const maximumRequestBytes = 64 * 1024;
+/** Minimum spacing between re-reads of the secret file triggered by rejected tokens. */
+const secretRefreshIntervalMs = 2_000;
 
 export interface GatewayBackend {
 	getState(): GatewayState;
@@ -52,6 +55,11 @@ export interface GatewayServerOptions {
 	readonly html: string;
 	readonly mermaidScript?: string;
 	readonly iconSvg?: string;
+	/** Bearer token required on every `/api/*` route except health and auth; re-read after a mismatch so a reset converges. */
+	readonly readPairingSecret: () => Promise<string>;
+	readonly secretRefreshIntervalMs?: number;
+	/** Every URL a client may reach this gateway through (LAN addresses, tunnels); re-read per health request. */
+	readonly getEndpoints?: (port: number) => readonly string[];
 }
 
 export interface GatewayAddress {
@@ -65,6 +73,8 @@ export class GatewayServer {
 	private readonly streams: StateStreamHub<GatewayState>;
 	private readonly backendSubscription: { dispose(): void };
 	private address: GatewayAddress | undefined;
+	private pairingSecret = '';
+	private secretRefreshedAt = 0;
 
 	constructor(
 		private readonly backend: GatewayBackend,
@@ -81,6 +91,8 @@ export class GatewayServer {
 		if (this.address) {
 			return this.address;
 		}
+		this.pairingSecret = await this.options.readPairingSecret();
+		this.secretRefreshedAt = Date.now();
 		await new Promise<void>((resolve, reject) => {
 			const onError = (error: Error) => {
 				this.server.off('listening', onListening);
@@ -137,6 +149,7 @@ export class GatewayServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/health') {
+				const port = this.address?.port ?? this.options.port;
 				this.sendJson(response, 200, {
 					service: 'githubcopilot-monitor-gateway',
 					registryId: this.options.registryId,
@@ -145,8 +158,26 @@ export class GatewayServer {
 					...(this.options.ownerId ? { ownerId: this.options.ownerId } : {}),
 					apiVersion,
 					capabilities: apiCapabilities,
+					authRequired: true,
+					authorized: await this.isAuthorized(request),
+					endpoints: this.options.getEndpoints?.(port) ?? [],
 				});
 				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/auth') {
+				// Browsers cannot attach headers to EventSource, so the dashboard trades the secret for a cookie once.
+				const body = await this.readJsonBody(request) as { token?: unknown };
+				const token = typeof body.token === 'string' ? body.token : undefined;
+				if (!await this.isAuthorized({ headers: { authorization: token ? `Bearer ${token}` : undefined } })) {
+					response.setHeader('Set-Cookie', clearedAuthCookie());
+					throw new MonitorRequestError(401, 'This pairing code is not valid for this computer.');
+				}
+				response.setHeader('Set-Cookie', authCookie(this.pairingSecret, requestIsHttps(request)));
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (url.pathname.startsWith('/api/') && !await this.isAuthorized(request)) {
+				throw new MonitorRequestError(401, 'Not paired with this computer. Scan its pairing code again.');
 			}
 			if (request.method === 'GET' && url.pathname === '/api/state') {
 				this.sendJson(response, 200, this.backend.getState());
@@ -316,6 +347,23 @@ export class GatewayServer {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+	}
+
+	private async isAuthorized(request: Pick<http.IncomingMessage, 'headers'>): Promise<boolean> {
+		const token = presentedToken(request);
+		if (tokensMatch(this.pairingSecret, token)) {
+			return true;
+		}
+		if (!token || Date.now() - this.secretRefreshedAt < (this.options.secretRefreshIntervalMs ?? secretRefreshIntervalMs)) {
+			return false;
+		}
+		this.secretRefreshedAt = Date.now();
+		try {
+			this.pairingSecret = await this.options.readPairingSecret();
+		} catch {
+			return false;
+		}
+		return tokensMatch(this.pairingSecret, token);
 	}
 
 	private sendHtml(response: http.ServerResponse): void {

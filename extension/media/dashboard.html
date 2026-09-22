@@ -4560,15 +4560,35 @@
 				}
 			});
 
+			const notPairedMessage = 'This browser is not paired with the computer. Open the dashboard from VS Code (Copilot Monitor: Open Dashboard) or scan the pairing code again.';
+
+			// The pairing link carries the secret in the URL fragment; trade it for an HttpOnly cookie once,
+			// then drop it from the address bar so it is not kept in history or shared by accident.
+			async function authenticateFromFragment() {
+				const token = new URLSearchParams(location.hash.replace(/^#/, '')).get('k');
+				if (!token) return;
+				const response = await fetch('/api/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
+				history.replaceState(null, '', location.pathname + location.search);
+				if (!response.ok) throw new Error('The pairing code in this link is not valid for this computer. Scan or copy a fresh one from VS Code.');
+			}
+
 			async function loadInitialState() {
 				try {
+					await authenticateFromFragment();
 					const healthResponse = await fetch('/api/health');
 					if (!healthResponse.ok) throw new Error(`Bridge returned ${healthResponse.status}`);
 					const health = await healthResponse.json();
 					gatewayCapabilities = new Set(Array.isArray(health.capabilities) ? health.capabilities : []);
+					if (health.authRequired && !health.authorized) {
+						setConnection('offline', 'Not paired');
+						renderError(notPairedMessage);
+						return false;
+					}
+					return true;
 				} catch (error) {
 					setConnection('offline', 'Bridge unavailable');
 					renderError(error instanceof Error ? error.message : String(error));
+					return false;
 				}
 			}
 
@@ -4630,6 +4650,7 @@
 
 			let eventSource;
 			let eventResyncTimer;
+			let eventResyncDelay = 250;
 			function connectEvents() {
 				if (eventSource) eventSource.close();
 				// v2: one snapshot, then patches. Every (re)connection starts with a fresh snapshot,
@@ -4643,10 +4664,13 @@
 					eventSource = undefined;
 					setConnection('connecting', 'Resyncing');
 					clearTimeout(eventResyncTimer);
-					eventResyncTimer = setTimeout(connectEvents, 250);
+					// A stream that dies before its first snapshot (gateway gone, pairing reset) must not spin.
+					eventResyncTimer = setTimeout(connectEvents, eventResyncDelay);
+					eventResyncDelay = Math.min(eventResyncDelay * 2, 10_000);
 				};
 				events.onopen = () => setConnection('connected', 'Live');
 				events.addEventListener('snapshot', event => {
+					eventResyncDelay = 250;
 					base = JSON.parse(event.data);
 					renderError('');
 					render(base);
@@ -4674,8 +4698,7 @@
 				};
 			}
 
-			void loadInitialState();
-			connectEvents();
+			void loadInitialState().then(authorized => { if (authorized) connectEvents(); });
 		})();
 	</script>
 </body>

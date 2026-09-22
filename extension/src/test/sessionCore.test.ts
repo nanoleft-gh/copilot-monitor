@@ -236,6 +236,25 @@ describe('SessionCore', () => {
 		await waitFor(() => core.getState().sessions.find(session => session.sessionId === sessionB)?.status === 'idle', 3_000);
 	});
 
+	it('does not report a finished chat as working just because it was opened and then left', async () => {
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'a', { modelState: { value: 1, completedAt: base + 5 } })]));
+		await fs.writeFile(path.join(fixture.sessions, `${sessionB}.jsonl`), initialLine(sessionB, [request(0, 'b', { modelState: { value: 1, completedAt: base + 5 } })]));
+		// A has an old, complete transcript on disk; replaying it on attach is not activity.
+		await fs.writeFile(path.join(fixture.transcripts, `${sessionA}.jsonl`),
+			transcriptLine('user.message', { content: 'a' }, base)
+			+ transcriptLine('assistant.turn_start', { turnId: '0' }, base + 1)
+			+ transcriptLine('assistant.message', { content: 'done', toolRequests: [] }, base + 2)
+			+ transcriptLine('assistant.turn_end', { turnId: '0' }, base + 3));
+		const core = createCore();
+		await core.setViewerCount(1);
+		await core.selectSession(sessionA);
+		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
+		await core.selectSession(sessionB);
+		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
+		await core.selectSession(sessionA);
+		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
+	});
+
 	it('picks up the index appearing later and new/removed session files', async () => {
 		const core = createCore();
 		await core.setViewerCount(1);

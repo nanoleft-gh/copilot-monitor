@@ -226,6 +226,33 @@ capabilities `sessionSync` and `eventsV2`.
 | `GET /api/events?v=2` | Protocol 2: one `event: snapshot`, then `event: patch` deltas |
 | `POST /api/sessions/sync` | Request one export snapshot for a session (user action) |
 | `GET /api/presence` (gateway) | Idle SSE stream followers hold open; does not count as a dashboard client |
+| `POST /api/auth` (gateway) | Browser-only: trades the pairing secret for an `HttpOnly; SameSite=Strict` cookie |
+
+### 9.0 Pairing secret and reachability (`gatewayAuth.ts`, `hostIdentity.ts`)
+
+Every `/api/*` route on the shared gateway except `/api/health` and `/api/auth` requires the
+host's **pairing secret**, presented as `Authorization: Bearer <secret>` (apps, follower
+windows) or as the `cm_auth` cookie (browser dashboard, because `EventSource` cannot set
+headers). The secret is 32 random bytes, created exclusively (`wx`, mode 0600) in the shared
+state directory next to `host.json`, so concurrent windows converge on one value and gateway
+failover keeps it. Comparison is constant-time. The gateway caches the secret and re-reads
+the file (throttled to once per 2 s) when a token it does not know arrives, so
+`Copilot Monitor: Reset Pairing Secret` from any window converges without restarts.
+
+The QR code / pairing link is `http://<lan-ip>:<port>/#k=<secret>`: the fragment never
+reaches the server, its logs, or a tunnel provider. The dashboard posts it to `/api/auth`
+once and strips it from the address bar. `SameSite=Strict` plus the JSON `Content-Type`
+requirement blocks cross-site requests; no CORS headers are issued.
+
+`/api/health` is public (it carries only identifiers) and additionally reports
+`authRequired`, `authorized` (whether *this* request carried a valid token) and
+`endpoints`: every URL the gateway can be reached through — all physical LAN IPv4
+interfaces plus the `githubCopilotMonitor.remoteUrl` setting. Phones persist the list and,
+when the last-good address fails, probe LAN candidates in parallel, then remote ones, then
+scan the subnet (`mobile/src/transport/host-locator.ts`). Remote access relies on an
+externally provided tunnel (VS Code Ports view / dev tunnels, Tailscale, Cloudflare Tunnel):
+`env.asExternalUri` is a no-op in local windows and `workspace.openTunnel` is a proposed
+API, so the URL is pasted once and advertised from then on.
 
 ### 9.1 Protocol 2 deltas (`stateDelta.ts`, `stateStream.ts`)
 

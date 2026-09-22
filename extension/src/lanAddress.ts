@@ -3,14 +3,21 @@ import { networkInterfaces, type NetworkInterfaceInfo } from 'node:os';
 type InterfaceMap = NodeJS.Dict<NetworkInterfaceInfo[]>;
 
 export function findLanAddress(interfaces: InterfaceMap = networkInterfaces()): string {
+	return findLanAddresses(interfaces)[0] ?? '127.0.0.1';
+}
+
+/** Every plausible LAN IPv4 address, best first; virtual adapters (WSL, Hyper-V, Docker) are excluded. */
+export function findLanAddresses(interfaces: InterfaceMap = networkInterfaces()): string[] {
 	const candidates = Object.entries(interfaces)
 		.flatMap(([name, entries]) => (entries ?? []).map(entry => ({ name, entry })))
 		.filter(candidate => candidate.entry.family === 'IPv4' && !candidate.entry.internal)
 		.map(candidate => ({
 			address: candidate.entry.address,
 			score: scoreInterface(candidate.name, candidate.entry.address),
-		}));
-	return candidates.sort((left, right) => right.score - left.score)[0]?.address ?? '127.0.0.1';
+		}))
+		.sort((left, right) => right.score - left.score);
+	const reachable = candidates.filter(candidate => candidate.score >= 0);
+	return [...new Set((reachable.length > 0 ? reachable : candidates.slice(0, 1)).map(candidate => candidate.address))];
 }
 
 function scoreInterface(name: string, address: string): number {

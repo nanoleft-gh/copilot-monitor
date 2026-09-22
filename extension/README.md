@@ -9,10 +9,11 @@ Every open VS Code window runs a hidden loopback bridge, while one window owns t
 
 ## Security
 
-The dashboard intentionally has **no authentication**. Anyone who can reach its LAN URL can read local Copilot transcripts and may be able to send prompts, change chat settings, approve individual tool calls, or enable Bypass Approvals/Autopilot for a chat.
+Every API request must present the computer's **pairing secret**. Anyone who holds it can read local Copilot transcripts, send prompts, change chat settings, approve tool calls, or enable Bypass Approvals/Autopilot for a chat, so treat the QR code and pairing link like a password.
 
-- Use it only on a private, trusted network.
-- Do not expose port `43121` to the public internet, guest Wi-Fi, tunnels, or port-forwarding.
+- The secret is created once per computer and shared by all VS Code windows; the QR code / `Copy Pairing Link` carry it in the URL fragment, which browsers never send to servers.
+- Rotate it with `Copilot Monitor: Reset Pairing Secret` if a code or link may have leaked; every phone and browser then re-pairs.
+- On the LAN the dashboard is plain HTTP. For access from outside your network, use an HTTPS tunnel (see [Remote access](#remote-access)); do not port-forward `43121` on your router.
 - Review Windows Firewall prompts and allow private networks only.
 - Stop the dashboard from the Command Palette when it is not needed.
 
@@ -44,7 +45,8 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Exports complete conversations as Markdown by copying to the clipboard or downloading a `.md` file.
 - Keeps persisted session identity separate from live response overlays.
 - Deduplicates submitted message IDs and reports accepted, completed, and failed states.
-- Exposes one tokenless dashboard URL on the trusted local network.
+- Exposes one gateway URL per computer, protected by a per-computer pairing secret (bearer token for apps, `HttpOnly` cookie for the browser dashboard).
+- Advertises every reachable address (all LAN interfaces plus an optional remote URL) so paired phones survive Wi-Fi drops, IP changes, and leaving the house without re-scanning.
 - Elects the gateway owner by binding the shared port and automatically fails over when that window closes.
 - Does nothing while no dashboard or phone is connected: no watchers, no tailers, no timers.
 - Requires no proposed API and no special launch flags.
@@ -95,22 +97,34 @@ Reload VS Code. The bridge starts automatically, adds a `Copilot Monitor` status
 
 1. Connect the phone and computer to the same trusted Wi-Fi network.
 2. Reload each VS Code window after installing the extension.
-3. Run `Copilot Monitor: Copy Dashboard URL` in any window.
-4. Open that URL on the phone.
+3. Open the **Copilot Monitor** view in the Activity Bar and scan its QR code with the Copilot Monitor app (or with the camera, to open the browser dashboard). `Copilot Monitor: Copy Pairing Link` gives the same link as text.
 
-All windows publish through the same port and URL. Windows Firewall may ask whether VS Code can accept private-network traffic. See [Security](#security) before opening the dashboard from another device.
+Pair once. The phone keeps every address the computer advertises and finds it again after Wi-Fi drops, router-assigned IP changes, or a switch to another network. All windows publish through the same port. Windows Firewall may ask whether VS Code can accept private-network traffic. See [Security](#security) before pairing another device.
+
+## Remote access
+
+To reach the computer when the phone is not on your Wi-Fi, without any paid service:
+
+1. Open the **Ports** view (Panel > Ports, or the sidebar's *Open Ports view* button), choose **Forward a Port**, and enter `43121`. VS Code uses Microsoft dev tunnels; sign in with GitHub when asked.
+2. Right-click the port and set **Port Visibility > Public**. Private ports require a GitHub browser login the app cannot perform; the pairing secret still protects every request.
+3. Copy the **Forwarded Address** and run `Copilot Monitor: Set Remote Access URL` (or use the sidebar's *Set remote URL*).
+
+The next time the phone connects at home it learns the address and switches to it automatically whenever the local network is unreachable. Traffic through the tunnel is HTTPS. A Tailscale (free personal plan; the phone reaches the PC's stable `100.x` address from anywhere, nothing is public) or Cloudflare Tunnel URL works the same way. Dev tunnels have bandwidth and active-tunnel limits; the delta stream keeps usage small.
 
 ## Settings
 
 - `githubCopilotMonitor.autoStart`: register each VS Code window with the shared gateway after startup. Default: `true`.
 - `githubCopilotMonitor.port`: stable LAN gateway port shared by all windows. Default: `43121`.
+- `githubCopilotMonitor.remoteUrl`: public HTTPS address (Ports view Forwarded Address, Tailscale, Cloudflare Tunnel) that reaches the gateway from outside your Wi-Fi. Paired phones learn it automatically. Default: empty.
 
 ## Commands
 `ctrl+shift+p` -> 
 - `Copilot Monitor: Start Dashboard`
 - `Copilot Monitor: Stop Dashboard`
 - `Copilot Monitor: Open Dashboard`
-- `Copilot Monitor: Copy Dashboard URL`
+- `Copilot Monitor: Copy Pairing Link`
+- `Copilot Monitor: Set Remote Access URL`
+- `Copilot Monitor: Reset Pairing Secret`
 
 ## Known Limitations for Future Scope
 
@@ -125,4 +139,4 @@ All windows publish through the same port and URL. Windows Firewall may ask whet
 
 ## Validation
 
-`npm test` runs TypeScript compilation, ESLint, model inventory/configuration tests, transcript/cache tests, terminal parsing and approval guards, window registry tests, exact cross-window routing tests, single-port gateway tests, and leader failover tests. `npm run test:integration` launches VS Code and fetches the tokenless gateway dashboard and aggregate state.
+`npm test` runs TypeScript compilation, ESLint, model inventory/configuration tests, transcript/cache tests, terminal parsing and approval guards, window registry tests, exact cross-window routing tests, single-port gateway and pairing-secret tests, and leader failover tests. `npm run test:integration` launches VS Code and fetches the gateway dashboard and aggregate state.

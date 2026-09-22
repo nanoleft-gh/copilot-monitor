@@ -9,6 +9,10 @@ import { GatewayCoordinator } from '../gatewayCoordinator';
 import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewaySyncSessionRequest, GatewayToolDecisionRequest } from '../protocol';
 
 const emptyState: GatewayState = { version: 2, gatewayStartedAt: 1, windows: [] };
+const secret = 'test-secret-0123456789abcdefghijklmnopqrstuv';
+const readPairingSecret = async () => secret;
+const authorized = { Authorization: `Bearer ${secret}` };
+const jsonHeaders = { ...authorized, 'Content-Type': 'application/json' };
 
 class TestGatewayBackend implements GatewayBackend {
 	messages: GatewaySendMessageRequest[] = [];
@@ -82,6 +86,51 @@ class TestGatewayBackend implements GatewayBackend {
 }
 
 describe('GatewayServer', () => {
+	it('requires the pairing secret on every API route except health, and issues a cookie for browsers', async () => {
+		let current = secret;
+		const server = new GatewayServer(new TestGatewayBackend(), {
+			host: '127.0.0.1', advertisedHost: '127.0.0.1', port: 0, registryId: 'registry-auth', html: '<!doctype html>',
+			readPairingSecret: async () => current,
+			secretRefreshIntervalMs: 0,
+			getEndpoints: port => [`http://10.0.0.5:${port}/`, 'https://example-43121.devtunnels.ms/'],
+		});
+		const address = await server.start();
+		const baseUrl = `http://127.0.0.1:${address.port}`;
+		try {
+			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json()) as Record<string, unknown>;
+			assert.equal(health.authRequired, true);
+			assert.equal(health.authorized, false);
+			assert.deepEqual(health.endpoints, [`http://10.0.0.5:${address.port}/`, 'https://example-43121.devtunnels.ms/']);
+			assert.equal((await fetch(`${baseUrl}/api/state`)).status, 401);
+			assert.equal((await fetch(`${baseUrl}/api/state`, { headers: { Authorization: 'Bearer wrong' } })).status, 401);
+			assert.equal((await fetch(`${baseUrl}/api/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+			assert.equal((await fetch(`${baseUrl}/api/state`, { headers: authorized })).status, 200);
+			assert.equal((await fetch(`${baseUrl}/`)).status, 200, 'the dashboard shell itself is public');
+
+			const rejected = await fetch(`${baseUrl}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'wrong' }) });
+			assert.equal(rejected.status, 401);
+			const accepted = await fetch(`${baseUrl}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: secret }) });
+			assert.equal(accepted.status, 204);
+			const cookie = accepted.headers.get('set-cookie') ?? '';
+			assert.match(cookie, /^cm_auth=/);
+			assert.match(cookie, /HttpOnly/);
+			assert.match(cookie, /SameSite=Strict/);
+			assert.doesNotMatch(cookie, /Secure/, 'plain-HTTP LAN dashboards cannot use Secure cookies');
+			const viaTunnel = await fetch(`${baseUrl}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-Proto': 'https' }, body: JSON.stringify({ token: secret }) });
+			assert.match(viaTunnel.headers.get('set-cookie') ?? '', /Secure/);
+			const cookieOnly = await fetch(`${baseUrl}/api/health`, { headers: { Cookie: cookie.split(';')[0] } }).then(response => response.json()) as Record<string, unknown>;
+			assert.equal(cookieOnly.authorized, true);
+			assert.equal((await fetch(`${baseUrl}/api/state`, { headers: { Cookie: cookie.split(';')[0] } })).status, 200);
+
+			// A reset from another window: the server re-reads the secret when a token it does not know shows up.
+			current = 'rotated-secret-0123456789abcdefghijklmnopqrs';
+			assert.equal((await fetch(`${baseUrl}/api/state`, { headers: { Authorization: `Bearer ${current}` } })).status, 200);
+			assert.equal((await fetch(`${baseUrl}/api/state`, { headers: authorized })).status, 401);
+		} finally {
+			await server.stop();
+		}
+	});
+
 	it('serves one tokenless endpoint and routes window-aware requests', async () => {
 		const backend = new TestGatewayBackend();
 		const server = new GatewayServer(backend, {
@@ -92,6 +141,7 @@ describe('GatewayServer', () => {
 			html: '<!doctype html><title>Gateway</title>',
 			mermaidScript: 'globalThis.mermaid = {};',
 			iconSvg: '<svg/>',
+			readPairingSecret,
 		});
 		const address = await server.start();
 		const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -100,45 +150,46 @@ describe('GatewayServer', () => {
 			assert.deepEqual(health, {
 				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 4,
 				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2'],
+				authRequired: true, authorized: false, endpoints: [],
 			});
 			const page = await fetch(`${baseUrl}/`);
 			assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' 'unsafe-inline'/);
-			assert.deepEqual(await fetch(`${baseUrl}/api/state`).then(response => response.json()), emptyState);
+			assert.deepEqual(await fetch(`${baseUrl}/api/state`, { headers: authorized }).then(response => response.json()), emptyState);
 			const mermaid = await fetch(`${baseUrl}/assets/mermaid.min.js`);
 			assert.equal(mermaid.status, 200);
 			assert.match(mermaid.headers.get('content-type') ?? '', /text\/javascript/);
 			assert.equal(await mermaid.text(), 'globalThis.mermaid = {};');
 			assert.equal(await fetch(`${baseUrl}/assets/icon.svg`).then(response => response.text()), '<svg/>');
 			const abortController = new AbortController();
-			const events = await fetch(`${baseUrl}/api/events`, { signal: abortController.signal });
+			const events = await fetch(`${baseUrl}/api/events`, { signal: abortController.signal, headers: authorized });
 			assert.equal(events.status, 200);
 			assert.equal(backend.clientCounts.at(-1), 1);
 			abortController.abort();
 
 			const message = { windowId: 'w2', id: 'm1', sessionResource: 's2', text: 'Hello' };
 			assert.equal((await fetch(`${baseUrl}/api/messages`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(message),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(message),
 			})).status, 202);
 			assert.deepEqual(backend.messages, [message]);
 
 			const edit = { windowId: 'w2', id: 'e1', sessionResource: 's2', sessionRevision: 'rev-1', requestId: 'r1', text: 'Edited' };
-			assert.equal((await fetch(`${baseUrl}/api/turns/edit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edit) })).status, 202);
+			assert.equal((await fetch(`${baseUrl}/api/turns/edit`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(edit) })).status, 202);
 			assert.deepEqual(backend.edits, [edit]);
 
 			const selection = { windowId: 'w1', sessionResource: 's1' };
 			assert.equal((await fetch(`${baseUrl}/api/sessions/select`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selection),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(selection),
 			})).status, 204);
 			assert.deepEqual(backend.selections, [selection]);
 
 			assert.equal((await fetch(`${baseUrl}/api/sessions/sync`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selection),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(selection),
 			})).status, 204);
 			assert.deepEqual(backend.syncs, [selection]);
 
 			const history = { windowId: 'w1', sessionResource: 's1', sessionRevision: 'rev-1', before: 40, limit: 40 };
 			const historyResponse = await fetch(`${baseUrl}/api/sessions/history`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(history),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(history),
 			});
 			assert.equal(historyResponse.status, 200);
 			assert.equal((await historyResponse.json() as { revision: string }).revision, 'rev-1');
@@ -146,13 +197,13 @@ describe('GatewayServer', () => {
 
 			const decision = { windowId: 'w1', sessionResource: 's1', requestId: 'r1', toolCallId: 't1', decision: 'allow' };
 			assert.equal((await fetch(`${baseUrl}/api/tools/decision`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(decision),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(decision),
 			})).status, 204);
 			assert.deepEqual(backend.toolDecisions, [decision]);
 
 			const modelSelection = { windowId: 'w1', sessionResource: 's1', modelId: 'copilot/gpt-test' };
 			assert.equal((await fetch(`${baseUrl}/api/models/select`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(modelSelection),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(modelSelection),
 			})).status, 204);
 			assert.deepEqual(backend.modelSelections, [modelSelection]);
 
@@ -160,20 +211,20 @@ describe('GatewayServer', () => {
 				windowId: 'w2', sessionResource: 's2', modelId: 'copilot/gpt-test', key: 'contextSize', value: 922000,
 			};
 			assert.equal((await fetch(`${baseUrl}/api/models/configure`, {
-				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(modelConfiguration),
+				method: 'POST', headers: jsonHeaders, body: JSON.stringify(modelConfiguration),
 			})).status, 204);
 			assert.deepEqual(backend.modelConfigurations, [modelConfiguration]);
 
 			const rename = { windowId: 'w1', sessionResource: 's1', title: 'Renamed' };
-			assert.equal((await fetch(`${baseUrl}/api/sessions/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rename) })).status, 204);
+			assert.equal((await fetch(`${baseUrl}/api/sessions/rename`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(rename) })).status, 204);
 			assert.deepEqual(backend.renames, [rename]);
 			const created = { id: 'new-1', windowId: 'w2', sourceSessionResource: 's2' };
-			const createdResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(created) });
+			const createdResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(created) });
 			assert.equal(createdResponse.status, 201);
 			assert.deepEqual(await createdResponse.json(), { sessionResource: 'new-session' });
 			assert.deepEqual(backend.created, [created]);
 			const permission = { windowId: 'w1', sessionResource: 's1', permissionLevel: 'autopilot' } as const;
-			assert.equal((await fetch(`${baseUrl}/api/sessions/permission`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(permission) })).status, 204);
+			assert.equal((await fetch(`${baseUrl}/api/sessions/permission`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(permission) })).status, 204);
 			assert.deepEqual(backend.permissions, [permission]);
 		} finally {
 			await server.stop();
@@ -201,6 +252,7 @@ describe('GatewayCoordinator', () => {
 			html: '<!doctype html>',
 			mermaidScript: 'globalThis.mermaid = {};',
 			retryIntervalMs: 25,
+			readPairingSecret,
 		};
 		const first = new GatewayCoordinator({ ...options, ownerId: 'window-1' });
 		const second = new GatewayCoordinator({ ...options, ownerId: 'window-2' });
@@ -233,6 +285,7 @@ describe('GatewayCoordinator', () => {
 			html: '<!doctype html>',
 			mermaidScript: 'globalThis.mermaid = {};',
 			retryIntervalMs: 25,
+			readPairingSecret,
 		};
 		const first = new GatewayCoordinator({ ...options, ownerId: 'window-1' });
 		const second = new GatewayCoordinator({ ...options, ownerId: 'window-2' });
@@ -265,6 +318,7 @@ describe('GatewayCoordinator', () => {
 			advertisedHost: '127.0.0.1',
 			html: '<!doctype html>',
 			mermaidScript: 'globalThis.mermaid = {};',
+			readPairingSecret,
 		};
 		const first = new GatewayCoordinator({ ...options, ownerId: 'window-1', retryIntervalMs: 25 });
 		const second = new GatewayCoordinator({ ...options, ownerId: 'window-2', retryIntervalMs: 25 });
@@ -300,6 +354,7 @@ describe('GatewayCoordinator', () => {
 			html: '<!doctype html>',
 			mermaidScript: 'globalThis.mermaid = {};',
 			retryIntervalMs: 25,
+			readPairingSecret,
 		};
 		const leader = new GatewayCoordinator({ ...options, ownerId: 'window-1' });
 		const follower = new GatewayCoordinator({ ...options, ownerId: 'window-2' });

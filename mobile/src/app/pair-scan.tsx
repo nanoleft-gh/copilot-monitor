@@ -50,7 +50,7 @@ export default function PairScanScreen() {
           showsVerticalScrollIndicator={false}
         >
         <Text style={styles.title}>Scan the pairing code</Text>
-        <Text style={styles.body}>Open the Copilot Monitor sidebar in VS Code, then point your camera at its QR code.</Text>
+        <Text style={styles.body}>Open the Copilot Monitor sidebar in VS Code, then point your camera at its QR code. Pair once; the phone keeps finding the computer after Wi-Fi drops and IP changes.</Text>
 
         <View style={styles.cameraFrame}>
           {permission?.granted ? (
@@ -78,7 +78,7 @@ export default function PairScanScreen() {
 
         <Pressable accessibilityRole="button" onPress={() => setManualEntry(value => !value)} style={styles.manualButton}>
           <Clipboard color={colors.textSecondary} size={18} />
-          <Text style={styles.manualText}>Paste pairing code</Text>
+          <Text style={styles.manualText}>Paste pairing link</Text>
         </Pressable>
         {manualEntry && (
           <View style={styles.manualEntry}>
@@ -91,7 +91,7 @@ export default function PairScanScreen() {
                 setAddress(value);
                 setError(null);
               }}
-              placeholder="http://192.168.1.10:43121/"
+              placeholder="http://192.168.1.10:43121/#k=…"
               placeholderTextColor={colors.textMuted}
               style={styles.input}
               value={address}

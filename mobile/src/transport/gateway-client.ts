@@ -12,27 +12,29 @@ import type {
   TranscriptTurn,
   WindowSnapshot,
 } from './types';
-import { pairGateway } from './pairing';
-import { replaceHost } from './host-store';
-import { discoverHostEndpoint } from './host-discovery';
+import { authHeaders } from './pairing';
+import { locateHost, refreshHostEndpoints } from './host-locator';
 
 const requestTimeoutMs = 10_000;
 
+/** The gateway answered, but with an error; retrying elsewhere on the network will not help. */
+export class GatewayHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'GatewayHttpError';
+  }
+}
+
 export async function fetchGatewaySnapshot(host: HostProfile): Promise<GatewaySnapshot> {
-  let currentHost = host;
   let value: unknown;
   try {
-    value = await requestJson(new URL('/api/state', currentHost.endpoint));
-  } catch {
-    const discoveredEndpoint = await discoverHostEndpoint(host);
-    if (!discoveredEndpoint) {
-      throw new Error(`Cannot find ${host.name} on this local network. Confirm VS Code is running and both devices are on the same network.`);
-    }
-    const discovered = await pairGateway(discoveredEndpoint);
-    currentHost = { ...discovered, name: host.name };
-    await replaceHost(host.id, currentHost);
-    Object.assign(host, currentHost);
-    value = await requestJson(new URL('/api/state', currentHost.endpoint));
+    value = await requestJson(host, '/api/state');
+    refreshHostEndpoints(host);
+  } catch (error) {
+    if (error instanceof GatewayHttpError) throw error;
+    // Network-level failure: the computer may have moved (new IP, different network, tunnel only).
+    await locateHost(host);
+    value = await requestJson(host, '/api/state');
   }
   if (!isRecord(value) || value.version !== 2 || !Array.isArray(value.windows)) {
     throw new Error('The computer returned an unsupported monitor state.');
@@ -56,11 +58,7 @@ export async function selectSession(
   windowId: string,
   sessionResource: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/sessions/select', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource }),
-  });
+  await postJson(host, '/api/sessions/select', { windowId, sessionResource });
 }
 
 export async function sendMessage(
@@ -69,11 +67,7 @@ export async function sendMessage(
   sessionResource: string,
   text: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/messages', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, text, id: createRequestId() }),
-  });
+  await postJson(host, '/api/messages', { windowId, sessionResource, text, id: createRequestId() });
 }
 
 export async function editTurn(
@@ -84,17 +78,13 @@ export async function editTurn(
   requestId: string,
   text: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/turns/edit', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      windowId,
-      sessionResource,
-      sessionRevision,
-      requestId,
-      text,
-      id: createRequestId('edit'),
-    }),
+  await postJson(host, '/api/turns/edit', {
+    windowId,
+    sessionResource,
+    sessionRevision,
+    requestId,
+    text,
+    id: createRequestId('edit'),
   });
 }
 
@@ -106,11 +96,7 @@ export async function decideTool(
   toolCallId: string,
   decision: 'allow' | 'skip',
 ): Promise<void> {
-  await requestJson(new URL('/api/tools/decision', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, requestId, toolCallId, decision }),
-  });
+  await postJson(host, '/api/tools/decision', { windowId, sessionResource, requestId, toolCallId, decision });
 }
 
 export async function selectModel(
@@ -119,11 +105,7 @@ export async function selectModel(
   sessionResource: string,
   modelId: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/models/select', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, modelId }),
-  });
+  await postJson(host, '/api/models/select', { windowId, sessionResource, modelId });
 }
 
 export async function configureModel(
@@ -134,11 +116,7 @@ export async function configureModel(
   key: string,
   value: string | number | boolean,
 ): Promise<void> {
-  await requestJson(new URL('/api/models/configure', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, modelId, key, value }),
-  });
+  await postJson(host, '/api/models/configure', { windowId, sessionResource, modelId, key, value });
 }
 
 export async function setPermissionLevel(
@@ -147,25 +125,29 @@ export async function setPermissionLevel(
   sessionResource: string,
   permissionLevel: 'default' | 'autoApprove' | 'autopilot',
 ): Promise<void> {
-  await requestJson(new URL('/api/sessions/permission', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, permissionLevel }),
-  });
+  await postJson(host, '/api/sessions/permission', { windowId, sessionResource, permissionLevel });
 }
 
-async function requestJson(url: URL, init?: RequestInit): Promise<unknown> {
+async function postJson(host: HostProfile, path: string, body: unknown): Promise<unknown> {
+  return requestJson(host, path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+async function requestJson(host: HostProfile, path: string, init?: RequestInit): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(new URL(path, host.endpoint), {
+      ...init,
+      headers: { ...authHeaders(host), ...(init?.headers as Record<string, string> | undefined) },
+      signal: controller.signal,
+    });
     if (!response.ok) {
       let detail = `HTTP ${response.status}`;
       try {
         const body = await response.json() as { error?: unknown };
         if (typeof body.error === 'string') detail = body.error;
       } catch {}
-      throw new Error(detail);
+      throw new GatewayHttpError(response.status, detail);
     }
     return response.status === 204 ? undefined : response.json();
   } catch (error) {
@@ -371,11 +353,7 @@ export async function createSession(
   existingSessionResources: readonly string[] = [],
 ): Promise<{ sessionResource: string }> {
   try {
-    return await requestJson(new URL('/api/sessions/new', host.endpoint), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ windowId, sourceSessionResource }),
-    }) as { sessionResource: string };
+    return await postJson(host, '/api/sessions/new', { windowId, sourceSessionResource }) as { sessionResource: string };
   } catch (error) {
     const known = new Set(existingSessionResources);
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -401,11 +379,7 @@ export async function loadHistoryPage(
   before: number,
   limit = 40,
 ): Promise<HistoryPage> {
-  const value = await requestJson(new URL('/api/sessions/history', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, sessionRevision, before, limit }),
-  });
+  const value = await postJson(host, '/api/sessions/history', { windowId, sessionResource, sessionRevision, before, limit });
   if (!isRecord(value) || !Array.isArray(value.turns) || typeof value.revision !== 'string') {
     throw new Error('The computer returned an invalid history page.');
   }

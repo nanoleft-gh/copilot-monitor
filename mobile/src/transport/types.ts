@@ -1,8 +1,13 @@
 export type HostProfile = {
   id: string;
   name: string;
+  /** The address that worked most recently; tried first on every connection. */
   endpoint: string;
+  /** Every address the computer advertised (LAN interfaces, tunnel URLs); probed when `endpoint` fails. */
+  endpoints?: string[];
   lastConnected: number;
+  /** Pairing secret, held in memory only; persisted separately in the device keystore. */
+  secret?: string;
 };
 
 export type GatewayHealth = {
@@ -10,6 +15,9 @@ export type GatewayHealth = {
   hostId: string;
   registryId: string;
   apiVersion: number;
+  authRequired: boolean;
+  authorized: boolean;
+  endpoints: string[];
 };
 
 export type TranscriptActivity = {

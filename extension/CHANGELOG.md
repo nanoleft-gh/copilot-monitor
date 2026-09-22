@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.0]
+
+Pairing secret and connection resilience. Phones pair once and keep working through Wi-Fi drops, IP changes, and from outside the home network.
+
+- Every `/api/*` route except `/api/health` now requires the host's pairing secret (`Authorization: Bearer ...`). The secret is minted once per computer in the shared state directory, shared by every VS Code window so gateway failover keeps it, and compared in constant time. The QR code and "Copy pairing link" carry it in the URL fragment (`#k=...`), which never reaches the server or its logs; the browser dashboard trades it for an `HttpOnly; SameSite=Strict` cookie via `POST /api/auth` and drops it from the address bar. `Copilot Monitor: Reset Pairing Secret` rotates it; other windows converge because the gateway re-reads the secret file when it sees a token it does not know.
+- `/api/health` advertises every address the gateway can be reached through (`endpoints`): all physical LAN interfaces plus the new `githubCopilotMonitor.remoteUrl` setting. Paired phones store the list and, when the last-good address fails, probe the LAN candidates in parallel, then the remote ones, then fall back to the subnet scan, so a changed IP or a different network needs no re-scan.
+- Remote access without a paid server: forward the gateway port in VS Code's **Ports** view (Microsoft dev tunnels, free, GitHub sign-in), set its visibility to *Public*, and paste the Forwarded Address via `Copilot Monitor: Set Remote Access URL` or the sidebar. Phones learn the URL the next time they connect at home and switch to it automatically when away. A Tailscale or Cloudflare Tunnel URL works the same way. VS Code offers no stable API to create local tunnels programmatically (`env.asExternalUri` is a no-op in local windows; `workspace.openTunnel` is a proposed API), so the address is pasted once.
+- Fixed chats briefly showing "Working" after being opened and left on the phone: replaying an existing transcript on attach, and log lines that touched no turn, counted as activity.
+- Dashboard: a stream that dies before its first snapshot (gateway gone, pairing reset) backs off instead of reconnecting every 250 ms.
+
 ## [1.2.3]
 
 - Fixed effort/context (and rename, approval-mode fallback) changes made from the dashboard or phone not reaching VS Code. These are written to the session log, which VS Code reads only when it loads a session; the previous "open in editor and close it" release did nothing while the chat panel still held the session. The session is now gathered into the panel, the panel is moved to a fresh blank chat so the last reference drops, VS Code's own dispose-time write is allowed to land, the change is appended, and the session is shown again from disk.

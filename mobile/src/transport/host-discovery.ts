@@ -6,6 +6,11 @@ const probeTimeoutMs = 650;
 const probeConcurrency = 24;
 
 export async function discoverHostEndpoint(host: HostProfile): Promise<string | undefined> {
+  // Sweeping a /24 only makes sense on a LAN; on mobile data the address belongs to the carrier.
+  const network = await Network.getNetworkStateAsync().catch(() => undefined);
+  if (network && network.type !== Network.NetworkStateType.WIFI && network.type !== Network.NetworkStateType.ETHERNET) {
+    return undefined;
+  }
   const localAddress = await Network.getIpAddressAsync().catch(() => undefined);
   const prefix = ipv4Prefix(localAddress);
   if (!prefix) return undefined;

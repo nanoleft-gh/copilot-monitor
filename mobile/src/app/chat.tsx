@@ -3,11 +3,12 @@ import { Check, ChevronLeft, Pencil, Send, X } from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Keyboard, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { MarkdownText } from '@/components/ui/markdown-text';
 import { PickerField, type PickerOption } from '@/components/ui/picker-field';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
 import { configureModel, decideTool, editTurn, fetchGatewaySnapshot, loadHistoryPage, selectModel, selectSession, sendMessage, setPermissionLevel } from '@/transport/gateway-client';
 import { getHost } from '@/transport/host-store';
-import { subscribeToGateway } from '@/transport/gateway-stream';
+import { subscribeToGateway, type StreamStatus } from '@/transport/gateway-stream';
 import type { ChatModelDescriptor, HistoryPage, HostProfile, ModelConfigurationField, SessionSummary, TranscriptActivity, WindowSnapshot } from '@/transport/types';
 
 const permissionOptions: PickerOption[] = [
@@ -65,6 +66,7 @@ export default function ChatScreen() {
   const [editTarget, setEditTarget] = useState<{ requestId: string; text: string }>();
   const [editText, setEditText] = useState('');
   const [error, setError] = useState<string>();
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting');
   const [optimisticModel, setOptimisticModel] = useState<OptimisticValue<string>>();
   const [optimisticConfigurations, setOptimisticConfigurations] = useState<Record<string, OptimisticValue<string | number | boolean>>>({});
   const [optimisticPermission, setOptimisticPermission] = useState<OptimisticValue<PermissionLevel>>();
@@ -164,6 +166,11 @@ export default function ChatScreen() {
         applySnapshot(snapshot.windows);
         unsubscribe = subscribeToGateway(nextHost, {
           onSnapshot: value => { if (active) applySnapshot(value.windows); },
+          onStatus: status => {
+            if (!active) return;
+            setStreamStatus(status);
+            if (status === 'unpaired') setError('This computer no longer accepts the phone\'s pairing. Scan its code in VS Code again.');
+          },
         });
       } catch (initError) {
         if (active) {
@@ -374,7 +381,9 @@ export default function ChatScreen() {
 
   const lastTurn = session?.turns.at(-1);
   const pendingToolId = lastTurn?.activities.find(activity => activity.canApprove)?.id;
-  const headerMeta = working
+  const headerMeta = streamStatus === 'connecting' && session
+    ? 'Reconnecting…'
+    : working
     ? 'Copilot is working'
     : selectedModel?.name ?? session?.modelName ?? 'GitHub Copilot';
 
@@ -474,7 +483,7 @@ export default function ChatScreen() {
                       if (block.kind === 'text') {
                         return (
                           <View key={key} style={styles.assistant}>
-                            <Text selectable style={styles.assistantText}>{block.text}</Text>
+                            <MarkdownText text={block.text} />
                           </View>
                         );
                       }
@@ -483,7 +492,7 @@ export default function ChatScreen() {
                   : (
                     <>
                       {!!turn.thinking && <View style={styles.thinking}><Text style={styles.thinkingTitle}>{turn.thinkingTitle || 'Thinking'}</Text><Text selectable style={styles.thinkingText}>{turn.thinking}</Text></View>}
-                      {!!turn.assistantText && <View style={styles.assistant}><Text selectable style={styles.assistantText}>{turn.assistantText}</Text></View>}
+                      {!!turn.assistantText && <View style={styles.assistant}><MarkdownText text={turn.assistantText} /></View>}
                       {turn.activities.map((activity, activityIndex) => renderActivity(turn.id, activity, `${turn.id}:${activity.id}:${activityIndex}`))}
                     </>
                   )}
@@ -592,7 +601,6 @@ const styles = StyleSheet.create({
   userText: { color: colors.textPrimary, fontSize: typography.bodySize, lineHeight: 21 },
   editButton: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: radii.button, borderWidth: 1, borderColor: colors.borderSubtle, backgroundColor: colors.bgBase },
   assistant: { alignSelf: 'stretch' },
-  assistantText: { color: colors.textPrimary, fontSize: typography.bodySize, lineHeight: 22 },
   thinking: { borderLeftWidth: 2, borderLeftColor: colors.borderSubtle, paddingLeft: spacing.md },
   thinkingTitle: { color: colors.textSecondary, fontSize: typography.metaSize, fontWeight: '700', marginBottom: 4 },
   thinkingText: { color: colors.textSecondary, fontSize: typography.metaSize, lineHeight: 18 },

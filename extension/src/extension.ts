@@ -3,15 +3,40 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { GatewayCoordinator } from './gatewayCoordinator';
+import { pairingUrl } from './gatewayAuth';
 import { GatewayAddress } from './gatewayServer';
-import { getOrCreateHostIdentity, getSharedStateDirectory } from './hostIdentity';
-import { findLanAddress } from './lanAddress';
+import { getOrCreateHostIdentity, getOrCreatePairingSecret, getSharedStateDirectory, resetPairingSecret } from './hostIdentity';
+import { findLanAddress, findLanAddresses } from './lanAddress';
 import { MonitorServer, MonitorServerAddress } from './monitorServer';
-import { MobileViewProvider, mobileViewId } from './mobileViewProvider';
+import { MobileViewProvider, mobileViewId, type PairingAddress } from './mobileViewProvider';
 import { SessionMonitor } from './sessionMonitor';
 import { WindowRegistry } from './windowRegistry';
 
 const defaultGatewayPort = 43_121;
+
+/** Normalises the user's remote access setting to an origin with a trailing slash, or nothing when unusable. */
+export function normalizeRemoteUrl(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) {
+		return undefined;
+	}
+	try {
+		const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+		if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
+			return undefined;
+		}
+		url.pathname = '/';
+		url.search = '';
+		url.hash = '';
+		return url.toString();
+	} catch {
+		return undefined;
+	}
+}
+
+function readRemoteUrl(): string | undefined {
+	return normalizeRemoteUrl(vscode.workspace.getConfiguration('githubCopilotMonitor').get<string>('remoteUrl'));
+}
 
 class MonitorRuntime implements vscode.Disposable {
 	private readonly output = vscode.window.createOutputChannel('Copilot Monitor');
@@ -24,6 +49,7 @@ class MonitorRuntime implements vscode.Disposable {
 	private gateway: GatewayCoordinator | undefined;
 	private gatewayAddressSubscription: { dispose(): void } | undefined;
 	private address: GatewayAddress | undefined;
+	private pairingSecret: string | undefined;
 	private startPromise: Promise<GatewayAddress> | undefined;
 	readonly onDidChangeAddress = this.addressChanged.event;
 
@@ -35,6 +61,11 @@ class MonitorRuntime implements vscode.Disposable {
 		this.statusBar.command = 'githubCopilotMonitor.open';
 		this.statusBar.text = '$(radio-tower) Copilot Monitor';
 		this.statusBar.tooltip = 'Open the Copilot Monitor dashboard';
+		context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+			if (event.affectsConfiguration('githubCopilotMonitor.remoteUrl')) {
+				this.addressChanged.fire();
+			}
+		}));
 	}
 
 	async start(notify = true): Promise<GatewayAddress> {
@@ -86,14 +117,49 @@ class MonitorRuntime implements vscode.Disposable {
 	}
 
 	async open(): Promise<void> {
-		const address = await this.start(false);
-		await vscode.env.openExternal(vscode.Uri.parse(address.url));
+		const address = await this.getPairingAddress();
+		await vscode.env.openExternal(vscode.Uri.parse(address.pairingUrl));
 	}
 
 	async copyUrl(): Promise<void> {
-		const address = await this.start(false);
-		await vscode.env.clipboard.writeText(address.url);
-		void vscode.window.showInformationMessage('Copilot Monitor URL copied.');
+		const address = await this.getPairingAddress();
+		await vscode.env.clipboard.writeText(address.pairingUrl);
+		void vscode.window.showInformationMessage('Copilot Monitor pairing link copied. It contains this computer\'s pairing secret; share it only with your own devices.');
+	}
+
+	async setRemoteUrl(): Promise<void> {
+		const configuration = vscode.workspace.getConfiguration('githubCopilotMonitor');
+		const value = await vscode.window.showInputBox({
+			title: 'Copilot Monitor: Remote Access URL',
+			prompt: 'Paste the public address that reaches this computer\'s gateway from outside your Wi-Fi (Ports view Forwarded Address, Tailscale, Cloudflare Tunnel...). Leave empty to disable.',
+			placeHolder: 'https://xxxxxxxx-43121.inc1.devtunnels.ms/',
+			value: configuration.get<string>('remoteUrl') ?? '',
+			ignoreFocusOut: true,
+			validateInput: input => input.trim() && !normalizeRemoteUrl(input) ? 'Enter an http(s) URL without credentials.' : undefined,
+		});
+		if (value === undefined) {
+			return;
+		}
+		await configuration.update('remoteUrl', normalizeRemoteUrl(value) ?? '', vscode.ConfigurationTarget.Global);
+	}
+
+	async resetPairing(): Promise<void> {
+		const confirmed = await vscode.window.showWarningMessage(
+			'Reset the pairing secret? Every paired phone and browser will need to scan the new code.',
+			{ modal: true },
+			'Reset',
+		);
+		if (confirmed !== 'Reset') {
+			return;
+		}
+		const wasRunning = this.running;
+		await this.stop(false);
+		await resetPairingSecret(getSharedStateDirectory());
+		this.pairingSecret = undefined;
+		if (wasRunning) {
+			await this.start(false);
+		}
+		void vscode.window.showInformationMessage('Copilot Monitor pairing secret reset. Other open VS Code windows pick it up when their monitor restarts.');
 	}
 
 	async getCurrentAddress(): Promise<GatewayAddress> {
@@ -108,6 +174,17 @@ class MonitorRuntime implements vscode.Disposable {
 		this.address = address;
 		this.statusBar.tooltip = `Copilot Monitor · ${address.url}`;
 		return address;
+	}
+
+	async getPairingAddress(): Promise<PairingAddress> {
+		const address = await this.getCurrentAddress();
+		const secret = this.pairingSecret ?? await getOrCreatePairingSecret(getSharedStateDirectory());
+		const remoteUrl = readRemoteUrl();
+		return {
+			...address,
+			pairingUrl: pairingUrl(address.url, secret),
+			...(remoteUrl ? { remoteUrl, remotePairingUrl: pairingUrl(remoteUrl, secret) } : {}),
+		};
 	}
 
 	dispose(): void {
@@ -143,6 +220,8 @@ class MonitorRuntime implements vscode.Disposable {
 		});
 		const sharedStateDirectory = getSharedStateDirectory();
 		const hostIdentity = await getOrCreateHostIdentity(sharedStateDirectory);
+		const pairingSecret = await getOrCreatePairingSecret(sharedStateDirectory);
+		this.pairingSecret = pairingSecret;
 		const registryDirectory = path.join(sharedStateDirectory, 'windows');
 		const registry = new WindowRegistry(registryDirectory, this.windowId);
 		const gateway = new GatewayCoordinator({
@@ -156,6 +235,11 @@ class MonitorRuntime implements vscode.Disposable {
 			html,
 			mermaidScript,
 			iconSvg,
+			readPairingSecret: () => getOrCreatePairingSecret(sharedStateDirectory),
+			getEndpoints: port => {
+				const remoteUrl = readRemoteUrl();
+				return [...findLanAddresses().map(address => `http://${address}:${port}/`), ...(remoteUrl ? [remoteUrl] : [])];
+			},
 		});
 		try {
 			const localAddress: MonitorServerAddress = await localServer.start();
@@ -203,11 +287,11 @@ class MonitorRuntime implements vscode.Disposable {
 		const action = await vscode.window.showInformationMessage(
 			`Copilot Monitor is running on ${address.url}`,
 			'Open Dashboard',
-			'Copy URL',
+			'Copy Pairing Link',
 		);
 		if (action === 'Open Dashboard') {
 			await this.open();
-		} else if (action === 'Copy URL') {
+		} else if (action === 'Copy Pairing Link') {
 			await this.copyUrl();
 		}
 	}
@@ -222,11 +306,16 @@ export function activate(context: vscode.ExtensionContext) {
 	));
 	context.subscriptions.push(vscode.commands.registerCommand(
 		'githubCopilotMonitor.start',
-		(options?: { silent?: boolean }) => runtime.start(options?.silent !== true),
+		async (options?: { silent?: boolean }) => {
+			await runtime.start(options?.silent !== true);
+			return runtime.getPairingAddress();
+		},
 	));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.stop', () => runtime.stop()));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.open', () => runtime.open()));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.copyUrl', () => runtime.copyUrl()));
+	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.setRemoteUrl', () => runtime.setRemoteUrl()));
+	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.resetPairing', () => runtime.resetPairing()));
 
 	if (vscode.workspace.getConfiguration('githubCopilotMonitor').get<boolean>('autoStart', true)) {
 		void runtime.start(false);

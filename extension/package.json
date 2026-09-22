@@ -3,7 +3,7 @@
   "publisher": "nanoleft",
   "displayName": "Copilot Monitor",
   "description": "Monitor and remotely control local GitHub Copilot Chat sessions from a responsive LAN dashboard.",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -79,7 +79,15 @@
       },
       {
         "command": "githubCopilotMonitor.copyUrl",
-        "title": "Copilot Monitor: Copy Dashboard URL"
+        "title": "Copilot Monitor: Copy Pairing Link"
+      },
+      {
+        "command": "githubCopilotMonitor.setRemoteUrl",
+        "title": "Copilot Monitor: Set Remote Access URL"
+      },
+      {
+        "command": "githubCopilotMonitor.resetPairing",
+        "title": "Copilot Monitor: Reset Pairing Secret"
       }
     ],
     "configuration": {
@@ -97,6 +105,12 @@
           "default": 43121,
           "scope": "machine",
           "description": "Stable LAN port shared by all open VS Code windows."
+        },
+        "githubCopilotMonitor.remoteUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Public HTTPS address that reaches this computer's gateway from outside your Wi-Fi, for example the **Forwarded Address** VS Code shows after you forward the gateway port in the **Ports** view (set its visibility to *Public*), or a Tailscale/Cloudflare Tunnel URL. Paired phones learn it automatically and use it whenever the local network is unreachable. Every request still requires the pairing secret."
         }
       }
     }
@@ -107,7 +121,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "npm run compile && node --test out/test/aggregateMonitor.test.js out/test/chatBridge.test.js out/test/directoryWatcher.test.js out/test/gateway.test.js out/test/gatewayLease.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/lineTailer.test.js out/test/liveExportTracker.test.js out/test/liveMerge.test.js out/test/liveTurns.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/monitorServer.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/pagedMutationHistory.test.js out/test/sessionCore.test.js out/test/sessionIndex.test.js out/test/sessionLogProjection.test.js out/test/sessionMatcher.test.js out/test/stateDelta.test.js out/test/stateStream.test.js out/test/toolDecision.test.js out/test/transcript.test.js out/test/windowRegistry.test.js",
+    "test": "npm run compile && node --test out/test/aggregateMonitor.test.js out/test/chatBridge.test.js out/test/directoryWatcher.test.js out/test/gateway.test.js out/test/gatewayAuth.test.js out/test/gatewayLease.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/lineTailer.test.js out/test/liveExportTracker.test.js out/test/liveMerge.test.js out/test/liveTurns.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/monitorServer.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/pagedMutationHistory.test.js out/test/sessionCore.test.js out/test/sessionIndex.test.js out/test/sessionLogProjection.test.js out/test/sessionMatcher.test.js out/test/stateDelta.test.js out/test/stateStream.test.js out/test/toolDecision.test.js out/test/transcript.test.js out/test/windowRegistry.test.js",
     "test:integration": "vscode-test",
     "package": "npm run compile && npx --yes @vscode/vsce package",
     "publish:marketplace": "npm test && npx --yes @vscode/vsce publish"

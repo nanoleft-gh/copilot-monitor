@@ -6,14 +6,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
 import { createSession, describeSessionSize, fetchGatewaySnapshot, hasVisibleContent, selectSession } from '@/transport/gateway-client';
 import { getHost } from '@/transport/host-store';
-import { subscribeToGateway } from '@/transport/gateway-stream';
+import { subscribeToGateway, type StreamStatus } from '@/transport/gateway-stream';
 import type { GatewaySnapshot, HostProfile, SessionSummary, WindowSnapshot } from '@/transport/types';
+
+const unpairedMessage = 'This computer no longer accepts the phone\'s pairing. Scan the code in the Copilot Monitor sidebar again.';
 
 export default function HostOverviewScreen() {
   const { hostId } = useLocalSearchParams<{ hostId: string }>();
   const [host, setHost] = useState<HostProfile>();
   const [snapshot, setSnapshot] = useState<GatewaySnapshot>();
   const [loading, setLoading] = useState(true);
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting');
   const [opening, setOpening] = useState<string>();
   const [creatingInWindow, setCreatingInWindow] = useState<string>();
   const [error, setError] = useState<string>();
@@ -48,7 +51,18 @@ export default function HostOverviewScreen() {
         if (!active) return;
         setLoading(false);
         unsubscribe = subscribeToGateway(nextHost, {
-          onSnapshot: value => { if (active) { setSnapshot(value); setError(undefined); } },
+          onSnapshot: value => {
+            if (!active) return;
+            setSnapshot(value);
+            setError(undefined);
+            // The locator may have moved the host to another address (new IP, tunnel); reflect it in the header.
+            setHost(current => current?.endpoint === nextHost.endpoint ? current : { ...nextHost });
+          },
+          onStatus: status => {
+            if (!active) return;
+            setStreamStatus(status);
+            if (status === 'unpaired') setError(unpairedMessage);
+          },
         });
       } catch (refreshError) {
         if (active) {
@@ -113,7 +127,9 @@ export default function HostOverviewScreen() {
         </Pressable>
         <View style={styles.headerCopy}>
           <Text numberOfLines={1} style={styles.headerTitle}>{host?.name ?? 'Computer'}</Text>
-          <Text numberOfLines={1} style={styles.headerMeta}>{host?.endpoint ?? 'Connecting...'}</Text>
+          <Text numberOfLines={1} style={styles.headerMeta}>
+            {streamStatus === 'connecting' && snapshot ? 'Reconnecting…' : host?.endpoint ?? 'Connecting...'}
+          </Text>
         </View>
         <Pressable accessibilityLabel="Refresh" disabled={loading} onPress={() => void refresh()} style={styles.iconButton}>
           <RefreshCw color={colors.textSecondary} size={20} />

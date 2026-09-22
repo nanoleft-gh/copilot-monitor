@@ -18,6 +18,8 @@ export interface GatewayCoordinatorOptions {
 	readonly html: string;
 	readonly mermaidScript: string;
 	readonly iconSvg?: string;
+	readonly readPairingSecret: () => Promise<string>;
+	readonly getEndpoints?: (port: number) => readonly string[];
 	/** @deprecated No periodic re-check exists anymore; kept for call-site compatibility. */
 	readonly retryIntervalMs?: number;
 }
@@ -36,6 +38,7 @@ export class GatewayCoordinator {
 	private ownedLease: GatewayLease | undefined;
 	private currentAddress: GatewayAddress | undefined;
 	private presence: http.ClientRequest | undefined;
+	private presencePending: { destroyed: boolean } | undefined;
 	private presencePort: number | undefined;
 	private presenceRetryTimer: NodeJS.Timeout | undefined;
 	private presenceRetryAttempt = 0;
@@ -221,6 +224,8 @@ export class GatewayCoordinator {
 			html: this.options.html,
 			mermaidScript: this.options.mermaidScript,
 			iconSvg: this.options.iconSvg,
+			readPairingSecret: this.options.readPairingSecret,
+			getEndpoints: this.options.getEndpoints,
 		});
 	}
 
@@ -286,7 +291,7 @@ export class GatewayCoordinator {
 			this.closePresence();
 			return;
 		}
-		if (this.presence && this.presencePort === this.currentAddress.port) {
+		if ((this.presence || this.presencePending) && this.presencePort === this.currentAddress.port) {
 			return;
 		}
 		this.closePresence();
@@ -294,20 +299,40 @@ export class GatewayCoordinator {
 	}
 
 	private openPresence(port: number): void {
-		const request = http.get({ host: '127.0.0.1', port, path: '/api/presence' }, response => {
-			if (response.statusCode !== 200) {
-				response.resume();
-				this.onPresenceLost(request);
+		const pending = { destroyed: false, request: undefined as http.ClientRequest | undefined };
+		this.presence = undefined;
+		this.presencePort = port;
+		this.presencePending = pending;
+		void this.options.readPairingSecret().then(secret => {
+			if (pending.destroyed || this.presencePending !== pending) {
 				return;
 			}
-			this.presenceRetryAttempt = 0;
-			response.resume();
-			response.on('close', () => this.onPresenceLost(request));
-			response.on('error', () => this.onPresenceLost(request));
+			const request = http.get({
+				host: '127.0.0.1',
+				port,
+				path: '/api/presence',
+				headers: { authorization: `Bearer ${secret}` },
+			}, response => {
+				if (response.statusCode !== 200) {
+					response.resume();
+					this.onPresenceLost(request);
+					return;
+				}
+				this.presenceRetryAttempt = 0;
+				response.resume();
+				response.on('close', () => this.onPresenceLost(request));
+				response.on('error', () => this.onPresenceLost(request));
+			});
+			request.on('error', () => this.onPresenceLost(request));
+			this.presence = request;
+			this.presencePending = undefined;
+		}, () => {
+			if (this.presencePending === pending) {
+				this.presencePending = undefined;
+				this.presencePort = undefined;
+				this.schedulePresenceRetry();
+			}
 		});
-		request.on('error', () => this.onPresenceLost(request));
-		this.presence = request;
-		this.presencePort = port;
 	}
 
 	private onPresenceLost(request: http.ClientRequest): void {
@@ -348,6 +373,10 @@ export class GatewayCoordinator {
 		if (this.presenceRetryTimer) {
 			clearTimeout(this.presenceRetryTimer);
 			this.presenceRetryTimer = undefined;
+		}
+		if (this.presencePending) {
+			this.presencePending.destroyed = true;
+			this.presencePending = undefined;
 		}
 		const request = this.presence;
 		this.presence = undefined;

@@ -663,7 +663,9 @@ export class SessionCore {
 		for (const line of lines) {
 			changed = apply(line) || changed;
 		}
-		const record = this.records.get(tail.sessionId);
+		// Replaying an existing file on attach, or log chatter that touched no turn, is not evidence
+		// of work; counting it made a chat show "working" right after being opened and closed.
+		const record = changed && !tail.loading ? this.records.get(tail.sessionId) : undefined;
 		if (record) {
 			record.lastActivityAt = this.now();
 			this.scheduleActivityDecay();
