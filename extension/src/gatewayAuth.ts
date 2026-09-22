@@ -56,20 +56,42 @@ export function requestIsHttps(request: Pick<http.IncomingMessage, 'headers'>): 
 	return typeof value === 'string' && value.split(',')[0].trim().toLowerCase() === 'https';
 }
 
-/** The address a phone scans or a browser opens: base URL plus the secret in the fragment. */
-export function pairingUrl(baseUrl: string, secret: string): string {
+/** Fragment key listing the other addresses the same gateway answers on (comma-separated, URL-encoded). */
+export const alternatesFragmentKey = 'e';
+
+/**
+ * The address a phone scans or a browser opens: base URL plus the secret in the fragment.
+ * `alternates` are the gateway's other addresses (e.g. the tunnel when the base is the LAN one),
+ * so a phone that scans while away from home can still pair; browsers simply ignore them.
+ */
+export function pairingUrl(baseUrl: string, secret: string, alternates: readonly string[] = []): string {
 	const url = new URL(baseUrl);
-	url.hash = `${pairingFragmentKey}=${encodeURIComponent(secret)}`;
+	const others = alternates.filter(candidate => candidate !== baseUrl);
+	const parts = [`${pairingFragmentKey}=${encodeURIComponent(secret)}`];
+	if (others.length > 0) {
+		parts.push(`${alternatesFragmentKey}=${others.map(candidate => encodeURIComponent(candidate)).join(',')}`);
+	}
+	url.hash = parts.join('&');
 	return url.toString();
 }
 
-/** Splits a pairing URL into its gateway origin and secret; the secret is absent for plain addresses. */
-export function parsePairingUrl(value: string): { endpoint: string; secret?: string } {
+/** Splits a pairing URL into its gateway origin, secret, and alternate addresses. */
+export function parsePairingUrl(value: string): { endpoint: string; secret?: string; alternates: string[] } {
 	const url = new URL(value);
 	const fragment = new URLSearchParams(url.hash.replace(/^#/, ''));
 	const secret = fragment.get(pairingFragmentKey) ?? undefined;
+	const alternates = (fragment.get(alternatesFragmentKey) ?? '')
+		.split(',')
+		.map(candidate => {
+			try {
+				return decodeURIComponent(candidate);
+			} catch {
+				return '';
+			}
+		})
+		.filter(candidate => /^https?:\/\//i.test(candidate));
 	url.hash = '';
 	url.search = '';
 	url.pathname = '/';
-	return secret ? { endpoint: url.toString(), secret } : { endpoint: url.toString() };
+	return { endpoint: url.toString(), ...(secret ? { secret } : {}), alternates };
 }

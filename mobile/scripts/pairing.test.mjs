@@ -4,9 +4,16 @@ import { authHeaders, isLocalEndpoint, mergeEndpoints, parseGatewayHealth, parse
 
 describe('parsePairingCode', () => {
   it('splits the QR/link into gateway origin and fragment secret', () => {
-    assert.deepEqual(parsePairingCode('http://192.168.1.10:43121/#k=se%2Fcr%2Bet'), { endpoint: 'http://192.168.1.10:43121/', secret: 'se/cr+et' });
-    assert.deepEqual(parsePairingCode('  https://abc-43121.inc1.devtunnels.ms/x?y=1#k=tok '), { endpoint: 'https://abc-43121.inc1.devtunnels.ms/', secret: 'tok' });
-    assert.deepEqual(parsePairingCode('192.168.1.10:43121'), { endpoint: 'http://192.168.1.10:43121/' });
+    assert.deepEqual(parsePairingCode('http://192.168.1.10:43121/#k=se%2Fcr%2Bet'), { endpoint: 'http://192.168.1.10:43121/', secret: 'se/cr+et', alternates: [] });
+    assert.deepEqual(parsePairingCode('  https://abc-43121.inc1.devtunnels.ms/x?y=1#k=tok '), { endpoint: 'https://abc-43121.inc1.devtunnels.ms/', secret: 'tok', alternates: [] });
+    assert.deepEqual(parsePairingCode('192.168.1.10:43121'), { endpoint: 'http://192.168.1.10:43121/', alternates: [] });
+  });
+
+  it('reads the alternate addresses a code carries and drops junk', () => {
+    assert.deepEqual(
+      parsePairingCode('http://192.168.1.10:43121/#k=tok&e=https%3A%2F%2Fabc-43121.inc1.devtunnels.ms%2F,http%3A%2F%2F10.0.0.5%3A43121%2F,junk,%ZZ'),
+      { endpoint: 'http://192.168.1.10:43121/', secret: 'tok', alternates: ['https://abc-43121.inc1.devtunnels.ms/', 'http://10.0.0.5:43121/'] },
+    );
   });
 
   it('rejects credentials and non-http schemes', () => {

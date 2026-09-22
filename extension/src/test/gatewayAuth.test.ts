@@ -32,8 +32,19 @@ describe('gateway auth', () => {
 	it('round-trips the secret through the URL fragment so it never reaches the server or its logs', () => {
 		const url = pairingUrl('http://192.168.1.10:43121/', 'se/cr+et');
 		assert.equal(url, 'http://192.168.1.10:43121/#k=se%2Fcr%2Bet');
-		assert.deepEqual(parsePairingUrl(url), { endpoint: 'http://192.168.1.10:43121/', secret: 'se/cr+et' });
-		assert.deepEqual(parsePairingUrl('https://abc-43121.inc1.devtunnels.ms/some/path?x=1#k=tok'), { endpoint: 'https://abc-43121.inc1.devtunnels.ms/', secret: 'tok' });
-		assert.deepEqual(parsePairingUrl('http://192.168.1.10:43121/'), { endpoint: 'http://192.168.1.10:43121/' });
+		assert.deepEqual(parsePairingUrl(url), { endpoint: 'http://192.168.1.10:43121/', secret: 'se/cr+et', alternates: [] });
+		assert.deepEqual(parsePairingUrl('https://abc-43121.inc1.devtunnels.ms/some/path?x=1#k=tok'), { endpoint: 'https://abc-43121.inc1.devtunnels.ms/', secret: 'tok', alternates: [] });
+		assert.deepEqual(parsePairingUrl('http://192.168.1.10:43121/'), { endpoint: 'http://192.168.1.10:43121/', alternates: [] });
+	});
+
+	it('carries the gateway\'s other addresses so one code works at home and away', () => {
+		const url = pairingUrl('http://192.168.1.10:43121/', 'tok', ['http://192.168.1.10:43121/', 'https://abc-43121.inc1.devtunnels.ms/', 'http://10.0.0.5:43121/']);
+		assert.equal(url, 'http://192.168.1.10:43121/#k=tok&e=https%3A%2F%2Fabc-43121.inc1.devtunnels.ms%2F,http%3A%2F%2F10.0.0.5%3A43121%2F');
+		assert.deepEqual(parsePairingUrl(url), {
+			endpoint: 'http://192.168.1.10:43121/',
+			secret: 'tok',
+			alternates: ['https://abc-43121.inc1.devtunnels.ms/', 'http://10.0.0.5:43121/'],
+		});
+		assert.deepEqual(parsePairingUrl('http://h/#k=t&e=junk,%ZZ').alternates, []);
 	});
 });

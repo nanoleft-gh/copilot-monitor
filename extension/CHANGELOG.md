@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.3.3]
+
+- One pairing code for home and away. The QR / pairing link now carries every address the gateway answers on (all LAN interfaces, the dev tunnel, a manual URL) in its fragment (`#k=<secret>&e=<addresses>`). The app pairs through whichever address answers and remembers all of them; browsers keep opening the code's primary address. A **Home Wi-Fi / Anywhere** switch above the QR picks that primary address (default: home), and the code regenerates whenever an address changes. *Copy pairing link* follows the switch.
+- Clarified the tunnel address: the CLI persists its dev tunnel (`port_forwarding_tunnel.json` in the VS Code CLI data directory) and reuses it on every start, so `https://<id>-43121.<cluster>.devtunnels.ms/` stays the same across VS Code restarts and reboots as long as the same GitHub account is used. Paired phones learn a new address automatically on their next home connection anyway.
+
 ## [1.3.2]
 
 - Fixed "Unable to write to User Settings because githubCopilotMonitor.remoteAccess is not a registered configuration" when turning on remote access. VS Code's settings writer only accepts keys present in the running window's configuration registry, which is refreshed on a full window reload; an extension-host restart after a VSIX install can leave it stale. Remote access state (on/off, manual URL) is therefore no longer a VS Code setting at all: it lives in the shared state directory next to the host identity, is owned by the window that runs the gateway, and every window (this one included) reads and changes it through the authenticated `GET`/`POST /api/remote-access` gateway routes. This also makes the choice machine-wide and consistent across VS Code Stable and Insiders windows.

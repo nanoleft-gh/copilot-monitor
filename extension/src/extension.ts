@@ -139,9 +139,10 @@ class MonitorRuntime implements vscode.Disposable {
 		await vscode.env.openExternal(vscode.Uri.parse(address.pairingUrl));
 	}
 
-	async copyUrl(): Promise<void> {
+	async copyUrl(target: 'local' | 'remote' = 'local'): Promise<void> {
 		const address = await this.getPairingAddress();
-		await vscode.env.clipboard.writeText(address.pairingUrl);
+		const link = target === 'remote' && address.remotePairingUrl ? address.remotePairingUrl : address.pairingUrl;
+		await vscode.env.clipboard.writeText(link);
 		void vscode.window.showInformationMessage('Copilot Monitor pairing link copied. It contains this computer\'s pairing secret; share it only with your own devices.');
 	}
 
@@ -293,10 +294,16 @@ class MonitorRuntime implements vscode.Disposable {
 			tunnel: { status: 'error', error: error instanceof Error ? error.message : String(error) },
 		}));
 		const remoteUrl = remote.tunnel.status === 'active' ? remote.tunnel.url : remote.manualUrl;
+		// Both codes carry every address, so a phone pairs whichever one is reachable at scan time.
+		const everyAddress = [
+			...findLanAddresses().map(lan => `http://${lan}:${address.port}/`),
+			...(remote.tunnel.status === 'active' ? [remote.tunnel.url] : []),
+			...(remote.manualUrl ? [remote.manualUrl] : []),
+		];
 		return {
 			...address,
-			pairingUrl: pairingUrl(address.url, secret),
-			...(remoteUrl ? { remoteUrl, remotePairingUrl: pairingUrl(remoteUrl, secret) } : {}),
+			pairingUrl: pairingUrl(address.url, secret, everyAddress),
+			...(remoteUrl ? { remoteUrl, remotePairingUrl: pairingUrl(remoteUrl, secret, everyAddress) } : {}),
 			remote,
 		};
 	}

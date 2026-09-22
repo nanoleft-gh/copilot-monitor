@@ -1,5 +1,9 @@
 # Mobile Changelog
 
+## [0.2.1]
+
+- Pairing codes may carry the computer's other addresses (`#e=...`). The code's own address is tried first; if it is silent, every alternate is probed in parallel and the first that answers is used, so one code pairs both at home and away. All addresses are stored for reconnection.
+
 ## [0.2.0]
 
 - Assistant replies render as GitHub-flavoured markdown (headings, lists, code blocks, inline code, links, quotes, tables) via `react-native-marked`; each text block is memoised so a streaming reply re-parses only the block that changed.

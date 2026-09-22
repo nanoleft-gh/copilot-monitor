@@ -21,7 +21,7 @@ export interface MobileViewRuntime {
 	/** Fires whenever the shared gateway address may have changed (election, failover, stop). */
 	onDidChangeAddress(listener: () => void): vscode.Disposable;
 	open(): Promise<void>;
-	copyUrl(): Promise<void>;
+	copyUrl(target?: 'local' | 'remote'): Promise<void>;
 	updateRemoteAccess(request: RemoteAccessUpdateRequest): Promise<RemoteAccessStatus>;
 	signInForRemoteAccess(): Promise<RemoteAccessStatus>;
 	resetPairing(): Promise<void>;
@@ -39,6 +39,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 	private renderedUrl: string | undefined;
 	private followUpTimer: NodeJS.Timeout | undefined;
 	private followUpsLeft = 0;
+	/** Which address the QR/link opens first; the app tries every address either way. */
+	private qrTarget: 'local' | 'remote' = 'local';
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -79,7 +81,12 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (message.command === 'copy') {
-			await this.runtime.copyUrl();
+			await this.runtime.copyUrl(this.qrTarget);
+			return;
+		}
+		if (message.command === 'qr:local' || message.command === 'qr:remote') {
+			this.qrTarget = message.command === 'qr:remote' ? 'remote' : 'local';
+			await this.refresh();
 			return;
 		}
 		if (message.command === 'remote:enable') {
@@ -196,7 +203,10 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		try {
 			const address = await this.runtime.getPairingAddress();
 			this.lastTunnelStatus = address.remote.tunnel.status;
-			const rendered = JSON.stringify([address.pairingUrl, address.remotePairingUrl, address.remote]);
+			if (!address.remotePairingUrl) {
+				this.qrTarget = 'local';
+			}
+			const rendered = JSON.stringify([address.pairingUrl, address.remotePairingUrl, address.remote, this.qrTarget]);
 			if (this.view === view && this.renderedUrl !== rendered) {
 				this.renderedUrl = rendered;
 				view.webview.html = this.readyHtml(view.webview, address);
@@ -236,12 +246,28 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			this.extensionUri, 'media', 'vendor', 'qrcode-svg-1.1.0.min.js',
 		));
 		const nonce = createNonce();
+		const remoteAvailable = !!address.remotePairingUrl && !!address.remoteUrl;
+		const showRemote = remoteAvailable && this.qrTarget === 'remote';
+		const qrContent = showRemote ? address.remotePairingUrl! : address.pairingUrl;
+		const shownUrl = showRemote ? address.remoteUrl! : address.url;
+		const targetPicker = remoteAvailable
+			? `<div class="segmented" role="radiogroup" aria-label="Address the code opens">
+				<button role="radio" aria-checked="${showRemote ? 'false' : 'true'}" class="${showRemote ? '' : 'on'}" data-command="qr:local">Home Wi-Fi</button>
+				<button role="radio" aria-checked="${showRemote ? 'true' : 'false'}" class="${showRemote ? 'on' : ''}" data-command="qr:remote">Anywhere</button>
+			</div>`
+			: '';
+		const hint = showRemote
+			? 'Scan from anywhere. The app pairs through the tunnel and also learns the home address, so it switches to Wi-Fi when you are back.'
+			: remoteAvailable
+				? 'Scan while both devices share a Wi-Fi network. The code also carries the remote address, so the app can reach the computer once you leave.'
+				: 'Scan with the Copilot Monitor app, or with your camera to open the browser dashboard, while both devices share a Wi-Fi network.';
 		const body = `
 			<div class="eyebrow"><span class="dot"></span>Shared gateway online</div>
 			<h2>Open on your phone</h2>
-			<p>Scan with the Copilot Monitor app, or with your camera to open the browser dashboard, while both devices share a Wi-Fi network.</p>
-			<div id="qr" class="qr" aria-label="Pairing code for ${escapeHtml(address.url)}"></div>
-			<code>${escapeHtml(address.url)}</code>
+			<p>${hint}</p>
+			${targetPicker}
+			<div id="qr" class="qr" aria-label="Pairing code for ${escapeHtml(shownUrl)}"></div>
+			<code>${escapeHtml(shownUrl)}</code>
 			<div class="actions">
 				<button class="primary" data-command="open">Open dashboard</button>
 				<button data-command="copy">Copy pairing link</button>
@@ -255,7 +281,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			<script nonce="${nonce}">
 				const vscode = acquireVsCodeApi();
 				document.getElementById('qr').innerHTML = new QRCode({
-					content: ${JSON.stringify(address.pairingUrl)}, padding: 2, width: 224, height: 224,
+					content: ${JSON.stringify(qrContent)}, padding: 2, width: 224, height: 224,
 					color: '#111111', background: '#ffffff', ecl: 'M', join: true, container: 'svg-viewbox'
 				}).svg();
 				document.addEventListener('click', event => {
@@ -353,6 +379,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			.eyebrow{display:flex;align-items:center;gap:7px;color:var(--vscode-descriptionForeground);font-size:11px;text-transform:uppercase}.dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
 			h2{margin:10px 0 6px;font-size:18px;letter-spacing:0}h3{margin:22px 0 6px;font-size:13px;text-transform:uppercase;color:var(--vscode-descriptionForeground)}p{margin:0 0 16px;color:var(--vscode-descriptionForeground)}
 			.qr{width:min(224px,100%);aspect-ratio:1;margin:0 auto 14px;padding:8px;border-radius:6px;background:#fff}.qr svg{display:block;width:100%;height:100%}
+			.segmented{display:grid;grid-template-columns:1fr 1fr;margin:0 auto 12px;width:min(224px,100%);border:1px solid var(--vscode-widget-border);border-radius:4px;overflow:hidden}.segmented button{min-height:28px;border:0;border-radius:0;background:transparent;color:var(--vscode-descriptionForeground)}.segmented button.on{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.segmented button:hover:not(.on){background:var(--vscode-toolbar-hoverBackground)}
 			code{display:block;overflow-wrap:anywhere;padding:9px;border:1px solid var(--vscode-widget-border);border-radius:4px;background:var(--vscode-textCodeBlock-background);font-size:11px}code.inline{display:inline;padding:1px 4px}
 			.ok{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:var(--vscode-foreground);margin-bottom:8px}.warn{color:var(--vscode-editorWarning-foreground,var(--vscode-foreground))}.tight{margin-bottom:8px}
 			.manual-form{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin:6px 0 10px}.manual-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.manual-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.manual-form button{padding:0 10px}
