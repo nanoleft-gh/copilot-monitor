@@ -4543,24 +4543,116 @@
 
 			async function loadInitialState() {
 				try {
-					const [response, healthResponse] = await Promise.all([fetch('/api/state'), fetch('/api/health')]);
-					if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
-					if (healthResponse.ok) {
-						const health = await healthResponse.json();
-						gatewayCapabilities = new Set(Array.isArray(health.capabilities) ? health.capabilities : []);
-					}
-					render(await response.json());
+					const healthResponse = await fetch('/api/health');
+					if (!healthResponse.ok) throw new Error(`Bridge returned ${healthResponse.status}`);
+					const health = await healthResponse.json();
+					gatewayCapabilities = new Set(Array.isArray(health.capabilities) ? health.capabilities : []);
 				} catch (error) {
 					setConnection('offline', 'Bridge unavailable');
 					renderError(error instanceof Error ? error.message : String(error));
 				}
 			}
 
+			// Applies a `/api/events?v=2` patch (see extension/src/stateDelta.ts for the grammar).
+			function applyPatch(previous, patch) {
+				const isObject = value => typeof value === 'object' && value !== null && !Array.isArray(value);
+				const keyOf = item => {
+					if (!isObject(item)) return undefined;
+					for (const property of ['id', 'resource', 'windowId', 'identifier']) {
+						if (typeof item[property] === 'string') return `${property}:${item[property]}`;
+					}
+					return undefined;
+				};
+				switch (patch[0]) {
+					case '=': return patch[1];
+					case '+':
+						if (typeof previous !== 'string') throw new Error('append to non-string');
+						return previous + patch[1];
+					case 'o': {
+						if (!isObject(previous)) throw new Error('object patch on non-object');
+						const result = { ...previous };
+						for (const [key, member] of Object.entries(patch[1])) {
+							if (member[0] === '-') delete result[key];
+							else result[key] = applyPatch(previous[key], member);
+						}
+						return result;
+					}
+					case 'a': {
+						if (!Array.isArray(previous)) throw new Error('array patch on non-array');
+						const result = previous.slice(0, patch[1]);
+						for (const [index, member] of Object.entries(patch[2])) {
+							const position = Number(index);
+							if (!Number.isInteger(position) || position < 0 || position >= patch[1]) throw new Error('index out of range');
+							result[position] = applyPatch(position < previous.length ? previous[position] : undefined, member);
+						}
+						if (result.length !== patch[1]) throw new Error('array patch left holes');
+						for (let index = 0; index < result.length; index++) {
+							if (!(index in result)) throw new Error('array patch left holes');
+						}
+						return result;
+					}
+					case 'k': {
+						if (!Array.isArray(previous)) throw new Error('keyed patch on non-array');
+						const byKey = new Map();
+						for (const item of previous) {
+							const key = keyOf(item);
+							if (key !== undefined && !byKey.has(key)) byKey.set(key, item);
+						}
+						return patch[1].map(key => {
+							const member = patch[2][key];
+							if (member) return applyPatch(byKey.get(key), member);
+							if (!byKey.has(key)) throw new Error(`unknown item ${key}`);
+							return byKey.get(key);
+						});
+					}
+					default: throw new Error(`unknown patch op ${patch[0]}`);
+				}
+			}
+
+			let eventSource;
+			let eventResyncTimer;
 			function connectEvents() {
-				const events = new EventSource('/api/events');
+				if (eventSource) eventSource.close();
+				// v2: one snapshot, then patches. Every (re)connection starts with a fresh snapshot,
+				// so a patch that fails to apply just means we resync by reconnecting.
+				const events = new EventSource('/api/events?v=2');
+				eventSource = events;
+				let base;
+				const resync = () => {
+					if (eventSource !== events) return;
+					events.close();
+					eventSource = undefined;
+					setConnection('connecting', 'Resyncing');
+					clearTimeout(eventResyncTimer);
+					eventResyncTimer = setTimeout(connectEvents, 250);
+				};
 				events.onopen = () => setConnection('connected', 'Live');
-				events.addEventListener('state', event => render(JSON.parse(event.data)));
-				events.onerror = () => setConnection('connecting', 'Reconnecting');
+				events.addEventListener('snapshot', event => {
+					base = JSON.parse(event.data);
+					renderError('');
+					render(base);
+				});
+				events.addEventListener('patch', event => {
+					try {
+						if (!base) throw new Error('patch before snapshot');
+						base = applyPatch(base, JSON.parse(event.data));
+						render(base);
+					} catch {
+						resync();
+					}
+				});
+				// Older gateways ignore `v=2` and keep sending full states.
+				events.addEventListener('state', event => {
+					base = undefined;
+					render(JSON.parse(event.data));
+				});
+				events.onerror = () => {
+					if (events.readyState === EventSource.CLOSED) {
+						resync();
+						return;
+					}
+					setConnection('connecting', 'Reconnecting');
+				};
 			}
 
 			void loadInitialState();

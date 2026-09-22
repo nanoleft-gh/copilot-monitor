@@ -17,6 +17,8 @@ Event-driven core. The extension no longer polls, schedules exports, or re-reads
 - Ran SSE keepalive intervals only while a stream is open.
 - Native model/effort/context synchronization no longer polls while its SQLite watcher is healthy.
 - Bumped the gateway/bridge `apiVersion` to 4 and added the `sessionSync` capability; the `MonitorState` and `GatewayState` payloads are unchanged, so existing dashboards and mobile apps keep working.
+- Added the `eventsV2` delta stream (`GET /api/events?v=2`): one snapshot, then compact JSON patches with string-append and keyed-array operations, so streaming responses send only their new text and a sliding turn window sends only the new turn. The dashboard, the mobile app, and the gateway’s relay to each window use it; protocol 1 remains available.
+- Made the SSE hub keep its own copy of the last streamed state so patches stay correct even if a backend mutates state in place, and coalesced updates for slow sockets into one catch-up patch.
 - Removed the progressive transcript, session state cache, and bounded file read modules that the new core made unnecessary.
 
 ## [1.1.3]

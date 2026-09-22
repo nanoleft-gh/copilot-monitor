@@ -1,5 +1,5 @@
 import type * as http from 'node:http';
-import { diffValue } from './stateDelta';
+import { applyPatch, diffValue, Patch } from './stateDelta';
 
 /**
  * Server-Sent Events fan-out for state snapshots.
@@ -8,9 +8,12 @@ import { diffValue } from './stateDelta';
  * format). Protocol 2 sends one `event: snapshot` when the stream opens and afterwards only
  * `event: patch` deltas relative to the last frame that client received (see `stateDelta.ts`).
  *
- * Backpressure: while a socket is waiting for `drain`, further states are not queued; the
- * newest one is remembered and, once writable again, a single frame bridges the gap (for
- * protocol 2 the patch is computed against the last frame actually sent, so deltas compose).
+ * The hub keeps its own **independent copy** of the latest state (a *generation*), advanced by
+ * applying the very patch it sends. Backends are therefore free to mutate their state objects
+ * in place — the diff always compares against what clients really hold, never against aliased
+ * live objects. Every client at the newest generation shares one patch string and one state
+ * copy; a client that fell behind while its socket was waiting for `drain` gets a single
+ * catch-up patch computed from the generation it last received (deltas compose).
  *
  * The keepalive timer exists only while at least one stream is open.
  */
@@ -34,10 +37,21 @@ export interface StateStreamHubOptions {
 	readonly onDidChangeViewerCount?: (count: number) => void;
 }
 
+interface Generation {
+	readonly number: number;
+	/** Independent copy of the state (never aliases backend objects). */
+	readonly state: unknown;
+	/** Patch that turns the previous generation into this one, serialized. */
+	readonly patchFromPrevious: string | undefined;
+	/** Lazily computed full serialization for snapshots and protocol-1 frames. */
+	serialized?: string;
+}
+
 class Client implements StreamClient {
 	waitingForDrain = false;
-	pending: unknown;
-	lastSent: unknown;
+	/** Set while waiting for drain and a newer generation exists. */
+	pending = false;
+	received: Generation | undefined;
 	sequence = 0;
 
 	constructor(
@@ -53,6 +67,7 @@ class Client implements StreamClient {
 export class StateStreamHub<TState> {
 	private readonly clients = new Set<Client>();
 	private keepaliveTimer: NodeJS.Timeout | undefined;
+	private latest: Generation | undefined;
 
 	constructor(
 		private readonly getState: () => TState,
@@ -98,7 +113,8 @@ export class StateStreamHub<TState> {
 			}
 		});
 		if (options.protocol !== 'none') {
-			this.send(client, this.getState());
+			this.advance(this.getState());
+			this.send(client);
 		}
 		if (options.countsAsViewer) {
 			this.notifyViewers();
@@ -107,10 +123,24 @@ export class StateStreamHub<TState> {
 	}
 
 	broadcast(state: TState): void {
-		const cache = new Map<unknown, string>();
+		let hasStateClients = false;
 		for (const client of this.clients) {
 			if (client.options.protocol !== 'none') {
-				this.send(client, state, cache);
+				hasStateClients = true;
+				break;
+			}
+		}
+		if (!hasStateClients) {
+			// Nobody is listening: do not diff; the next stream starts from a fresh snapshot.
+			this.latest = undefined;
+			return;
+		}
+		if (!this.advance(state)) {
+			return;
+		}
+		for (const client of this.clients) {
+			if (client.options.protocol !== 'none') {
+				this.send(client);
 			}
 		}
 	}
@@ -125,21 +155,43 @@ export class StateStreamHub<TState> {
 			client.response.end();
 		}
 		this.clients.clear();
+		this.latest = undefined;
 		if (hadViewers) {
 			this.notifyViewers();
 		}
 	}
 
-	private send(client: Client, state: TState, cache?: Map<unknown, string>): void {
+	/** Records `state` as a new generation. Returns false when it equals the latest one. */
+	private advance(state: TState): boolean {
+		if (!this.latest) {
+			const serialized = JSON.stringify(state);
+			this.latest = { number: 1, state: JSON.parse(serialized) as unknown, patchFromPrevious: undefined, serialized };
+			return true;
+		}
+		const patch = diffValue(this.latest.state, state);
+		if (!patch) {
+			return false;
+		}
+		const serialized = JSON.stringify(patch);
+		this.latest = {
+			number: this.latest.number + 1,
+			state: applyPatch(this.latest.state, JSON.parse(serialized) as Patch),
+			patchFromPrevious: serialized,
+		};
+		return true;
+	}
+
+	private send(client: Client): void {
+		const latest = this.latest;
+		if (!latest || client.received === latest) {
+			return;
+		}
 		if (client.waitingForDrain) {
-			client.pending = state;
+			client.pending = true;
 			return;
 		}
-		const frame = this.frameFor(client, state, cache);
-		if (frame === undefined) {
-			return;
-		}
-		client.lastSent = state;
+		const frame = this.frameFor(client, latest);
+		client.received = latest;
 		if (client.response.write(frame)) {
 			return;
 		}
@@ -149,44 +201,32 @@ export class StateStreamHub<TState> {
 				return;
 			}
 			client.waitingForDrain = false;
-			const pending = client.pending as TState | undefined;
-			client.pending = undefined;
-			if (pending !== undefined) {
-				this.send(client, pending);
+			if (client.pending) {
+				client.pending = false;
+				this.send(client);
 			}
 		});
 	}
 
-	/**
-	 * Returns the SSE frame that brings `client` from its last frame to `state`, or `undefined`
-	 * when there is nothing to send. `cache` memoises serialisations shared by clients that are
-	 * at the same base state within one broadcast.
-	 */
-	private frameFor(client: Client, state: TState, cache?: Map<unknown, string>): string | undefined {
+	private frameFor(client: Client, latest: Generation): string {
 		if (client.options.protocol === 1) {
-			const cached = cache?.get(v1Key);
-			const serialized = cached ?? JSON.stringify(state);
-			cache?.set(v1Key, serialized);
-			return `event: state\ndata: ${serialized}\n\n`;
+			return `event: state\ndata: ${this.serialize(latest)}\n\n`;
 		}
 		client.sequence++;
-		if (client.lastSent === undefined) {
-			const cached = cache?.get(snapshotKey);
-			const serialized = cached ?? JSON.stringify(state);
-			cache?.set(snapshotKey, serialized);
-			return `event: snapshot\nid: ${client.sequence}\ndata: ${serialized}\n\n`;
+		const received = client.received;
+		if (!received) {
+			return `event: snapshot\nid: ${client.sequence}\ndata: ${this.serialize(latest)}\n\n`;
 		}
-		let serialized = cache?.get(client.lastSent);
-		if (serialized === undefined) {
-			const patch = diffValue(client.lastSent, state);
-			serialized = patch ? JSON.stringify(patch) : '';
-			cache?.set(client.lastSent, serialized);
-		}
-		if (serialized === '') {
-			client.sequence--;
-			return undefined;
-		}
-		return `event: patch\nid: ${client.sequence}\ndata: ${serialized}\n\n`;
+		const patch = received.number === latest.number - 1 && latest.patchFromPrevious !== undefined
+			? latest.patchFromPrevious
+			// Fell behind by more than one generation: one catch-up patch from what it last received.
+			: JSON.stringify(diffValue(received.state, latest.state) ?? ['=', latest.state]);
+		return `event: patch\nid: ${client.sequence}\ndata: ${patch}\n\n`;
+	}
+
+	private serialize(generation: Generation): string {
+		generation.serialized ??= JSON.stringify(generation.state);
+		return generation.serialized;
 	}
 
 	private syncKeepalive(): void {
@@ -214,6 +254,3 @@ export class StateStreamHub<TState> {
 		this.options.onDidChangeViewerCount?.(this.viewerCount);
 	}
 }
-
-const v1Key = Symbol('v1');
-const snapshotKey = Symbol('snapshot');

@@ -1,5 +1,10 @@
 # Mobile Changelog
 
+## [0.1.3]
+
+- Consumed the gateway's `eventsV2` delta stream: one snapshot on connect, then compact patches, so streaming responses only transfer their new text and the XHR response buffer grows far more slowly. Older gateways that still send full `state` frames keep working.
+- Reconnected for a fresh snapshot whenever a patch cannot be applied instead of showing stale data.
+
 ## [0.1.2]
 
 - Persisted one-time pairing across Wi-Fi and hotspot address changes by rediscovering the saved host ID on its saved gateway port.

@@ -209,14 +209,40 @@ There is no `setInterval` that runs while the system is idle and healthy.
 
 ## 9. Wire protocol
 
-`MonitorState` (per window) and `GatewayState` (aggregate) are unchanged from 1.1.x so the
-dashboard and mobile app keep working. `GET /api/health` reports `apiVersion: 4` and the
-capability `sessionSync`. New endpoints:
+`MonitorState` (per window) and `GatewayState` (aggregate) are unchanged from 1.1.x so older
+dashboards and mobile apps keep working. `GET /api/health` reports `apiVersion: 4` and the
+capabilities `sessionSync` and `eventsV2`.
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /api/events` | Protocol 1: every change is a full `event: state` frame |
+| `GET /api/events?v=2` | Protocol 2: one `event: snapshot`, then `event: patch` deltas |
 | `POST /api/sessions/sync` | Request one export snapshot for a session (user action) |
 | `GET /api/presence` (gateway) | Idle SSE stream followers hold open; does not count as a dashboard client |
+
+### 9.1 Protocol 2 deltas (`stateDelta.ts`, `stateStream.ts`)
+
+A patch is a JSON tuple that turns the client's previous state into the next one:
+
+| Op | Meaning |
+|---|---|
+| `['=', value]` | replace |
+| `['-']` | delete an object member (only inside `'o'`) |
+| `['+', suffix]` | append to a string — streaming assistant text and tool output travel as their new tail only |
+| `['o', {key: patch}]` | patch object members |
+| `['a', length, {index: patch}]` | positional array patch (resize, then patch indices) |
+| `['k', keys, {key: patch}]` | keyed array patch: rebuild in `keys` order from the previous items (`id` / `resource` / `windowId` / `identifier`), so a sliding 40-turn window sends only the new turn |
+
+The server (`StateStreamHub`) keeps an **independent copy** of the latest state per hub,
+advanced by applying the very patch it sends, so a backend that mutates objects in place
+cannot desynchronise clients. All clients at the newest generation share one patch string;
+a client whose socket was waiting for `drain` receives a single catch-up patch computed from
+the generation it last received. A client that fails to apply a patch simply reconnects and
+gets a fresh snapshot. The same codec is used on the gateway→window relay link, in the
+browser dashboard (inline port) and in the mobile app (`mobile/src/transport/state-delta.ts`).
+
+On a small demo state the v2 stream carried 7× fewer bytes than v1 for identical changes;
+the ratio grows with the size of the retained turn window.
 
 ## 10. Failure modes considered
 
