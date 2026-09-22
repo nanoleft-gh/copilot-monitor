@@ -1,45 +1,43 @@
 # Changelog
 
-## [1.3.5]
+## [2.0.0]
 
-- Fixed the tunnel-service picker doing nothing: the gateway's `/api/remote-access` route dropped the `provider` and `ngrok` fields before handing the request to the owner.
-- ngrok needs **one secret**, and either kind works. ngrok issues two look-alike tokens (an API key for api.ngrok.com and an agent authtoken); the sidebar takes either. An API key is recognised by the API accepting it and used once to mint a dedicated agent authtoken (`POST /credentials`, description "Copilot Monitor on <host>"); an authtoken is stored as is. Only the authtoken is kept.
-- ngrok addresses are stable without any domain setup: the agent is started with `--url https://`, which binds the account's auto-assigned dev domain (stable on every plan). A reserved domain can still be given to pin an explicit name.
-- The sidebar detects whether the ngrok agent is on PATH; when it is not, it shows the install commands for this OS (winget/Chocolatey, Homebrew, snap/apt) with copy buttons, a *Check again* button, and a one-click fallback to the dev tunnel.
+Pair once, reach your computer from anywhere. This release adds a pairing secret, one-click remote access over free tunnels, self-healing connections on the phone, and markdown on mobile.
 
-## [1.3.4]
+![Remote access with a VS Code dev tunnel](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-4-vs-tunnel-remote-access.png)
 
-- Paired phones now learn address changes **while connected**: the gateway streams its current address list (`endpoints`) in the state snapshot and pushes an update the moment a tunnel comes up or goes away, so a phone paired at home picks up a remote address added later without re-scanning, and a phone on the tunnel learns a changed home IP the same way.
-- **ngrok** as an alternative tunnel service. Pick it under Remote access, paste your authtoken (stored 0600 next to the pairing secret, passed to the agent through `NGROK_AUTHTOKEN`, never on the command line) and optionally the free static domain from dashboard.ngrok.com/domains; the extension runs the installed `ngrok` agent with `--url` pinned to that domain so the address never changes. Requires the ngrok agent on PATH; agent errors (missing token, domain in use) are translated into actionable messages. The tunnel manager is now driver-based, with the VS Code dev tunnel as the default driver.
-- Sidebar: the QR-target picker is now a labelled radio list ("Code opens first via: Home Wi-Fi / Anywhere") showing each address, with a note that the app tries both; a matching picker chooses the tunnel service.
+### Security: pairing secret
 
-## [1.3.3]
+- Every `/api/*` route except `/api/health` now requires the computer's pairing secret (`Authorization: Bearer …`). The secret is minted once per computer in the shared state directory, shared by every VS Code window so gateway failover keeps it, and compared in constant time.
+- The QR code and *Copy pairing link* carry it in the URL fragment (`#k=…`), which never reaches any server or log. The browser dashboard trades it for an `HttpOnly; SameSite=Strict` cookie via `POST /api/auth` and drops it from the address bar.
+- `Copilot Monitor: Reset Pairing Secret` rotates it; other windows converge because the gateway re-reads the secret file when it sees a token it does not know.
 
-- One pairing code for home and away. The QR / pairing link now carries every address the gateway answers on (all LAN interfaces, the dev tunnel, a manual URL) in its fragment (`#k=<secret>&e=<addresses>`). The app pairs through whichever address answers and remembers all of them; browsers keep opening the code's primary address. A **Home Wi-Fi / Anywhere** switch above the QR picks that primary address (default: home), and the code regenerates whenever an address changes. *Copy pairing link* follows the switch.
-- Clarified the tunnel address: the CLI persists its dev tunnel (`port_forwarding_tunnel.json` in the VS Code CLI data directory) and reuses it on every start, so `https://<id>-43121.<cluster>.devtunnels.ms/` stays the same across VS Code restarts and reboots as long as the same GitHub account is used. Paired phones learn a new address automatically on their next home connection anyway.
+### Remote access without a paid server
 
-## [1.3.2]
+- **One click.** *Turn on remote access* in the sidebar forwards the gateway port through a Microsoft dev tunnel by running the `code-tunnel` CLI that ships inside VS Code, with the same stdin/stderr protocol the Ports view uses (`tunnel forward-internal`). No proposed API, no manual forwarding. If GitHub is not signed in, the sidebar offers the sign-in and continues on its own. The CLI persists its tunnel, so the `https://<id>-43121.<cluster>.devtunnels.ms/` address survives restarts and reboots.
+- **ngrok** as an alternative service. Paste **either** an ngrok API key or an agent authtoken (they look alike; the extension tells them apart and mints a dedicated authtoken from an API key). The agent runs with `--url https://`, which binds the account's stable auto-assigned dev domain, so the address is permanent on the free plan too. A reserved domain can pin a chosen name. If the agent is not on PATH, the sidebar shows the install command for your OS.
+- **Your own route** (Tailscale, Cloudflare Tunnel, reverse proxy) can be entered as a manual address.
+- Remote access is a machine-wide choice stored next to the pairing secret — not a VS Code setting — owned by the window that runs the gateway and managed from any window through the authenticated `GET`/`POST /api/remote-access` routes. Leadership changes move the tunnel to the new owner.
 
-- Fixed "Unable to write to User Settings because githubCopilotMonitor.remoteAccess is not a registered configuration" when turning on remote access. VS Code's settings writer only accepts keys present in the running window's configuration registry, which is refreshed on a full window reload; an extension-host restart after a VSIX install can leave it stale. Remote access state (on/off, manual URL) is therefore no longer a VS Code setting at all: it lives in the shared state directory next to the host identity, is owned by the window that runs the gateway, and every window (this one included) reads and changes it through the authenticated `GET`/`POST /api/remote-access` gateway routes. This also makes the choice machine-wide and consistent across VS Code Stable and Insiders windows.
-- "Sign in with GitHub" now signs in from the window you clicked in (accounts are shared) and then asks the gateway owner to start the tunnel, so it works from any window.
-- The sidebar re-reads the tunnel state while it is starting so the address appears without reopening the view.
-- Removed the `githubCopilotMonitor.remoteAccess` / `remoteUrl` settings and the `Set Manual Remote URL` command; the sidebar is the single place to manage remote access.
+![ngrok setup in the sidebar](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-2-remote-access-ngrok.png)
 
-## [1.3.1]
+### Connections that heal themselves
 
-- Remote access is now one click. "Turn on remote access" in the Copilot Monitor sidebar forwards the gateway port through a Microsoft dev tunnel by running the `code-tunnel` CLI that ships inside VS Code with the same stdin/stderr protocol the Ports view uses (`tunnel forward-internal`), so no proposed API or manual forwarding is needed. The address appears in the sidebar and is advertised to paired phones automatically. If GitHub is not signed in, the sidebar offers the sign-in and continues on its own afterwards; the CLI is restarted with backoff if it exits. Only the window that owns the shared gateway runs the tunnel, and leadership changes now notify the runtime so failover moves it.
-- The manual remote URL (Tailscale, Cloudflare Tunnel, own proxy) is edited inside the sidebar instead of an input box; save errors are shown instead of being swallowed.
-- New setting `githubCopilotMonitor.remoteAccess` (machine scope, off by default).
+- `/api/health` advertises every address the gateway answers on (`endpoints`): all physical LAN interfaces plus the active tunnel and any manual URL. The same list is streamed in every state snapshot and pushed the moment a tunnel comes up or goes away, so a phone paired at home learns a remote address added later without re-scanning, and a phone on the tunnel learns a changed home IP.
+- One pairing code for home and away: the QR carries every address (`#k=<secret>&e=<addresses>`); the app pairs through whichever answers and remembers all of them. A **Home Wi-Fi / Anywhere** picker chooses which address a phone camera opens first.
+- Phones probe LAN candidates in parallel, then remote ones, then fall back to a subnet scan when the last-good address fails.
 
-## [1.3.0]
+![One code for home and away](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-3-vs-tunnel-dash.png)
 
-Pairing secret and connection resilience. Phones pair once and keep working through Wi-Fi drops, IP changes, and from outside the home network.
+### Fixes
 
-- Every `/api/*` route except `/api/health` now requires the host's pairing secret (`Authorization: Bearer ...`). The secret is minted once per computer in the shared state directory, shared by every VS Code window so gateway failover keeps it, and compared in constant time. The QR code and "Copy pairing link" carry it in the URL fragment (`#k=...`), which never reaches the server or its logs; the browser dashboard trades it for an `HttpOnly; SameSite=Strict` cookie via `POST /api/auth` and drops it from the address bar. `Copilot Monitor: Reset Pairing Secret` rotates it; other windows converge because the gateway re-reads the secret file when it sees a token it does not know.
-- `/api/health` advertises every address the gateway can be reached through (`endpoints`): all physical LAN interfaces plus the new `githubCopilotMonitor.remoteUrl` setting. Paired phones store the list and, when the last-good address fails, probe the LAN candidates in parallel, then the remote ones, then fall back to the subnet scan, so a changed IP or a different network needs no re-scan.
-- Remote access without a paid server: forward the gateway port in VS Code's **Ports** view (Microsoft dev tunnels, free, GitHub sign-in), set its visibility to *Public*, and paste the Forwarded Address via `Copilot Monitor: Set Remote Access URL` or the sidebar. Phones learn the URL the next time they connect at home and switch to it automatically when away. A Tailscale or Cloudflare Tunnel URL works the same way. VS Code offers no stable API to create local tunnels programmatically (`env.asExternalUri` is a no-op in local windows; `workspace.openTunnel` is a proposed API), so the address is pasted once.
-- Fixed chats briefly showing "Working" after being opened and left on the phone: replaying an existing transcript on attach, and log lines that touched no turn, counted as activity.
-- Dashboard: a stream that dies before its first snapshot (gateway gone, pairing reset) backs off instead of reconnecting every 250 ms.
+- Chats no longer flash "Working" after being opened and left on the phone: replaying an existing transcript on attach, and log lines that touched no turn, were counted as activity.
+- The dashboard's event stream backs off instead of reconnecting every 250 ms when it dies before its first snapshot.
+- Removed the short-lived `githubCopilotMonitor.remoteAccess` / `remoteUrl` settings and the `Set Remote Access URL` command; the sidebar is the single place to manage remote access. Renamed *Copy Dashboard URL* to *Copy Pairing Link*.
+
+### Wire protocol
+
+- `apiVersion` stays 4; new capability `remoteAccess`. New routes: `POST /api/auth`, `GET`/`POST /api/remote-access`. `GET /api/health` adds `authRequired`, `authorized`, `endpoints`. `GatewayState` adds `endpoints`.
 
 ## [1.2.3]
 

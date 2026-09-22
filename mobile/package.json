@@ -1,7 +1,7 @@
 {
   "name": "copilot-monitor-mobile",
   "main": "expo-router/entry",
-  "version": "0.2.3",
+  "version": "2.0.0",
   "packageManager": "pnpm@10.26.2",
   "dependencies": {
     "@expo/ui": "~57.0.7",

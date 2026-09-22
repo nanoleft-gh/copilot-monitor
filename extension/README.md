@@ -1,8 +1,19 @@
 # Copilot Monitor
 
-Monitor and control local GitHub Copilot Chat sessions from a responsive browser dashboard. Switch among open VS Code windows and conversations, follow responses and tools in real time, send prompts, manage models and approvals, organize chats, and use the dashboard from another device on your trusted local network.
+Monitor and control local GitHub Copilot Chat sessions from a browser dashboard or the Copilot Monitor phone app. Switch among open VS Code windows and conversations, follow responses and tools in real time, send prompts, manage models and approvals, organize chats — on your Wi-Fi or, with one click, from anywhere through a free tunnel.
 
-Every open VS Code window runs a hidden loopback bridge, while one window owns the shared LAN gateway on a stable port. The browser sees one URL and can route actions to the exact window and chat session.
+Every open VS Code window runs a hidden loopback bridge, while one window owns the shared gateway on a stable port. Clients see one address, protected by a per-computer pairing secret, and can route actions to the exact window and chat session.
+
+<p align="center">
+  <img alt="Pairing sidebar with one code for home and away" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-3-vs-tunnel-dash.png" width="49%">
+  <img alt="Remote access through a VS Code dev tunnel" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-4-vs-tunnel-remote-access.png" width="49%">
+</p>
+<p align="center">
+  <img alt="Phone: conversations list" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-2-conversations-list.jpeg" width="24%">
+  <img alt="Phone: conversation with markdown and controls" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-3-opened-conversation.jpeg" width="24%">
+  <img alt="Phone: approval mode" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-5-approval-edit.jpeg" width="24%">
+  <img alt="Phone: edit and resubmit a request" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-6-edit-message-for-resubmitting.jpeg" width="24%">
+</p>
 
 > [!IMPORTANT]
 > Copilot Monitor is an independent open-source project. It is not affiliated with, endorsed by, or supported by GitHub or Microsoft.
@@ -88,7 +99,7 @@ Press `F5` to open the Extension Development Host. In that window:
 
 ```sh
 npm run package
-code --install-extension githubcopilot-monitor-1.1.8.vsix --force
+code --install-extension githubcopilot-monitor-2.0.0.vsix --force
 ```
 
 Reload VS Code. The bridge starts automatically, adds a `Copilot Monitor` status bar item, and needs no proposed-API or launch flags.
@@ -107,7 +118,11 @@ To reach the computer when the phone is not on your Wi-Fi, without any paid serv
 
 Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL. Remote access is a machine-wide choice stored next to the pairing secret, not a VS Code setting; any window can change it and the window that owns the gateway runs the tunnel.
 
-**ngrok instead of dev tunnels:** choose *ngrok* under Tunnel service. If the ngrok agent is not on PATH the view shows the install command for your OS. Paste **either** your ngrok API key (dashboard → API Keys) **or** your agent authtoken (dashboard → Your Authtoken) — they look alike, and the extension tells them apart, minting a dedicated agent authtoken from an API key. The agent is started with `--url https://`, which uses your account's stable auto-assigned dev domain, so the address is permanent on the free plan too; a reserved domain can be entered to pin a chosen name. Browsers opening an ngrok free-tier address see ngrok's interstitial page once; the app skips it automatically.
+**ngrok instead of dev tunnels:** choose *ngrok* under Tunnel service. If the ngrok agent is not on PATH the view shows the install command for your OS. Paste **either** an ngrok API key — create one at [dashboard.ngrok.com/api-keys](https://dashboard.ngrok.com/api-keys) (Settings → Credentials → API Keys) — **or** your agent authtoken from [Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken). They look alike; the extension tells them apart and mints a dedicated agent authtoken from an API key, storing only the authtoken. The agent is started with `--url https://`, which uses your account's stable auto-assigned dev domain, so the address is permanent on the free plan too; a reserved domain can be entered to pin a chosen name. Browsers opening an ngrok free-tier address see ngrok's interstitial page once; the app skips it automatically.
+
+<p align="center">
+  <img alt="ngrok tunnel configured in the sidebar" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-2-remote-access-ngrok.png" width="60%">
+</p>
 
 Paired phones learn every address change live: the gateway streams its address list, so a remote address added later reaches a phone that is connected at home, and a changed home IP reaches a phone connected through the tunnel.
 

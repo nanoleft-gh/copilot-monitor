@@ -388,7 +388,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			? ''
 			: !ngrok.agent.installed
 				? `<div class="notice">
-					<strong>ngrok agent not found</strong><br>Install it, then press <em>Check again</em> (restart VS Code if it is still not found, so the new PATH is picked up).
+					<strong>ngrok agent not found</strong><br>Install it from <a href="https://ngrok.com/download">ngrok.com/download</a> or with a package manager, then press <em>Check again</em> (restart VS Code if it is still not found, so the new PATH is picked up).
 					${ngrokInstallCommands(ngrok.agent.platform).map(({ label, command }) => `
 						<div class="cmd"><span class="cmd-label">${escapeHtml(label)}</span><code class="inline">${escapeHtml(command)}</code><button type="button" class="mini" data-copy="${escapeHtml(command)}">Copy</button></div>`).join('')}
 					<div class="row"><button type="button" data-command="remote:recheck">Check again</button><button type="button" data-command="remote:provider:devtunnel">Use dev tunnel instead</button></div>
@@ -398,11 +398,11 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 				<label>ngrok API key or authtoken <small>${ngrok.hasAuthtoken ? 'a credential is saved · leave empty to keep it' : 'one secret is enough'}</small>
 					<input id="ngrok-credential" type="password" autocomplete="off" placeholder="${ngrok.hasAuthtoken ? '•••••••• (saved)' : '2abc…_xyz'}" spellcheck="false">
 				</label>
-				<p class="tight">ngrok has two look-alike secrets. An <strong>API key</strong> (dashboard → <em>API Keys</em>) lets this extension mint its own agent authtoken; an agent <strong>authtoken</strong> (dashboard → <em>Your Authtoken</em>) is used as is. Either works here; the extension tells them apart. Only the resulting authtoken is stored.</p>
-				<label>Reserved domain <small>optional · leave empty to use your account's stable dev domain</small>
+				<p class="tight">ngrok has two look-alike secrets and either works here. An <strong>API key</strong> from <a href="https://dashboard.ngrok.com/api-keys">dashboard.ngrok.com/api-keys</a> (Settings → Credentials → API Keys → <em>New API Key</em>) lets this extension mint its own agent authtoken; an agent <strong>authtoken</strong> from <a href="https://dashboard.ngrok.com/get-started/your-authtoken">Your Authtoken</a> is used as is. Only the resulting authtoken is stored.</p>
+				<label>Reserved domain <small>optional · leave empty to use your account's stable dev domain · <a href="https://dashboard.ngrok.com/domains">your domains</a></small>
 					<input id="ngrok-domain" type="text" autocomplete="off" placeholder="example.ngrok-free.app" value="${escapeHtml(ngrok.domain ?? '')}" spellcheck="false">
 				</label>
-				<div class="row"><button type="submit" class="primary">Save and connect</button>${ngrok.hasAuthtoken ? '<button type="button" data-command="remote:clearNgrokToken">Forget credential</button>' : ''}</div>
+				<div class="row"><button type="submit" class="primary">Save and connect</button>${ngrok.hasAuthtoken ? '<button type="button" data-command="remote:clearNgrokToken">Forget credential</button>' : '<a class="button-link" href="https://dashboard.ngrok.com/api-keys">Get an API key</a>'}</div>
 			</form>`;
 
 		if (!address.remote.enabled) {
@@ -478,6 +478,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			.manual-form{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin:6px 0 10px}.manual-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.manual-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.manual-form button{padding:0 10px}
 			.actions{display:grid;gap:8px;margin-top:12px}button{min-height:32px;border:1px solid var(--vscode-button-border,transparent);border-radius:2px;color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground);cursor:pointer;font:inherit}button:hover{background:var(--vscode-button-secondaryHoverBackground)}button.primary{color:var(--vscode-button-foreground);background:var(--vscode-button-background)}button.primary:hover{background:var(--vscode-button-hoverBackground)}
 			button.link{min-height:0;padding:0;border:0;background:none;color:var(--vscode-textLink-foreground);text-decoration:underline}button.link:hover{background:none}
+			a{color:var(--vscode-textLink-foreground)}a.button-link{display:flex;flex:1;align-items:center;justify-content:center;min-height:32px;border:1px solid var(--vscode-button-border,transparent);border-radius:2px;color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground);text-decoration:none}a.button-link:hover{background:var(--vscode-button-secondaryHoverBackground)}
 			.notice{margin-top:16px;padding:10px;border-left:2px solid var(--vscode-focusBorder);color:var(--vscode-descriptionForeground);background:var(--vscode-textBlockQuote-background)}
 			.status{display:flex;align-items:center;gap:9px;color:var(--vscode-descriptionForeground)}.spinner{width:13px;height:13px;border:2px solid var(--vscode-widget-border);border-top-color:var(--vscode-progressBar-background);border-radius:50%;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 		</style></head><body>${body}${script}</body></html>`;

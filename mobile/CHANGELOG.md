@@ -1,25 +1,22 @@
 # Mobile Changelog
 
-## [0.2.3]
+## [2.0.0]
 
-- Markdown rendering now uses `react-native-markdown-display` (markdown-it), the renderer most widely deployed on Expo Go; `react-native-marked` threw at render time on the device. The dependency had also been dropped from `package.json` by an editor save racing `pnpm add`, so fresh installs lacked it.
-- Assistant text is wrapped in an error boundary: if the markdown renderer ever throws, the message falls back to plain text and the error is logged instead of taking the whole chat screen down.
+Pair once, stay connected: pairing secret, self-healing connections, remote access, and markdown replies.
 
-## [0.2.2]
+<p align="center">
+  <img alt="Conversations list" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-2-conversations-list.jpeg" width="30%">
+  <img alt="Open conversation with markdown" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-3-opened-conversation.jpeg" width="30%">
+  <img alt="Thinking effort picker" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-4-thinking-effort-edit.jpeg" width="30%">
+</p>
 
-- Learns the computer's addresses from the live stream: every snapshot carries the gateway's current `endpoints`, and changes are persisted immediately, so a remote address added in VS Code (or a changed home IP) is known before it is ever needed.
+- **Pairing secret.** Pairing reads the computer's secret from the QR/link fragment and sends it as a bearer token on every request and on the event stream. Secrets live in the device keystore (`expo-secure-store`), never in the host list. Hosts paired before this release show *Needs re-pairing* and need one scan.
+- **One code, every address.** A pairing code carries all of the computer's addresses (`#e=…`). The code's own address is tried first; if it is silent, every alternate is probed in parallel and the first that answers is used, so the same code pairs at home and away. All addresses are stored.
+- **Learns addresses live.** Every gateway snapshot carries the current `endpoints`; changes are persisted immediately, so a remote address added later in VS Code, or a changed home IP, is known before it is ever needed. When the last-good address fails, LAN candidates are probed in parallel, then remote ones, then the subnet is scanned (Wi-Fi only).
+- **Resilient stream.** Reconnects back off exponentially with jitter, a socket that goes silent past the gateway's keepalive is dropped and reopened, and a network change or the app returning to the foreground retries immediately. The header shows *Reconnecting…* while the stream is down and a clear message when the computer stopped accepting this phone's pairing.
+- **Markdown replies.** Assistant messages render as GitHub-flavoured markdown (headings, lists, code blocks, inline code, links, quotes, tables) via `react-native-markdown-display`, memoised per block so streaming re-parses only the block that changed. A plain-text error boundary keeps the chat readable if the renderer ever fails.
 - Sends `ngrok-skip-browser-warning` on every request so ngrok free-tier tunnels answer without the interstitial page.
-
-## [0.2.1]
-
-- Pairing codes may carry the computer's other addresses (`#e=...`). The code's own address is tried first; if it is silent, every alternate is probed in parallel and the first that answers is used, so one code pairs both at home and away. All addresses are stored for reconnection.
-
-## [0.2.0]
-
-- Assistant replies render as GitHub-flavoured markdown (headings, lists, code blocks, inline code, links, quotes, tables) via `react-native-marked`; each text block is memoised so a streaming reply re-parses only the block that changed.
-- Pairing now carries the computer's secret (read from the QR/link fragment) and sends it as a bearer token on every request and on the event stream. Secrets live in the device keystore (`expo-secure-store`), never in the host list. Hosts paired before 1.3.0 show "Needs re-pairing" and prompt for one scan.
-- Connection resilience: the phone stores every address the computer advertises (all LAN interfaces plus its remote URL). When the last-good address fails it probes LAN candidates in parallel, then remote ones, then scans the subnet, and remembers the winner. Reconnects back off exponentially with jitter, a socket that goes silent past the gateway's keepalive is dropped and reopened, and a network change or the app returning to the foreground retries immediately. Newly advertised addresses (e.g. a tunnel URL added later in VS Code) are learned on the next successful connection.
-- The header shows "Reconnecting…" while the stream is down and a clear message when the computer stopped accepting this phone's pairing.
+- Native dependencies pinned to Expo SDK 57 (React Native 0.86.3, worklets 0.10.1, reanimated 4.5.1, screens 4.26.2); earlier mismatches crashed Expo Go on launch.
 
 ## [0.1.3]
 
