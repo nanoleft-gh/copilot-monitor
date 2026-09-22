@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.0.1]
+
+### Fixes
+
+- Fixed a directory watcher race condition on Linux/inotify where fast recursive directory creation (`mkdir -p`) could cause an ancestor watcher re-attach to miss events and hang reconciliation.
+
 ## [2.0.0]
 
 Pair once, reach your computer from anywhere. This release adds a pairing secret, one-click remote access over free tunnels, self-healing connections on the phone, and markdown on mobile.
