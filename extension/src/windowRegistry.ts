@@ -1,8 +1,17 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { DirectoryWatcher } from './directoryWatcher';
 
-export const windowHeartbeatIntervalMs = 2_000;
-export const windowStaleAfterMs = 8_000;
+/**
+ * Each VS Code window publishes one descriptor file so the shared gateway can find its
+ * local bridge. Liveness is not tracked here: the gateway keeps a connection to every
+ * window's event stream, and a descriptor whose bridge refuses connections is removed by
+ * the gateway. The only thing this class does after publishing is re-publish its own
+ * descriptor if something deletes it (observed through fs.watch, never by polling).
+ */
+
+/** Temporary files and unparseable descriptors older than this are garbage-collected. */
+export const abandonedFileAfterMs = 60_000;
 
 export interface WindowDescriptor {
 	readonly version: 1 | 2;
@@ -14,6 +23,7 @@ export interface WindowDescriptor {
 	readonly workspaceName: string;
 	readonly workspaceFolders: readonly string[];
 	readonly startedAt: number;
+	/** Kept for compatibility with older readers; equals the publish time. */
 	readonly heartbeatAt: number;
 	readonly pid: number;
 }
@@ -31,9 +41,10 @@ export interface WindowRegistration {
 
 export class WindowRegistry {
 	private readonly descriptorPath: string;
-	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private descriptor: WindowDescriptor | undefined;
-	private heartbeatWrite: Promise<void> = Promise.resolve();
+	private watcher: DirectoryWatcher | undefined;
+	private writing: Promise<void> = Promise.resolve();
+	private republishTimer: NodeJS.Timeout | undefined;
 
 	constructor(
 		readonly directory: string,
@@ -50,36 +61,67 @@ export class WindowRegistry {
 			windowId: this.windowId,
 			heartbeatAt: Date.now(),
 		};
-		await this.writeHeartbeat();
-		this.heartbeatTimer = setInterval(() => void this.writeHeartbeat(), windowHeartbeatIntervalMs);
-		this.heartbeatTimer.unref();
+		await this.publish();
+		this.watcher = new DirectoryWatcher(this.directory, event => {
+			if (!this.descriptor) {
+				return;
+			}
+			if (event.type === 'reconcile' || !event.name || event.name === path.basename(this.descriptorPath)) {
+				this.scheduleRepublish();
+			}
+		});
+		this.watcher.start();
 	}
 
 	async stop(): Promise<void> {
-		if (this.heartbeatTimer) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = undefined;
-		}
 		this.descriptor = undefined;
-		await this.heartbeatWrite;
+		this.watcher?.dispose();
+		this.watcher = undefined;
+		if (this.republishTimer) {
+			clearTimeout(this.republishTimer);
+			this.republishTimer = undefined;
+		}
+		await this.writing;
 		await fs.rm(this.descriptorPath, { force: true }).catch(() => undefined);
 	}
 
-	private writeHeartbeat(): Promise<void> {
-		this.heartbeatWrite = this.heartbeatWrite
-			.then(() => this.writeHeartbeatNow())
-			.catch(() => undefined);
-		return this.heartbeatWrite;
+	/** Re-writes the descriptor only when it is actually missing. */
+	private scheduleRepublish(): void {
+		if (this.republishTimer) {
+			return;
+		}
+		this.republishTimer = setTimeout(() => {
+			this.republishTimer = undefined;
+			void this.publishIfMissing();
+		}, 100);
+		this.republishTimer.unref();
 	}
 
-	private async writeHeartbeatNow(): Promise<void> {
+	private async publishIfMissing(): Promise<void> {
 		if (!this.descriptor) {
 			return;
 		}
-		this.descriptor = { ...this.descriptor, heartbeatAt: Date.now() };
+		try {
+			await fs.access(this.descriptorPath);
+			return;
+		} catch {
+			await this.publish();
+		}
+	}
+
+	private publish(): Promise<void> {
+		this.writing = this.writing.then(() => this.publishNow()).catch(() => undefined);
+		return this.writing;
+	}
+
+	private async publishNow(): Promise<void> {
+		const descriptor = this.descriptor;
+		if (!descriptor) {
+			return;
+		}
 		const temporaryPath = `${this.descriptorPath}.${process.pid}.tmp`;
 		try {
-			await fs.writeFile(temporaryPath, JSON.stringify(this.descriptor), 'utf8');
+			await fs.writeFile(temporaryPath, JSON.stringify(descriptor), 'utf8');
 			await replaceFile(temporaryPath, this.descriptorPath);
 		} catch {
 			await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
@@ -104,11 +146,11 @@ function isWindowsReplaceError(error: unknown): boolean {
 		&& (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EEXIST');
 }
 
-export async function readActiveWindowDescriptors(
-	directory: string,
-	now = Date.now(),
-	staleAfterMs = windowStaleAfterMs,
-): Promise<WindowDescriptor[]> {
+/**
+ * Lists published descriptors. Liveness is the caller's job (connect to `localPort`);
+ * only abandoned temporary files and old unparseable files are cleaned up here.
+ */
+export async function readWindowDescriptors(directory: string, now = Date.now()): Promise<WindowDescriptor[]> {
 	let entries: string[];
 	try {
 		entries = await fs.readdir(directory);
@@ -125,26 +167,27 @@ export async function readActiveWindowDescriptors(
 		}
 		const filePath = path.join(directory, entry);
 		if (isTemporary) {
-			await removeIfOld(filePath, now, staleAfterMs);
+			await removeIfOld(filePath, now);
 			continue;
 		}
 		try {
 			const value = JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
 			if (!isWindowDescriptor(value)) {
-				await removeIfOld(filePath, now, staleAfterMs);
-				continue;
-			}
-			if (now - value.heartbeatAt > staleAfterMs) {
-				await fs.rm(filePath, { force: true }).catch(() => undefined);
+				await removeIfOld(filePath, now);
 				continue;
 			}
 			descriptors.push(value);
 		} catch {
-			await removeIfOld(filePath, now, staleAfterMs);
+			await removeIfOld(filePath, now);
 		}
 	}
 
 	return descriptors.sort((left, right) => left.startedAt - right.startedAt);
+}
+
+/** Removes the descriptor of a window whose bridge is gone. */
+export async function removeWindowDescriptor(directory: string, windowId: string): Promise<void> {
+	await fs.rm(path.join(directory, `${windowId}.json`), { force: true }).catch(() => undefined);
 }
 
 function isWindowDescriptor(value: unknown): value is WindowDescriptor {
@@ -171,10 +214,10 @@ function isWindowDescriptor(value: unknown): value is WindowDescriptor {
 		&& Number.isInteger(candidate.pid);
 }
 
-async function removeIfOld(filePath: string, now: number, staleAfterMs: number): Promise<void> {
+async function removeIfOld(filePath: string, now: number): Promise<void> {
 	try {
 		const stat = await fs.stat(filePath);
-		if (now - stat.mtimeMs > staleAfterMs) {
+		if (now - stat.mtimeMs > abandonedFileAfterMs) {
 			await fs.rm(filePath, { force: true });
 		}
 	} catch {

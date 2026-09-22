@@ -4,15 +4,18 @@ import type { GatewayAddress } from './gatewayServer';
 export const mobileViewId = 'githubCopilotMonitor.mobile';
 
 export interface MobileViewRuntime {
+	/** Whether the monitor (and therefore a gateway address) currently exists for this window. */
+	readonly running: boolean;
 	start(notify?: boolean): Promise<GatewayAddress>;
 	getCurrentAddress(): Promise<GatewayAddress>;
+	/** Fires whenever the shared gateway address may have changed (election, failover, stop). */
+	onDidChangeAddress(listener: () => void): vscode.Disposable;
 	open(): Promise<void>;
 	copyUrl(): Promise<void>;
 }
 
 export class MobileViewProvider implements vscode.WebviewViewProvider {
 	private view: vscode.WebviewView | undefined;
-	private refreshTimer: NodeJS.Timeout | undefined;
 	private refreshRunning: Promise<void> | undefined;
 	private renderedUrl: string | undefined;
 
@@ -29,16 +32,21 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media', 'vendor')],
 		};
 		view.webview.onDidReceiveMessage((message: { command?: unknown }) => void this.handleMessage(message));
-		view.onDidChangeVisibility(() => this.updateRefreshTimer());
+		const addressSubscription = this.runtime.onDidChangeAddress(() => void this.refresh());
+		view.onDidChangeVisibility(() => {
+			if (view.visible) {
+				void this.refresh();
+			}
+		});
 		view.onDidDispose(() => {
+			addressSubscription.dispose();
 			if (this.view === view) {
 				this.view = undefined;
 			}
-			this.updateRefreshTimer();
 		});
 		view.webview.html = this.loadingHtml(view.webview);
-		this.updateRefreshTimer();
-		void this.refresh();
+		// Opening the view is an explicit request for the pairing address, so start on demand once.
+		void this.startAndRefresh();
 	}
 
 	private async handleMessage(message: { command?: unknown }): Promise<void> {
@@ -50,9 +58,23 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			await this.runtime.copyUrl();
 			return;
 		}
-		if (message.command === 'refresh') {
-			await this.refresh();
+		if (message.command === 'start') {
+			await this.startAndRefresh();
 		}
+	}
+
+	private async startAndRefresh(): Promise<void> {
+		const view = this.view;
+		try {
+			await this.runtime.start(false);
+		} catch (error) {
+			if (this.view === view && view) {
+				this.renderedUrl = undefined;
+				view.webview.html = this.errorHtml(view.webview, error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
+		await this.refresh();
 	}
 
 	private async refresh(): Promise<void> {
@@ -72,8 +94,12 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		if (!view) {
 			return;
 		}
+		if (!this.runtime.running) {
+			this.renderedUrl = undefined;
+			view.webview.html = this.stoppedHtml(view.webview);
+			return;
+		}
 		try {
-			await this.runtime.start(false);
 			const address = await this.runtime.getCurrentAddress();
 			if (this.view === view && this.renderedUrl !== address.url) {
 				this.renderedUrl = address.url;
@@ -81,19 +107,9 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			}
 		} catch (error) {
 			if (this.view === view) {
+				this.renderedUrl = undefined;
 				view.webview.html = this.errorHtml(view.webview, error instanceof Error ? error.message : String(error));
 			}
-		}
-	}
-
-	private updateRefreshTimer(): void {
-		if (this.refreshTimer) {
-			clearInterval(this.refreshTimer);
-			this.refreshTimer = undefined;
-		}
-		if (this.view?.visible) {
-			this.refreshTimer = setInterval(() => void this.refresh(), 2_000);
-			this.refreshTimer.unref();
 		}
 	}
 
@@ -101,12 +117,21 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		return this.document(webview, '<div class="status"><span class="spinner"></span>Starting shared gateway...</div>');
 	}
 
+	private stoppedHtml(webview: vscode.Webview): string {
+		return this.document(webview, `
+			<div class="eyebrow">Mobile access</div>
+			<h2>Monitor stopped</h2>
+			<p>Start the monitor to get a pairing address for your phone.</p>
+			<button class="primary" data-command="start">Start monitor</button>
+		`);
+	}
+
 	private errorHtml(webview: vscode.Webview, message: string): string {
 		return this.document(webview, `
 			<div class="eyebrow">Mobile access</div>
 			<h2>Gateway unavailable</h2>
 			<p>${escapeHtml(message)}</p>
-			<button class="primary" data-command="refresh">Try again</button>
+			<button class="primary" data-command="start">Try again</button>
 		`);
 	}
 

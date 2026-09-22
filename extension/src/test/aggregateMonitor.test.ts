@@ -77,7 +77,7 @@ describe('AggregateMonitor', () => {
 		const secondServer = new MonitorServer(secondBackend, { host: '127.0.0.1', port: 0 });
 		const firstRegistry = new WindowRegistry(root, 'window-1');
 		const secondRegistry = new WindowRegistry(root, 'window-2');
-		const aggregate = new AggregateMonitor(root, 25);
+		const aggregate = new AggregateMonitor(root, { scanDebounceMs: 25 });
 
 		try {
 			const firstAddress = await firstServer.start();
@@ -155,6 +155,43 @@ describe('AggregateMonitor', () => {
 			await secondRegistry.stop();
 			await firstServer.stop();
 			await secondServer.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it('drops a crashed window after bounded reconnects and purges its descriptor', async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-aggregate-'));
+		const backend = new TestWindowBackend(createState('window-crash', 'Crashing'));
+		const server = new MonitorServer(backend, { host: '127.0.0.1', port: 0 });
+		const registry = new WindowRegistry(root, 'window-crash');
+		const aggregate = new AggregateMonitor(root, { scanDebounceMs: 25, reconnectDelaysMs: [20, 40] });
+		const states: number[] = [];
+		const subscription = aggregate.onDidChange(state => states.push(state.windows.filter(window => window.connected).length));
+
+		try {
+			const address = await server.start();
+			await registry.start(descriptor(address.port, 'Crashing', 1));
+			await aggregate.start();
+			await waitFor(() => aggregate.getState().windows.some(window => window.connected), 2_000);
+
+			// Simulate a crash: the bridge disappears, the descriptor file stays behind.
+			const descriptorPath = path.join(root, 'window-crash.json');
+			await fs.stat(descriptorPath);
+			(registry as unknown as { watcher?: { dispose(): void } }).watcher?.dispose();
+			await server.stop();
+
+			await waitFor(() => aggregate.getState().windows.length === 0, 3_000);
+			const deadline = Date.now() + 1_000;
+			while (await fs.stat(descriptorPath).then(() => true, () => false)) {
+				assert.ok(Date.now() < deadline, 'the stale descriptor is purged');
+				await new Promise(resolve => setTimeout(resolve, 20));
+			}
+			assert.ok(states.includes(0), 'listeners observe the window going offline');
+		} finally {
+			subscription.dispose();
+			aggregate.dispose();
+			await registry.stop();
+			await server.stop().catch(() => undefined);
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

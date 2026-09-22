@@ -66,6 +66,7 @@ export interface GatewayAddress {
 export class GatewayServer {
 	private readonly server: http.Server;
 	private readonly eventClients = new Set<EventClient>();
+	private readonly presenceClients = new Set<http.ServerResponse>();
 	private readonly backendSubscription: { dispose(): void };
 	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private address: GatewayAddress | undefined;
@@ -102,27 +103,20 @@ export class GatewayServer {
 			port: info.port,
 			url: `http://${this.options.advertisedHost}:${info.port}/`,
 		};
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
 		return this.address;
 	}
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		if (this.heartbeatTimer) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = undefined;
-		}
 		for (const client of this.eventClients) {
 			client.response.end();
 		}
 		this.eventClients.clear();
+		for (const response of this.presenceClients) {
+			response.end();
+		}
+		this.presenceClients.clear();
+		this.syncHeartbeatTimer();
 		this.backend.setEventClientCount?.(0);
 		if (this.server.listening) {
 			await new Promise<void>((resolve, reject) => {
@@ -170,6 +164,10 @@ export class GatewayServer {
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
 				this.openEventStream(request, response);
+				return;
+			}
+			if (request.method === 'GET' && url.pathname === '/api/presence') {
+				this.openPresenceStream(request, response);
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/messages') {
@@ -372,12 +370,39 @@ export class GatewayServer {
 		response.flushHeaders();
 		const client: EventClient = { response, waitingForDrain: false };
 		this.eventClients.add(client);
+		this.syncHeartbeatTimer();
 		this.backend.setEventClientCount?.(this.eventClients.size);
 		this.writeState(client, JSON.stringify(this.backend.getState()));
 		request.on('close', () => {
 			this.eventClients.delete(client);
+			this.syncHeartbeatTimer();
 			this.backend.setEventClientCount?.(this.eventClients.size);
 		});
+	}
+
+	/** SSE keepalive comments are only worth sending while somebody is listening. */
+	private syncHeartbeatTimer(): void {
+		if (this.eventClients.size === 0 && this.presenceClients.size === 0) {
+			if (this.heartbeatTimer) {
+				clearInterval(this.heartbeatTimer);
+				this.heartbeatTimer = undefined;
+			}
+			return;
+		}
+		if (this.heartbeatTimer) {
+			return;
+		}
+		this.heartbeatTimer = setInterval(() => {
+			for (const client of this.eventClients) {
+				if (!client.waitingForDrain) {
+					client.response.write(': heartbeat\n\n');
+				}
+			}
+			for (const response of this.presenceClients) {
+				response.write(': heartbeat\n\n');
+			}
+		}, 15_000);
+		this.heartbeatTimer.unref();
 	}
 
 	private broadcastState(state: GatewayState): void {
@@ -385,6 +410,27 @@ export class GatewayServer {
 		for (const client of this.eventClients) {
 			this.writeState(client, serialized);
 		}
+	}
+
+	/**
+	 * Follower windows hold this stream open; its closure is their signal that the gateway
+	 * went away. It carries no state, so it does not count as a dashboard client.
+	 */
+	private openPresenceStream(request: http.IncomingMessage, response: http.ServerResponse): void {
+		response.writeHead(200, {
+			'Cache-Control': 'no-cache, no-transform',
+			Connection: 'keep-alive',
+			'Content-Type': 'text/event-stream; charset=utf-8',
+			'X-Accel-Buffering': 'no',
+		});
+		response.flushHeaders();
+		response.write(`event: gateway\ndata: ${JSON.stringify({ registryId: this.options.registryId, leaseNonce: this.options.leaseNonce ?? null })}\n\n`);
+		this.presenceClients.add(response);
+		this.syncHeartbeatTimer();
+		request.on('close', () => {
+			this.presenceClients.delete(response);
+			this.syncHeartbeatTimer();
+		});
 	}
 
 	private writeState(client: EventClient, serializedState: string): void {

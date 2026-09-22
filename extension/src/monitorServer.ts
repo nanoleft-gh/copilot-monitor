@@ -84,27 +84,16 @@ export class MonitorServer {
 			port: info.port,
 			url: `http://${displayHost}:${info.port}/`,
 		};
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
 		return this.address;
 	}
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		if (this.heartbeatTimer) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = undefined;
-		}
 		for (const client of this.eventClients) {
 			client.response.end();
 		}
 		this.eventClients.clear();
+		this.syncHeartbeatTimer();
 		this.backend.setEventClientCount?.(0);
 		if (!this.server.listening) {
 			return;
@@ -369,12 +358,36 @@ export class MonitorServer {
 		response.flushHeaders();
 		const client: EventClient = { response, countsAsDashboard, waitingForDrain: false };
 		this.eventClients.add(client);
+		this.syncHeartbeatTimer();
 		this.updateDashboardClientCount();
 		this.writeState(client, JSON.stringify(this.backend.getState()));
 		request.on('close', () => {
 			this.eventClients.delete(client);
+			this.syncHeartbeatTimer();
 			this.updateDashboardClientCount();
 		});
+	}
+
+	/** SSE keepalive comments are only worth sending while somebody is listening. */
+	private syncHeartbeatTimer(): void {
+		if (this.eventClients.size === 0) {
+			if (this.heartbeatTimer) {
+				clearInterval(this.heartbeatTimer);
+				this.heartbeatTimer = undefined;
+			}
+			return;
+		}
+		if (this.heartbeatTimer) {
+			return;
+		}
+		this.heartbeatTimer = setInterval(() => {
+			for (const client of this.eventClients) {
+				if (!client.waitingForDrain) {
+					client.response.write(': heartbeat\n\n');
+				}
+			}
+		}, 15_000);
+		this.heartbeatTimer.unref();
 	}
 
 	private updateDashboardClientCount(): void {

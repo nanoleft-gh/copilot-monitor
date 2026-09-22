@@ -1,4 +1,5 @@
 import * as http from 'node:http';
+import { DirectoryWatcher } from './directoryWatcher';
 import {
 	GatewayCreateSessionRequest,
 	GatewayEditTurnRequest,
@@ -19,28 +20,55 @@ import {
 	SendMessageResult,
 	CreateSessionResult,
 } from './protocol';
-import { readActiveWindowDescriptors, WindowDescriptor } from './windowRegistry';
+import { readWindowDescriptors, removeWindowDescriptor, WindowDescriptor } from './windowRegistry';
 
-const defaultScanIntervalMs = 1_000;
+const defaultScanDebounceMs = 100;
 const relayRequestTimeoutMs = 15_000;
+/** Reconnect delays after the event stream to a window drops; after the last one the window is declared dead. */
+const defaultReconnectDelaysMs: readonly number[] = [500, 1_500, 4_000];
 
+export interface AggregateMonitorOptions {
+	readonly scanDebounceMs?: number;
+	readonly reconnectDelaysMs?: readonly number[];
+}
+
+/**
+ * Aggregates every window's bridge behind the shared gateway.
+ *
+ * Discovery is driven by fs.watch on the registry directory; liveness by the event-stream
+ * connection to each window. A window whose stream drops is reconnected a few times with
+ * growing delays and then removed together with its stale descriptor. Nothing polls.
+ */
 export class AggregateMonitor {
 	private readonly listeners = new Set<(state: GatewayState) => void>();
 	private readonly connections = new Map<string, WindowConnection>();
 	private readonly gatewayStartedAt = Date.now();
+	private readonly scanDebounceMs: number;
+	private readonly reconnectDelaysMs: readonly number[];
+	private watcher: DirectoryWatcher | undefined;
 	private scanTimer: NodeJS.Timeout | undefined;
-	private scanRunning = false;
+	private scanRunning: Promise<void> | undefined;
+	private scanRequested = false;
 	private eventClientCount = 0;
+	private disposed = false;
 
 	constructor(
 		private readonly registryDirectory: string,
-		private readonly scanIntervalMs = defaultScanIntervalMs,
-	) {}
+		options: AggregateMonitorOptions = {},
+	) {
+		this.scanDebounceMs = options.scanDebounceMs ?? defaultScanDebounceMs;
+		this.reconnectDelaysMs = options.reconnectDelaysMs ?? defaultReconnectDelaysMs;
+	}
 
 	async start(): Promise<void> {
 		await this.scan();
-		this.scanTimer = setInterval(() => void this.scan(), this.scanIntervalMs);
-		this.scanTimer.unref();
+		this.watcher = new DirectoryWatcher(this.registryDirectory, event => {
+			if (event.type === 'change' && event.name && !event.name.endsWith('.json')) {
+				return;
+			}
+			this.requestScan();
+		});
+		this.watcher.start();
 	}
 
 	getState(): GatewayState {
@@ -174,8 +202,11 @@ export class AggregateMonitor {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		this.watcher?.dispose();
+		this.watcher = undefined;
 		if (this.scanTimer) {
-			clearInterval(this.scanTimer);
+			clearTimeout(this.scanTimer);
 			this.scanTimer = undefined;
 		}
 		for (const connection of this.connections.values()) {
@@ -191,45 +222,82 @@ export class AggregateMonitor {
 		return connection;
 	}
 
-	private async scan(): Promise<void> {
-		if (this.scanRunning) {
+	private requestScan(): void {
+		if (this.disposed || this.scanTimer) {
 			return;
 		}
-		this.scanRunning = true;
-		try {
-			const descriptors = await readActiveWindowDescriptors(this.registryDirectory);
-			const activeIds = new Set(descriptors.map(descriptor => descriptor.windowId));
-			let changed = false;
+		this.scanTimer = setTimeout(() => {
+			this.scanTimer = undefined;
+			void this.scan();
+		}, this.scanDebounceMs);
+		this.scanTimer.unref();
+	}
 
-			for (const [windowId, connection] of this.connections) {
-				if (!activeIds.has(windowId)) {
-					connection.dispose();
-					this.connections.delete(windowId);
-					changed = true;
-				}
-			}
-
-			for (const descriptor of descriptors) {
-				const current = this.connections.get(descriptor.windowId);
-				if (!current || current.localPort !== descriptor.localPort) {
-					current?.dispose();
-					const connection = new WindowConnection(descriptor, () => this.emit());
-					this.connections.set(descriptor.windowId, connection);
-					connection.setEventClientCount(this.eventClientCount);
-					connection.connect();
-					changed = true;
-				} else {
-					changed = current.updateDescriptor(descriptor) || changed;
-					current.connect();
-				}
-			}
-
-			if (changed) {
-				this.emit();
-			}
-		} finally {
-			this.scanRunning = false;
+	private scan(): Promise<void> {
+		if (this.scanRunning) {
+			this.scanRequested = true;
+			return this.scanRunning;
 		}
+		this.scanRunning = this.doScan().finally(() => {
+			this.scanRunning = undefined;
+			if (this.scanRequested && !this.disposed) {
+				this.scanRequested = false;
+				void this.scan();
+			}
+		});
+		return this.scanRunning;
+	}
+
+	private async doScan(): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		const descriptors = await readWindowDescriptors(this.registryDirectory);
+		const activeIds = new Set(descriptors.map(descriptor => descriptor.windowId));
+		let changed = false;
+
+		for (const [windowId, connection] of this.connections) {
+			if (!activeIds.has(windowId)) {
+				connection.dispose();
+				this.connections.delete(windowId);
+				changed = true;
+			}
+		}
+
+		for (const descriptor of descriptors) {
+			const current = this.connections.get(descriptor.windowId);
+			if (!current || current.localPort !== descriptor.localPort) {
+				current?.dispose();
+				const connection = new WindowConnection(
+					descriptor,
+					this.reconnectDelaysMs,
+					() => this.emit(),
+					() => this.forgetDeadWindow(descriptor.windowId),
+				);
+				this.connections.set(descriptor.windowId, connection);
+				connection.setEventClientCount(this.eventClientCount);
+				connection.connect();
+				changed = true;
+			} else {
+				changed = current.updateDescriptor(descriptor) || changed;
+			}
+		}
+
+		if (changed) {
+			this.emit();
+		}
+	}
+
+	/** The bridge behind a descriptor refused connections repeatedly: the window is gone. */
+	private forgetDeadWindow(windowId: string): void {
+		const connection = this.connections.get(windowId);
+		if (!connection) {
+			return;
+		}
+		connection.dispose();
+		this.connections.delete(windowId);
+		void removeWindowDescriptor(this.registryDirectory, windowId);
+		this.emit();
 	}
 
 	private emit(): void {
@@ -247,10 +315,15 @@ class WindowConnection {
 	private connected = false;
 	private buffer = '';
 	private eventClientCount = 0;
+	private reconnectAttempt = 0;
+	private reconnectTimer: NodeJS.Timeout | undefined;
+	private disposed = false;
 
 	constructor(
 		private descriptor: WindowDescriptor,
+		private readonly reconnectDelaysMs: readonly number[],
 		private readonly onChange: () => void,
+		private readonly onDead: () => void,
 	) {}
 
 	get localPort(): number {
@@ -283,7 +356,7 @@ class WindowConnection {
 	}
 
 	connect(): void {
-		if (this.request || this.response) {
+		if (this.disposed || this.request || this.response) {
 			return;
 		}
 		this.buffer = '';
@@ -299,6 +372,7 @@ class WindowConnection {
 				return;
 			}
 			this.connected = true;
+			this.reconnectAttempt = 0;
 			this.forwardEventClientCount();
 			this.onChange();
 			response.setEncoding('utf8');
@@ -344,6 +418,11 @@ class WindowConnection {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
+		}
 		this.request?.destroy();
 		this.response?.destroy();
 		this.request = undefined;
@@ -380,9 +459,31 @@ class WindowConnection {
 		this.request = undefined;
 		this.response = undefined;
 		this.connected = false;
+		if (this.disposed) {
+			return;
+		}
 		if (wasConnected) {
 			this.onChange();
 		}
+		this.scheduleReconnect();
+	}
+
+	/** Bounded reconnects; when they run out the window is reported dead. */
+	private scheduleReconnect(): void {
+		if (this.reconnectTimer) {
+			return;
+		}
+		const delay = this.reconnectDelaysMs[this.reconnectAttempt];
+		if (delay === undefined) {
+			this.onDead();
+			return;
+		}
+		this.reconnectAttempt++;
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			this.connect();
+		}, delay);
+		this.reconnectTimer.unref();
 	}
 
 	private forwardEventClientCount(): void {

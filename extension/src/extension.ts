@@ -16,13 +16,20 @@ const defaultGatewayPort = 43_121;
 class MonitorRuntime implements vscode.Disposable {
 	private readonly output = vscode.window.createOutputChannel('Copilot Monitor');
 	private readonly statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+	private readonly addressChanged = new vscode.EventEmitter<void>();
 	private readonly windowId = randomUUID();
 	private monitor: SessionMonitor | undefined;
 	private localServer: MonitorServer | undefined;
 	private registry: WindowRegistry | undefined;
 	private gateway: GatewayCoordinator | undefined;
+	private gatewayAddressSubscription: { dispose(): void } | undefined;
 	private address: GatewayAddress | undefined;
 	private startPromise: Promise<GatewayAddress> | undefined;
+	readonly onDidChangeAddress = this.addressChanged.event;
+
+	get running(): boolean {
+		return this.gateway !== undefined || this.startPromise !== undefined;
+	}
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.statusBar.command = 'githubCopilotMonitor.open';
@@ -58,6 +65,8 @@ class MonitorRuntime implements vscode.Disposable {
 		const localServer = this.localServer;
 		const registry = this.registry;
 		const gateway = this.gateway;
+		this.gatewayAddressSubscription?.dispose();
+		this.gatewayAddressSubscription = undefined;
 		this.localServer = undefined;
 		this.registry = undefined;
 		this.gateway = undefined;
@@ -70,6 +79,7 @@ class MonitorRuntime implements vscode.Disposable {
 		this.monitor = undefined;
 		await gateway?.stop();
 		this.output.appendLine('Dashboard stopped.');
+		this.addressChanged.fire();
 		if (notify) {
 			void vscode.window.showInformationMessage('Copilot Monitor stopped.');
 		}
@@ -102,6 +112,7 @@ class MonitorRuntime implements vscode.Disposable {
 
 	dispose(): void {
 		void this.stop(false);
+		this.addressChanged.dispose();
 		this.statusBar.dispose();
 		this.output.dispose();
 	}
@@ -165,11 +176,16 @@ class MonitorRuntime implements vscode.Disposable {
 			this.registry = registry;
 			this.gateway = gateway;
 			this.address = address;
+			this.gatewayAddressSubscription = gateway.onDidChangeAddress(() => {
+				this.output.appendLine('Shared gateway address changed.');
+				this.addressChanged.fire();
+			});
 			this.statusBar.tooltip = `Copilot Monitor · ${address.url}`;
 			this.statusBar.show();
 			await vscode.commands.executeCommand('setContext', 'githubCopilotMonitor.running', true);
 			this.output.appendLine(`Internal bridge for this window: http://127.0.0.1:${localAddress.port}/ (not a pairing address)`);
 			this.output.appendLine(`Machine-wide pairing address: ${address.url}`);
+			this.addressChanged.fire();
 			return address;
 		} catch (error) {
 			await registry.stop();
