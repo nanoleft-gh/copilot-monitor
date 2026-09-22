@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.5]
+
+- Fixed the tunnel-service picker doing nothing: the gateway's `/api/remote-access` route dropped the `provider` and `ngrok` fields before handing the request to the owner.
+- ngrok needs **one secret**, and either kind works. ngrok issues two look-alike tokens (an API key for api.ngrok.com and an agent authtoken); the sidebar takes either. An API key is recognised by the API accepting it and used once to mint a dedicated agent authtoken (`POST /credentials`, description "Copilot Monitor on <host>"); an authtoken is stored as is. Only the authtoken is kept.
+- ngrok addresses are stable without any domain setup: the agent is started with `--url https://`, which binds the account's auto-assigned dev domain (stable on every plan). A reserved domain can still be given to pin an explicit name.
+- The sidebar detects whether the ngrok agent is on PATH; when it is not, it shows the install commands for this OS (winget/Chocolatey, Homebrew, snap/apt) with copy buttons, a *Check again* button, and a one-click fallback to the dev tunnel.
+
 ## [1.3.4]
 
 - Paired phones now learn address changes **while connected**: the gateway streams its current address list (`endpoints`) in the state snapshot and pushes an update the moment a tunnel comes up or goes away, so a phone paired at home picks up a remote address added later without re-scanning, and a phone on the tunnel learns a changed home IP the same way.

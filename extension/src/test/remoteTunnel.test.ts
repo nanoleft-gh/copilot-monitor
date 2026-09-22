@@ -158,6 +158,8 @@ describe('RemoteTunnel (ngrok driver)', () => {
 				assert.equal(launch.env?.NGROK_AUTHTOKEN, 'tok');
 				assert.ok(!launch.args.includes('tok'), 'the token is not on the command line');
 			}
+			const bare = await ngrokDriver({ getSettings: async () => ({ authtoken: 'tok' }), resolveAgent: async () => agent }).prepare(43121, false);
+			assert.ok(bare.kind === 'run' && bare.args.at(-1) === 'https://', 'without a domain the account\'s stable dev domain is requested');
 			const tunnel = ngrokTunnel(agent, { authtoken: 'tok', domain: 'pc.ngrok-free.app' });
 			try {
 				await tunnel.start(43121);
@@ -174,7 +176,7 @@ describe('RemoteTunnel (ngrok driver)', () => {
 			try {
 				await tunnel.start(43121);
 				const errored = await waitForState(tunnel, 'error');
-				assert.match((errored as { error: string }).error, /needs your authtoken/);
+				assert.match((errored as { error: string }).error, /needs a credential/);
 			} finally {
 				tunnel.dispose();
 			}

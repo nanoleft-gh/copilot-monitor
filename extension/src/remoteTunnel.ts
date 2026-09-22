@@ -406,14 +406,13 @@ export function ngrokDriver(options: NgrokDriverOptions): TunnelDriver {
 		async prepare(port) {
 			const agent = await (options.resolveAgent ?? findOnPath)('ngrok');
 			if (!agent) {
-				return { kind: 'unavailable', reason: 'The ngrok agent was not found on PATH. Install it from ngrok.com/download, then retry.' };
+				return { kind: 'unavailable', reason: 'The ngrok agent was not found on PATH.' };
 			}
 			const settings = await options.getSettings();
-			const args = ['http', String(port), '--log', 'stdout', '--log-format', 'json'];
+			// `--url https://` binds the account's auto-assigned dev domain, which is stable; a reserved
+			// domain (paid plans, or one already claimed) pins an explicit name instead.
 			const domain = normalizeNgrokDomain(settings.domain);
-			if (domain) {
-				args.push('--url', `https://${domain}`);
-			}
+			const args = ['http', String(port), '--log', 'stdout', '--log-format', 'json', '--url', domain ? `https://${domain}` : 'https://'];
 			return {
 				kind: 'run',
 				command: agent,
@@ -460,15 +459,33 @@ export function normalizeNgrokDomain(value: string | undefined): string | undefi
 
 function friendlyNgrokError(detail: string): string {
 	if (/ERR_NGROK_4018|authtoken|authentication failed/i.test(detail)) {
-		return 'ngrok needs your authtoken. Copy it from dashboard.ngrok.com/get-started/your-authtoken and save it below.';
+		return 'ngrok needs a credential. Paste your ngrok API key (or agent authtoken) below.';
 	}
 	if (/ERR_NGROK_334|already online|is already bound/i.test(detail)) {
-		return 'That ngrok domain is already in use by another agent (another computer or a leftover ngrok process). Stop it and retry.';
+		return 'That ngrok address is already in use by another agent (another computer or a leftover ngrok process). Stop it and retry.';
 	}
 	if (/ERR_NGROK_1/i.test(detail) && /domain/i.test(detail)) {
 		return `${detail} Check the domain spelling on dashboard.ngrok.com/domains.`;
 	}
 	return detail;
+}
+
+/** How to put the ngrok agent on PATH for this platform; shown when it is missing. */
+export function ngrokInstallCommands(platform: NodeJS.Platform = process.platform): { label: string; command: string }[] {
+	switch (platform) {
+		case 'win32':
+			return [
+				{ label: 'winget', command: 'winget install ngrok.ngrok' },
+				{ label: 'Chocolatey', command: 'choco install ngrok' },
+			];
+		case 'darwin':
+			return [{ label: 'Homebrew', command: 'brew install ngrok' }];
+		default:
+			return [
+				{ label: 'snap', command: 'sudo snap install ngrok' },
+				{ label: 'apt', command: 'curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null && echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" | sudo tee /etc/apt/sources.list.d/ngrok.list && sudo apt update && sudo apt install ngrok' },
+			];
+	}
 }
 
 export async function findOnPath(executable: string, environment: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): Promise<string | undefined> {

@@ -262,7 +262,12 @@ export interface RemoteAccessStatus {
 	readonly manualUrl?: string;
 	readonly tunnel: RemoteTunnelStatus;
 	/** ngrok settings, minus the authtoken itself. */
-	readonly ngrok: { readonly hasAuthtoken: boolean; readonly domain?: string };
+	readonly ngrok: {
+		readonly hasAuthtoken: boolean;
+		readonly domain?: string;
+		/** Whether the ngrok agent was found on the gateway owner's PATH (and where). */
+		readonly agent: { readonly installed: boolean; readonly path?: string; readonly platform: NodeJS.Platform };
+	};
 }
 
 export interface RemoteAccessUpdateRequest {
@@ -270,8 +275,11 @@ export interface RemoteAccessUpdateRequest {
 	readonly provider?: RemoteTunnelProvider;
 	/** `null` clears the manual address. */
 	readonly manualUrl?: string | null;
-	/** `null` clears a field; omitted fields are kept. */
-	readonly ngrok?: { readonly authtoken?: string | null; readonly domain?: string | null };
+	/**
+	 * `credential` is either an ngrok **API key** (an agent authtoken is minted from it and stored) or an
+	 * agent **authtoken** (stored as is); `null` forgets the stored authtoken. Omitted fields are kept.
+	 */
+	readonly ngrok?: { readonly credential?: string | null; readonly domain?: string | null };
 	/** Re-run the tunnel start (after the user signed in, or to retry an error). */
 	readonly retry?: boolean;
 }

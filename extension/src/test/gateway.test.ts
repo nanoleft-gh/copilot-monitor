@@ -87,7 +87,7 @@ class TestGatewayBackend implements GatewayBackend {
 
 describe('GatewayServer', () => {
 	it('exposes remote access control to authenticated windows only', async () => {
-		let status: RemoteAccessStatus = { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false } };
+		let status: RemoteAccessStatus = { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false, agent: { installed: false, platform: 'linux' } } };
 		const updates: RemoteAccessUpdateRequest[] = [];
 		const server = new GatewayServer(new TestGatewayBackend(), {
 			host: '127.0.0.1', advertisedHost: '127.0.0.1', port: 0, registryId: 'registry-remote', html: '<!doctype html>', readPairingSecret,
@@ -104,12 +104,13 @@ describe('GatewayServer', () => {
 		const baseUrl = `http://127.0.0.1:${address.port}`;
 		try {
 			assert.equal((await fetch(`${baseUrl}/api/remote-access`)).status, 401);
-			assert.deepEqual(await fetch(`${baseUrl}/api/remote-access`, { headers: authorized }).then(response => response.json()), { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false } });
-			const updated = await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }) });
+			assert.deepEqual(await fetch(`${baseUrl}/api/remote-access`, { headers: authorized }).then(response => response.json()), { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false, agent: { installed: false, platform: 'linux' } } });
+			const updated = await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/', provider: 'ngrok', ngrok: { credential: 'key', domain: null } }) });
 			assert.equal(updated.status, 200);
-			assert.deepEqual(updates, [{ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }]);
+			assert.deepEqual(updates, [{ enabled: true, provider: 'ngrok', manualUrl: 'https://pc.tail.ts.net/', ngrok: { credential: 'key', domain: null }, retry: true }]);
 			assert.equal(((await updated.json()) as RemoteAccessStatus).tunnel.status, 'active');
 			assert.equal((await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ manualUrl: 5 }) })).status, 400);
+			assert.equal((await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ provider: 'tor' }) })).status, 400);
 		} finally {
 			await server.stop();
 		}

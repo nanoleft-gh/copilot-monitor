@@ -11,7 +11,9 @@ import { MonitorServer, MonitorServerAddress } from './monitorServer';
 import { MobileViewProvider, mobileViewId, type PairingAddress } from './mobileViewProvider';
 import { MonitorRequestError, type RemoteAccessStatus, type RemoteAccessUpdateRequest, type RemoteTunnelProvider } from './protocol';
 import { readRemoteAccessPreferences, writeRemoteAccessPreferences, type RemoteAccessPreferences } from './remoteAccessStore';
-import { RemoteTunnel, devTunnelDriver, firstExisting, ngrokDriver, normalizeNgrokDomain, readProductInfo, tunnelCliCandidates } from './remoteTunnel';
+import { RemoteTunnel, devTunnelDriver, findOnPath, firstExisting, ngrokDriver, normalizeNgrokDomain, readProductInfo, tunnelCliCandidates } from './remoteTunnel';
+import { resolveNgrokCredential } from './ngrokApi';
+import * as os from 'node:os';
 import { SessionMonitor } from './sessionMonitor';
 import { WindowRegistry } from './windowRegistry';
 
@@ -203,10 +205,14 @@ class MonitorRuntime implements vscode.Disposable {
 				throw new MonitorRequestError(400, 'Enter an http(s) URL without credentials.');
 			}
 			const ngrok = { ...current.ngrok };
-			if (request.ngrok?.authtoken !== undefined) {
-				const token = request.ngrok.authtoken?.trim();
-				if (token) {
-					ngrok.authtoken = token;
+			if (request.ngrok?.credential !== undefined) {
+				const credential = request.ngrok.credential?.trim();
+				if (credential) {
+					const resolved = await resolveNgrokCredential(credential, `Copilot Monitor on ${os.hostname()}`).catch(error => {
+						throw new MonitorRequestError(400, error instanceof Error ? error.message : String(error));
+					});
+					ngrok.authtoken = resolved.authtoken;
+					this.output.appendLine(`ngrok: stored an agent authtoken (${resolved.kind === 'apiKey' ? 'minted from the API key' : 'pasted directly'}).`);
 				} else {
 					delete ngrok.authtoken;
 				}
@@ -245,7 +251,8 @@ class MonitorRuntime implements vscode.Disposable {
 		},
 	};
 
-	private remoteAccessStatus(preferences: RemoteAccessPreferences): RemoteAccessStatus {
+	private async remoteAccessStatus(preferences: RemoteAccessPreferences): Promise<RemoteAccessStatus> {
+		const agentPath = await findOnPath('ngrok');
 		return {
 			enabled: preferences.enabled,
 			provider: preferences.provider,
@@ -254,6 +261,7 @@ class MonitorRuntime implements vscode.Disposable {
 			ngrok: {
 				hasAuthtoken: !!preferences.ngrok?.authtoken,
 				...(preferences.ngrok?.domain ? { domain: preferences.ngrok.domain } : {}),
+				agent: { installed: !!agentPath, ...(agentPath ? { path: agentPath } : {}), platform: process.platform },
 			},
 		};
 	}
@@ -353,7 +361,7 @@ class MonitorRuntime implements vscode.Disposable {
 			enabled: false,
 			provider: 'devtunnel',
 			tunnel: { status: 'error', error: error instanceof Error ? error.message : String(error) },
-			ngrok: { hasAuthtoken: false },
+			ngrok: { hasAuthtoken: false, agent: { installed: false, platform: process.platform } },
 		}));
 		const remoteUrl = remote.tunnel.status === 'active' ? remote.tunnel.url : remote.manualUrl;
 		// Both codes carry every address, so a phone pairs whichever one is reachable at scan time.

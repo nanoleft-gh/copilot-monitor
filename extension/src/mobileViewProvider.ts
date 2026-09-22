@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { GatewayAddress } from './gatewayServer';
 import type { RemoteAccessStatus, RemoteAccessUpdateRequest } from './protocol';
+import { ngrokInstallCommands } from './remoteTunnel';
 
 export const mobileViewId = 'githubCopilotMonitor.mobile';
 
@@ -129,21 +130,32 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (message.command === 'remote:saveNgrok') {
-			const value = (typeof message.value === 'object' && message.value !== null ? message.value : {}) as { authtoken?: unknown; domain?: unknown };
-			const authtoken = typeof value.authtoken === 'string' ? value.authtoken.trim() : '';
+			const value = (typeof message.value === 'object' && message.value !== null ? message.value : {}) as { credential?: unknown; domain?: unknown };
+			const credential = typeof value.credential === 'string' ? value.credential.trim() : '';
 			const domain = typeof value.domain === 'string' ? value.domain.trim() : '';
 			await this.runtime.updateRemoteAccess({
 				provider: 'ngrok',
 				enabled: true,
-				// An empty token field keeps the stored token; "Clear" sends null explicitly.
-				ngrok: { ...(authtoken ? { authtoken } : {}), domain: domain || null },
+				// An empty credential field keeps the stored authtoken; "Forget" sends null explicitly.
+				ngrok: { ...(credential ? { credential } : {}), domain: domain || null },
 				retry: true,
 			});
 			await this.refreshAndFollowUp();
 			return;
 		}
 		if (message.command === 'remote:clearNgrokToken') {
-			await this.runtime.updateRemoteAccess({ ngrok: { authtoken: null } });
+			await this.runtime.updateRemoteAccess({ ngrok: { credential: null } });
+			await this.refresh();
+			return;
+		}
+		if (message.command === 'copyText') {
+			if (typeof message.value === 'string') {
+				await vscode.env.clipboard.writeText(message.value);
+				void vscode.window.showInformationMessage('Copied.');
+			}
+			return;
+		}
+		if (message.command === 'remote:recheck') {
 			await this.refresh();
 			return;
 		}
@@ -334,10 +346,13 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 				document.getElementById('ngrok-form')?.addEventListener('submit', event => {
 					event.preventDefault();
 					vscode.postMessage({ command: 'remote:saveNgrok', value: {
-						authtoken: document.getElementById('ngrok-token').value,
+						credential: document.getElementById('ngrok-credential').value,
 						domain: document.getElementById('ngrok-domain').value,
 					} });
 				});
+				for (const button of document.querySelectorAll('[data-copy]')) {
+					button.addEventListener('click', () => vscode.postMessage({ command: 'copyText', value: button.dataset.copy }));
+				}
 			</script>
 		`;
 		return this.document(webview, body, script, nonce);
@@ -366,21 +381,29 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 					<span class="radio"></span><span class="option-copy"><strong>VS Code dev tunnel</strong><small>Free, nothing to install, GitHub sign-in. Address is stable per computer.</small></span>
 				</button>
 				<button role="radio" aria-checked="${provider === 'ngrok'}" class="option ${provider === 'ngrok' ? 'on' : ''}" data-command="remote:provider:ngrok">
-					<span class="radio"></span><span class="option-copy"><strong>ngrok</strong><small>Needs the ngrok agent installed and your authtoken. Free accounts get one static domain.</small></span>
+					<span class="radio"></span><span class="option-copy"><strong>ngrok</strong><small>Needs the ngrok agent installed and one ngrok secret. Uses your account's stable dev domain.</small></span>
 				</button>
 			</div>`;
-		const ngrokForm = provider === 'ngrok'
-			? `<form id="ngrok-form" class="stack-form">
-				<label>Authtoken <small>${ngrok.hasAuthtoken ? 'saved · leave empty to keep' : 'from dashboard.ngrok.com/get-started/your-authtoken'}</small>
-					<input id="ngrok-token" type="password" autocomplete="off" placeholder="${ngrok.hasAuthtoken ? '•••••••• (saved)' : '2abc…'}" spellcheck="false">
+		const ngrokForm = provider !== 'ngrok'
+			? ''
+			: !ngrok.agent.installed
+				? `<div class="notice">
+					<strong>ngrok agent not found</strong><br>Install it, then press <em>Check again</em> (restart VS Code if it is still not found, so the new PATH is picked up).
+					${ngrokInstallCommands(ngrok.agent.platform).map(({ label, command }) => `
+						<div class="cmd"><span class="cmd-label">${escapeHtml(label)}</span><code class="inline">${escapeHtml(command)}</code><button type="button" class="mini" data-copy="${escapeHtml(command)}">Copy</button></div>`).join('')}
+					<div class="row"><button type="button" data-command="remote:recheck">Check again</button><button type="button" data-command="remote:provider:devtunnel">Use dev tunnel instead</button></div>
+			</div>`
+				: `<form id="ngrok-form" class="stack-form">
+				<p class="tight ok"><span class="dot"></span>ngrok agent found: <code class="inline">${escapeHtml(ngrok.agent.path ?? 'ngrok')}</code></p>
+				<label>ngrok API key or authtoken <small>${ngrok.hasAuthtoken ? 'a credential is saved · leave empty to keep it' : 'one secret is enough'}</small>
+					<input id="ngrok-credential" type="password" autocomplete="off" placeholder="${ngrok.hasAuthtoken ? '•••••••• (saved)' : '2abc…_xyz'}" spellcheck="false">
 				</label>
-				<label>Static domain <small>optional · claim one free at dashboard.ngrok.com/domains so the address never changes</small>
+				<p class="tight">ngrok has two look-alike secrets. An <strong>API key</strong> (dashboard → <em>API Keys</em>) lets this extension mint its own agent authtoken; an agent <strong>authtoken</strong> (dashboard → <em>Your Authtoken</em>) is used as is. Either works here; the extension tells them apart. Only the resulting authtoken is stored.</p>
+				<label>Reserved domain <small>optional · leave empty to use your account's stable dev domain</small>
 					<input id="ngrok-domain" type="text" autocomplete="off" placeholder="example.ngrok-free.app" value="${escapeHtml(ngrok.domain ?? '')}" spellcheck="false">
 				</label>
-				<div class="row"><button type="submit" class="primary">Save and connect</button>${ngrok.hasAuthtoken ? '<button type="button" data-command="remote:clearNgrokToken">Forget token</button>' : ''}</div>
-				<p class="tight">Without a domain ngrok assigns a new random address each start; paired phones still learn it, but only while at home.</p>
-			</form>`
-			: '';
+				<div class="row"><button type="submit" class="primary">Save and connect</button>${ngrok.hasAuthtoken ? '<button type="button" data-command="remote:clearNgrokToken">Forget credential</button>' : ''}</div>
+			</form>`;
 
 		if (!address.remote.enabled) {
 			const gatewayProblem = tunnel.status === 'error'
@@ -448,7 +471,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			.option{display:flex;width:100%;align-items:flex-start;gap:10px;margin-bottom:6px;padding:8px 10px;text-align:left;border:1px solid var(--vscode-widget-border);border-radius:4px;background:transparent;color:var(--vscode-foreground)}.option:hover{background:var(--vscode-list-hoverBackground)}.option.on{border-color:var(--vscode-focusBorder);background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
 			.radio{flex:none;width:14px;height:14px;margin-top:2px;border:1.5px solid currentColor;border-radius:50%;position:relative}.option.on .radio::after{content:'';position:absolute;inset:3px;border-radius:50%;background:currentColor}
 			.option-copy{display:grid;gap:2px;min-width:0}.option-copy strong{font-weight:600}.option-copy small{display:block;overflow-wrap:anywhere;font-size:11px;opacity:.8}
-			.stack-form{display:grid;gap:8px;margin:8px 0 12px}.stack-form label{display:grid;gap:4px;font-size:12px}.stack-form label small{color:var(--vscode-descriptionForeground);font-size:11px}.stack-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.stack-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.row{display:flex;gap:8px}.row button{flex:1}
+			.stack-form{display:grid;gap:8px;margin:8px 0 12px}.stack-form label{display:grid;gap:4px;font-size:12px}.stack-form label small{color:var(--vscode-descriptionForeground);font-size:11px}.stack-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.stack-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.row{display:flex;gap:8px;margin-top:6px}.row button{flex:1}
+			.cmd{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:6px;margin:6px 0}.cmd-label{font-size:11px;color:var(--vscode-descriptionForeground)}.cmd code{font-size:11px}button.mini{min-height:24px;padding:0 8px;font-size:11px}
 			code{display:block;overflow-wrap:anywhere;padding:9px;border:1px solid var(--vscode-widget-border);border-radius:4px;background:var(--vscode-textCodeBlock-background);font-size:11px}code.inline{display:inline;padding:1px 4px}
 			.ok{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:var(--vscode-foreground);margin-bottom:8px}.warn{color:var(--vscode-editorWarning-foreground,var(--vscode-foreground))}.tight{margin-bottom:8px}
 			.manual-form{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin:6px 0 10px}.manual-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.manual-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.manual-form button{padding:0 10px}

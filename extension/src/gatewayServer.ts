@@ -229,9 +229,20 @@ export class GatewayServer {
 				if (body.manualUrl !== undefined && body.manualUrl !== null && typeof body.manualUrl !== 'string') {
 					throw new MonitorRequestError(400, 'manualUrl must be a string or null.');
 				}
+				if (body.provider !== undefined && body.provider !== 'devtunnel' && body.provider !== 'ngrok') {
+					throw new MonitorRequestError(400, 'provider must be "devtunnel" or "ngrok".');
+				}
+				const ngrok = body.ngrok && typeof body.ngrok === 'object'
+					? {
+						...(body.ngrok.credential !== undefined ? { credential: body.ngrok.credential === null ? null : String(body.ngrok.credential) } : {}),
+						...(body.ngrok.domain !== undefined ? { domain: body.ngrok.domain === null ? null : String(body.ngrok.domain) } : {}),
+					}
+					: undefined;
 				this.sendJson(response, 200, await this.options.remoteAccess.update({
 					...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+					...(body.provider ? { provider: body.provider } : {}),
 					...(body.manualUrl !== undefined ? { manualUrl: body.manualUrl } : {}),
+					...(ngrok && Object.keys(ngrok).length > 0 ? { ngrok } : {}),
 					...(body.retry === true ? { retry: true } : {}),
 				}));
 				return;
