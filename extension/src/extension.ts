@@ -9,9 +9,9 @@ import { getOrCreateHostIdentity, getOrCreatePairingSecret, getSharedStateDirect
 import { findLanAddress, findLanAddresses } from './lanAddress';
 import { MonitorServer, MonitorServerAddress } from './monitorServer';
 import { MobileViewProvider, mobileViewId, type PairingAddress } from './mobileViewProvider';
-import { MonitorRequestError, type RemoteAccessStatus, type RemoteAccessUpdateRequest } from './protocol';
+import { MonitorRequestError, type RemoteAccessStatus, type RemoteAccessUpdateRequest, type RemoteTunnelProvider } from './protocol';
 import { readRemoteAccessPreferences, writeRemoteAccessPreferences, type RemoteAccessPreferences } from './remoteAccessStore';
-import { RemoteTunnel, readProductInfo, resolveTunnelCli, tunnelCliCandidates } from './remoteTunnel';
+import { RemoteTunnel, devTunnelDriver, firstExisting, ngrokDriver, normalizeNgrokDomain, readProductInfo, tunnelCliCandidates } from './remoteTunnel';
 import { SessionMonitor } from './sessionMonitor';
 import { WindowRegistry } from './windowRegistry';
 
@@ -53,31 +53,50 @@ class MonitorRuntime implements vscode.Disposable {
 	private address: GatewayAddress | undefined;
 	private pairingSecret: string | undefined;
 	private startPromise: Promise<GatewayAddress> | undefined;
-	private readonly tunnel: RemoteTunnel;
+	private readonly tunnels: Record<RemoteTunnelProvider, RemoteTunnel>;
 	/** Last preferences this window read or wrote; refreshed from disk when the tunnel is (re)synced. */
-	private remotePreferences: RemoteAccessPreferences = { version: 1, enabled: false };
+	private remotePreferences: RemoteAccessPreferences = { version: 1, enabled: false, provider: 'devtunnel' };
 	readonly onDidChangeAddress = this.addressChanged.event;
 
 	get running(): boolean {
 		return this.gateway !== undefined || this.startPromise !== undefined;
 	}
 
+	/** The tunnel for the currently selected provider. */
+	private get tunnel(): RemoteTunnel {
+		return this.tunnels[this.remotePreferences.provider];
+	}
+
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.statusBar.command = 'githubCopilotMonitor.open';
 		this.statusBar.text = '$(radio-tower) Copilot Monitor';
 		this.statusBar.tooltip = 'Open the Copilot Monitor dashboard';
-		this.tunnel = new RemoteTunnel({
-			resolveCommand: async () => {
-				const product = await readProductInfo(vscode.env.appRoot);
-				return resolveTunnelCli(tunnelCliCandidates(vscode.env.appRoot, product.quality, product.commit));
-			},
-			getAccessToken: async interactive => {
-				const session = await vscode.authentication.getSession('github', githubScopes, interactive ? { createIfNone: true } : { silent: true });
-				return session?.accessToken;
-			},
-			log: message => this.output.appendLine(message),
-		});
-		context.subscriptions.push(this.tunnel.onDidChangeState(() => this.addressChanged.fire()));
+		const log = (message: string) => this.output.appendLine(message);
+		this.tunnels = {
+			devtunnel: new RemoteTunnel({
+				log,
+				driver: devTunnelDriver({
+					resolveCli: async () => {
+						const product = await readProductInfo(vscode.env.appRoot);
+						return firstExisting(tunnelCliCandidates(vscode.env.appRoot, product.quality, product.commit));
+					},
+					getAccessToken: async interactive => {
+						const session = await vscode.authentication.getSession('github', githubScopes, interactive ? { createIfNone: true } : { silent: true });
+						return session?.accessToken;
+					},
+				}),
+			}),
+			ngrok: new RemoteTunnel({
+				log,
+				driver: ngrokDriver({ getSettings: async () => (await this.loadRemotePreferences()).ngrok ?? {} }),
+			}),
+		};
+		for (const tunnel of Object.values(this.tunnels)) {
+			context.subscriptions.push(tunnel.onDidChangeState(() => {
+				this.gateway?.notifyEndpointsChanged();
+				this.addressChanged.fire();
+			}));
+		}
 		context.subscriptions.push(vscode.authentication.onDidChangeSessions(event => {
 			if (event.provider.id === 'github' && this.tunnel.state.status === 'signin-required') {
 				void this.syncRemoteTunnel();
@@ -126,7 +145,7 @@ class MonitorRuntime implements vscode.Disposable {
 		this.monitor?.dispose();
 		this.monitor = undefined;
 		await gateway?.stop();
-		await this.tunnel.stop();
+		await this.stopAllTunnels();
 		this.output.appendLine('Dashboard stopped.');
 		this.addressChanged.fire();
 		if (notify) {
@@ -183,17 +202,44 @@ class MonitorRuntime implements vscode.Disposable {
 			if (request.manualUrl && !manualUrl) {
 				throw new MonitorRequestError(400, 'Enter an http(s) URL without credentials.');
 			}
+			const ngrok = { ...current.ngrok };
+			if (request.ngrok?.authtoken !== undefined) {
+				const token = request.ngrok.authtoken?.trim();
+				if (token) {
+					ngrok.authtoken = token;
+				} else {
+					delete ngrok.authtoken;
+				}
+			}
+			if (request.ngrok?.domain !== undefined) {
+				const domain = normalizeNgrokDomain(request.ngrok.domain ?? undefined);
+				if (request.ngrok.domain?.trim() && !domain) {
+					throw new MonitorRequestError(400, 'Enter the ngrok domain like example.ngrok-free.app.');
+				}
+				if (domain) {
+					ngrok.domain = domain;
+				} else {
+					delete ngrok.domain;
+				}
+			}
 			const next: RemoteAccessPreferences = {
 				version: 1,
 				enabled: request.enabled ?? current.enabled,
+				provider: request.provider ?? current.provider,
 				...(manualUrl ? { manualUrl } : {}),
+				...(Object.keys(ngrok).length > 0 ? { ngrok } : {}),
 			};
 			await writeRemoteAccessPreferences(getSharedStateDirectory(), next);
+			const providerChanged = next.provider !== current.provider;
+			const ngrokChanged = JSON.stringify(next.ngrok ?? {}) !== JSON.stringify(current.ngrok ?? {});
 			this.remotePreferences = next;
-			if (request.retry && next.enabled) {
+			if (providerChanged) {
+				await this.stopAllTunnels();
+			} else if (next.enabled && (request.retry || (next.provider === 'ngrok' && ngrokChanged))) {
 				await this.tunnel.stop();
 			}
 			await this.syncRemoteTunnel();
+			this.gateway?.notifyEndpointsChanged();
 			this.addressChanged.fire();
 			return this.remoteAccessStatus(next);
 		},
@@ -202,8 +248,13 @@ class MonitorRuntime implements vscode.Disposable {
 	private remoteAccessStatus(preferences: RemoteAccessPreferences): RemoteAccessStatus {
 		return {
 			enabled: preferences.enabled,
+			provider: preferences.provider,
 			...(preferences.manualUrl ? { manualUrl: preferences.manualUrl } : {}),
-			tunnel: this.tunnel.state,
+			tunnel: this.tunnels[preferences.provider].state,
+			ngrok: {
+				hasAuthtoken: !!preferences.ngrok?.authtoken,
+				...(preferences.ngrok?.domain ? { domain: preferences.ngrok.domain } : {}),
+			},
 		};
 	}
 
@@ -212,17 +263,26 @@ class MonitorRuntime implements vscode.Disposable {
 		return this.remotePreferences;
 	}
 
+	private async stopAllTunnels(): Promise<void> {
+		await Promise.all(Object.values(this.tunnels).map(tunnel => tunnel.stop()));
+	}
+
 	/** Only the gateway owner runs the tunnel; called on start, leadership change, and preference change. */
 	private async syncRemoteTunnel(): Promise<void> {
 		const port = this.address?.port;
 		if (this.gateway?.isLeader && port) {
 			const preferences = await this.loadRemotePreferences();
 			if (preferences.enabled) {
-				await this.tunnel.start(port, false);
+				for (const [provider, tunnel] of Object.entries(this.tunnels) as [RemoteTunnelProvider, RemoteTunnel][]) {
+					if (provider !== preferences.provider) {
+						await tunnel.stop();
+					}
+				}
+				await this.tunnels[preferences.provider].start(port, false);
 				return;
 			}
 		}
-		await this.tunnel.stop();
+		await this.stopAllTunnels();
 	}
 
 	private async gatewayRequest<T>(port: number, method: 'GET' | 'POST', body?: unknown): Promise<T> {
@@ -291,7 +351,9 @@ class MonitorRuntime implements vscode.Disposable {
 		const secret = this.pairingSecret ?? await getOrCreatePairingSecret(getSharedStateDirectory());
 		const remote = await this.getRemoteAccess().catch((error: unknown): RemoteAccessStatus => ({
 			enabled: false,
+			provider: 'devtunnel',
 			tunnel: { status: 'error', error: error instanceof Error ? error.message : String(error) },
+			ngrok: { hasAuthtoken: false },
 		}));
 		const remoteUrl = remote.tunnel.status === 'active' ? remote.tunnel.url : remote.manualUrl;
 		// Both codes carry every address, so a phone pairs whichever one is reachable at scan time.
@@ -310,7 +372,9 @@ class MonitorRuntime implements vscode.Disposable {
 
 	dispose(): void {
 		void this.stop(false);
-		this.tunnel.dispose();
+		for (const tunnel of Object.values(this.tunnels)) {
+			tunnel.dispose();
+		}
 		this.addressChanged.dispose();
 		this.statusBar.dispose();
 		this.output.dispose();

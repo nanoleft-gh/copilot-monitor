@@ -41,7 +41,11 @@ export function parsePairingCode(value: string): { endpoint: string; secret?: st
 }
 
 export function authHeaders(host: Pick<HostProfile, 'secret'>): Record<string, string> {
-  return host.secret ? { Authorization: `Bearer ${host.secret}` } : {};
+  return {
+    // ngrok's free tier shows an interstitial to browser-like clients unless this header is present.
+    'ngrok-skip-browser-warning': '1',
+    ...(host.secret ? { Authorization: `Bearer ${host.secret}` } : {}),
+  };
 }
 
 /**

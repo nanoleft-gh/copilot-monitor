@@ -40,9 +40,9 @@ describe('endpoint helpers', () => {
     assert.equal(isLocalEndpoint('http://100.101.102.103:43121/'), false);
   });
 
-  it('builds a bearer header only when a secret is known', () => {
-    assert.deepEqual(authHeaders({ secret: 'abc' }), { Authorization: 'Bearer abc' });
-    assert.deepEqual(authHeaders({}), {});
+  it('builds a bearer header only when a secret is known, always skipping ngrok\'s interstitial', () => {
+    assert.deepEqual(authHeaders({ secret: 'abc' }), { 'ngrok-skip-browser-warning': '1', Authorization: 'Bearer abc' });
+    assert.deepEqual(authHeaders({}), { 'ngrok-skip-browser-warning': '1' });
   });
 });
 

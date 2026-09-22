@@ -87,7 +87,7 @@ class TestGatewayBackend implements GatewayBackend {
 
 describe('GatewayServer', () => {
 	it('exposes remote access control to authenticated windows only', async () => {
-		let status: RemoteAccessStatus = { enabled: false, tunnel: { status: 'inactive' } };
+		let status: RemoteAccessStatus = { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false } };
 		const updates: RemoteAccessUpdateRequest[] = [];
 		const server = new GatewayServer(new TestGatewayBackend(), {
 			host: '127.0.0.1', advertisedHost: '127.0.0.1', port: 0, registryId: 'registry-remote', html: '<!doctype html>', readPairingSecret,
@@ -95,7 +95,7 @@ describe('GatewayServer', () => {
 				get: async () => status,
 				update: async request => {
 					updates.push(request);
-					status = { enabled: request.enabled ?? status.enabled, ...(request.manualUrl ? { manualUrl: request.manualUrl } : {}), tunnel: { status: 'active', url: 'https://abc-43121.inc1.devtunnels.ms/' } };
+					status = { ...status, enabled: request.enabled ?? status.enabled, ...(request.manualUrl ? { manualUrl: request.manualUrl } : {}), tunnel: { status: 'active', url: 'https://abc-43121.inc1.devtunnels.ms/' } };
 					return status;
 				},
 			},
@@ -104,7 +104,7 @@ describe('GatewayServer', () => {
 		const baseUrl = `http://127.0.0.1:${address.port}`;
 		try {
 			assert.equal((await fetch(`${baseUrl}/api/remote-access`)).status, 401);
-			assert.deepEqual(await fetch(`${baseUrl}/api/remote-access`, { headers: authorized }).then(response => response.json()), { enabled: false, tunnel: { status: 'inactive' } });
+			assert.deepEqual(await fetch(`${baseUrl}/api/remote-access`, { headers: authorized }).then(response => response.json()), { enabled: false, provider: 'devtunnel', tunnel: { status: 'inactive' }, ngrok: { hasAuthtoken: false } });
 			const updated = await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }) });
 			assert.equal(updated.status, 200);
 			assert.deepEqual(updates, [{ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }]);
@@ -189,7 +189,7 @@ describe('GatewayServer', () => {
 			});
 			const page = await fetch(`${baseUrl}/`);
 			assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' 'unsafe-inline'/);
-			assert.deepEqual(await fetch(`${baseUrl}/api/state`, { headers: authorized }).then(response => response.json()), emptyState);
+			assert.deepEqual(await fetch(`${baseUrl}/api/state`, { headers: authorized }).then(response => response.json()), { ...emptyState, endpoints: [] });
 			const mermaid = await fetch(`${baseUrl}/assets/mermaid.min.js`);
 			assert.equal(mermaid.status, 200);
 			assert.match(mermaid.headers.get('content-type') ?? '', /text\/javascript/);

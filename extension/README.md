@@ -107,6 +107,10 @@ To reach the computer when the phone is not on your Wi-Fi, without any paid serv
 
 Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL. Remote access is a machine-wide choice stored next to the pairing secret, not a VS Code setting; any window can change it and the window that owns the gateway runs the tunnel.
 
+**ngrok instead of dev tunnels:** choose *ngrok* under Tunnel service, paste the authtoken from your ngrok dashboard and, ideally, the one free static domain every ngrok account can claim (dashboard.ngrok.com/domains). The extension runs the installed `ngrok` agent pinned to that domain, so the address is permanent. Browsers opening an ngrok free-tier address see ngrok's interstitial page once; the app skips it automatically.
+
+Paired phones learn every address change live: the gateway streams its address list, so a remote address added later reaches a phone that is connected at home, and a changed home IP reaches a phone connected through the tunnel.
+
 ## Settings
 
 - `githubCopilotMonitor.autoStart`: register each VS Code window with the shared gateway after startup. Default: `true`.

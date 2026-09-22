@@ -44,12 +44,23 @@ export function refreshHostEndpoints(host: HostProfile): void {
   void fetchGatewayHealth(host.endpoint, host.secret, localProbeTimeoutMs)
     .then(health => {
       if (health.hostId !== host.id) return;
-      const endpoints = mergeEndpoints([host.endpoint], health.endpoints, host.endpoints);
-      if (endpoints.join('\n') !== (host.endpoints ?? []).join('\n')) {
-        return adopt(host, host.endpoint, health);
-      }
+      learnEndpoints(host, health.endpoints);
     })
     .catch(() => undefined);
+}
+
+/**
+ * Adopts the address list the gateway just streamed (it is authoritative about what exists now),
+ * keeping the current connection's address first. Persists only when something changed, so
+ * calling this on every snapshot is cheap.
+ */
+export function learnEndpoints(host: HostProfile, advertised: readonly string[]): void {
+  if (advertised.length === 0) return;
+  const endpoints = mergeEndpoints([host.endpoint], advertised);
+  if (endpoints.join('\n') === (host.endpoints ?? []).join('\n')) return;
+  const updated: HostProfile = { ...host, endpoints, lastConnected: Date.now() };
+  Object.assign(host, updated);
+  void replaceHost(host.id, updated).catch(() => undefined);
 }
 
 async function adopt(host: HostProfile, endpoint: string, health: GatewayHealth): Promise<HostProfile> {

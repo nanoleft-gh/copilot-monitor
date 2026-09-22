@@ -13,7 +13,7 @@ import type {
   WindowSnapshot,
 } from './types';
 import { authHeaders } from './pairing';
-import { locateHost, refreshHostEndpoints } from './host-locator';
+import { locateHost, learnEndpoints, refreshHostEndpoints } from './host-locator';
 
 const requestTimeoutMs = 10_000;
 
@@ -29,7 +29,6 @@ export async function fetchGatewaySnapshot(host: HostProfile): Promise<GatewaySn
   let value: unknown;
   try {
     value = await requestJson(host, '/api/state');
-    refreshHostEndpoints(host);
   } catch (error) {
     if (error instanceof GatewayHttpError) throw error;
     // Network-level failure: the computer may have moved (new IP, different network, tunnel only).
@@ -39,7 +38,13 @@ export async function fetchGatewaySnapshot(host: HostProfile): Promise<GatewaySn
   if (!isRecord(value) || value.version !== 2 || !Array.isArray(value.windows)) {
     throw new Error('The computer returned an unsupported monitor state.');
   }
-  return parseGatewaySnapshot(value);
+  const snapshot = parseGatewaySnapshot(value);
+  if (snapshot.endpoints) {
+    learnEndpoints(host, snapshot.endpoints);
+  } else {
+    refreshHostEndpoints(host);
+  }
+  return snapshot;
 }
 
 export function parseGatewaySnapshot(value: unknown): GatewaySnapshot {
@@ -50,6 +55,9 @@ export function parseGatewaySnapshot(value: unknown): GatewaySnapshot {
     version: 2,
     gatewayStartedAt: numberValue(value.gatewayStartedAt),
     windows: value.windows.flatMap(parseWindow),
+    ...(Array.isArray(value.endpoints)
+      ? { endpoints: value.endpoints.filter((endpoint): endpoint is string => typeof endpoint === 'string') }
+      : {}),
   };
 }
 

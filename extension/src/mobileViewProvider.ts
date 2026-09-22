@@ -123,6 +123,30 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			await this.refresh();
 			return;
 		}
+		if (message.command === 'remote:provider:devtunnel' || message.command === 'remote:provider:ngrok') {
+			await this.runtime.updateRemoteAccess({ provider: message.command.endsWith('ngrok') ? 'ngrok' : 'devtunnel' });
+			await this.refreshAndFollowUp();
+			return;
+		}
+		if (message.command === 'remote:saveNgrok') {
+			const value = (typeof message.value === 'object' && message.value !== null ? message.value : {}) as { authtoken?: unknown; domain?: unknown };
+			const authtoken = typeof value.authtoken === 'string' ? value.authtoken.trim() : '';
+			const domain = typeof value.domain === 'string' ? value.domain.trim() : '';
+			await this.runtime.updateRemoteAccess({
+				provider: 'ngrok',
+				enabled: true,
+				// An empty token field keeps the stored token; "Clear" sends null explicitly.
+				ngrok: { ...(authtoken ? { authtoken } : {}), domain: domain || null },
+				retry: true,
+			});
+			await this.refreshAndFollowUp();
+			return;
+		}
+		if (message.command === 'remote:clearNgrokToken') {
+			await this.runtime.updateRemoteAccess({ ngrok: { authtoken: null } });
+			await this.refresh();
+			return;
+		}
 		if (message.command === 'reset') {
 			await this.runtime.resetPairing();
 			return;
@@ -251,9 +275,15 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		const qrContent = showRemote ? address.remotePairingUrl! : address.pairingUrl;
 		const shownUrl = showRemote ? address.remoteUrl! : address.url;
 		const targetPicker = remoteAvailable
-			? `<div class="segmented" role="radiogroup" aria-label="Address the code opens">
-				<button role="radio" aria-checked="${showRemote ? 'false' : 'true'}" class="${showRemote ? '' : 'on'}" data-command="qr:local">Home Wi-Fi</button>
-				<button role="radio" aria-checked="${showRemote ? 'true' : 'false'}" class="${showRemote ? 'on' : ''}" data-command="qr:remote">Anywhere</button>
+			? `<div class="choice" role="radiogroup" aria-label="Which address the code opens first">
+				<div class="choice-label">Code opens first via</div>
+				<button role="radio" aria-checked="${showRemote ? 'false' : 'true'}" class="option ${showRemote ? '' : 'on'}" data-command="qr:local">
+					<span class="radio"></span><span class="option-copy"><strong>Home Wi-Fi</strong><small>${escapeHtml(address.url)}</small></span>
+				</button>
+				<button role="radio" aria-checked="${showRemote ? 'true' : 'false'}" class="option ${showRemote ? 'on' : ''}" data-command="qr:remote">
+					<span class="radio"></span><span class="option-copy"><strong>Anywhere</strong><small>${escapeHtml(address.remoteUrl!)}</small></span>
+				</button>
+				<div class="choice-note">One code carries both addresses; the app uses whichever answers. This only decides what a phone camera opens.</div>
 			</div>`
 			: '';
 		const hint = showRemote
@@ -265,9 +295,9 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			<div class="eyebrow"><span class="dot"></span>Shared gateway online</div>
 			<h2>Open on your phone</h2>
 			<p>${hint}</p>
-			${targetPicker}
 			<div id="qr" class="qr" aria-label="Pairing code for ${escapeHtml(shownUrl)}"></div>
 			<code>${escapeHtml(shownUrl)}</code>
+			${targetPicker}
 			<div class="actions">
 				<button class="primary" data-command="open">Open dashboard</button>
 				<button data-command="copy">Copy pairing link</button>
@@ -301,6 +331,13 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 					details.hidden = !details.hidden;
 					if (!details.hidden) document.getElementById('manual-url').focus();
 				});
+				document.getElementById('ngrok-form')?.addEventListener('submit', event => {
+					event.preventDefault();
+					vscode.postMessage({ command: 'remote:saveNgrok', value: {
+						authtoken: document.getElementById('ngrok-token').value,
+						domain: document.getElementById('ngrok-domain').value,
+					} });
+				});
 			</script>
 		`;
 		return this.document(webview, body, script, nonce);
@@ -320,6 +357,30 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 				${manual ? `<p class="tight ok"><span class="dot"></span>Phones also try <code class="inline">${escapeHtml(manual)}</code>.</p>` : ''}
 			</div>`;
 		const manualToggle = manual ? '' : '<button class="link" id="manual-toggle">Use my own address instead</button>';
+		const provider = address.remote.provider;
+		const ngrok = address.remote.ngrok;
+		const providerPicker = `
+			<div class="choice" role="radiogroup" aria-label="Tunnel service">
+				<div class="choice-label">Tunnel service</div>
+				<button role="radio" aria-checked="${provider === 'devtunnel'}" class="option ${provider === 'devtunnel' ? 'on' : ''}" data-command="remote:provider:devtunnel">
+					<span class="radio"></span><span class="option-copy"><strong>VS Code dev tunnel</strong><small>Free, nothing to install, GitHub sign-in. Address is stable per computer.</small></span>
+				</button>
+				<button role="radio" aria-checked="${provider === 'ngrok'}" class="option ${provider === 'ngrok' ? 'on' : ''}" data-command="remote:provider:ngrok">
+					<span class="radio"></span><span class="option-copy"><strong>ngrok</strong><small>Needs the ngrok agent installed and your authtoken. Free accounts get one static domain.</small></span>
+				</button>
+			</div>`;
+		const ngrokForm = provider === 'ngrok'
+			? `<form id="ngrok-form" class="stack-form">
+				<label>Authtoken <small>${ngrok.hasAuthtoken ? 'saved · leave empty to keep' : 'from dashboard.ngrok.com/get-started/your-authtoken'}</small>
+					<input id="ngrok-token" type="password" autocomplete="off" placeholder="${ngrok.hasAuthtoken ? '•••••••• (saved)' : '2abc…'}" spellcheck="false">
+				</label>
+				<label>Static domain <small>optional · claim one free at dashboard.ngrok.com/domains so the address never changes</small>
+					<input id="ngrok-domain" type="text" autocomplete="off" placeholder="example.ngrok-free.app" value="${escapeHtml(ngrok.domain ?? '')}" spellcheck="false">
+				</label>
+				<div class="row"><button type="submit" class="primary">Save and connect</button>${ngrok.hasAuthtoken ? '<button type="button" data-command="remote:clearNgrokToken">Forget token</button>' : ''}</div>
+				<p class="tight">Without a domain ngrok assigns a new random address each start; paired phones still learn it, but only while at home.</p>
+			</form>`
+			: '';
 
 		if (!address.remote.enabled) {
 			const gatewayProblem = tunnel.status === 'error'
@@ -327,7 +388,9 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 				: '';
 			return `
 				${gatewayProblem}
-				<p>Turn this on to reach the computer when the phone is not on your Wi-Fi. The gateway port is forwarded through a free Microsoft dev tunnel (the same service behind VS Code's Ports view) using your GitHub account; paired phones pick the address up on their own. Requests still need the pairing secret.</p>
+				<p>Turn this on to reach the computer when the phone is not on your Wi-Fi. The gateway port is forwarded through a tunnel and paired phones pick the address up on their own. Requests still need the pairing secret.</p>
+				${providerPicker}
+				${ngrokForm}
 				<div class="actions"><button class="primary" data-command="remote:enable">Turn on remote access</button></div>
 				<p class="tight">${manualToggle}</p>
 				${manualBlock}`;
@@ -337,13 +400,13 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		switch (tunnel.status) {
 			case 'active':
 				status = `
-					<p class="ok"><span class="dot"></span>Reachable from anywhere</p>
+					<p class="ok"><span class="dot"></span>Reachable from anywhere via ${provider === 'ngrok' ? 'ngrok' : 'dev tunnel'}</p>
 					<code>${escapeHtml(tunnel.url)}</code>
-					<p class="tight">Paired phones learn this address automatically and use it whenever your Wi-Fi is out of reach. Nothing to type on the phone.</p>
+					<p class="tight">Paired phones learn this address automatically, even while connected at home, and use it whenever your Wi-Fi is out of reach.</p>
 					<div class="actions"><button data-command="remote:copy">Copy remote address</button></div>`;
 				break;
 			case 'starting':
-				status = `<p class="status"><span class="spinner"></span>Starting the dev tunnel…</p>`;
+				status = `<p class="status"><span class="spinner"></span>Starting the ${provider === 'ngrok' ? 'ngrok agent' : 'dev tunnel'}…</p>`;
 				break;
 			case 'signin-required':
 				status = `
@@ -366,6 +429,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		}
 		return `
 			${status}
+			${providerPicker}
+			${ngrokForm}
 			<p class="tight"><button class="link" data-command="remote:disable">Turn off remote access</button>${manualToggle ? ` · ${manualToggle}` : ''}</p>
 			${manualBlock}`;
 	}
@@ -379,7 +444,11 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			.eyebrow{display:flex;align-items:center;gap:7px;color:var(--vscode-descriptionForeground);font-size:11px;text-transform:uppercase}.dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
 			h2{margin:10px 0 6px;font-size:18px;letter-spacing:0}h3{margin:22px 0 6px;font-size:13px;text-transform:uppercase;color:var(--vscode-descriptionForeground)}p{margin:0 0 16px;color:var(--vscode-descriptionForeground)}
 			.qr{width:min(224px,100%);aspect-ratio:1;margin:0 auto 14px;padding:8px;border-radius:6px;background:#fff}.qr svg{display:block;width:100%;height:100%}
-			.segmented{display:grid;grid-template-columns:1fr 1fr;margin:0 auto 12px;width:min(224px,100%);border:1px solid var(--vscode-widget-border);border-radius:4px;overflow:hidden}.segmented button{min-height:28px;border:0;border-radius:0;background:transparent;color:var(--vscode-descriptionForeground)}.segmented button.on{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.segmented button:hover:not(.on){background:var(--vscode-toolbar-hoverBackground)}
+			.choice{margin:12px 0 4px}.choice-label{margin-bottom:6px;color:var(--vscode-descriptionForeground);font-size:11px;text-transform:uppercase}.choice-note{margin-top:6px;color:var(--vscode-descriptionForeground);font-size:11px}
+			.option{display:flex;width:100%;align-items:flex-start;gap:10px;margin-bottom:6px;padding:8px 10px;text-align:left;border:1px solid var(--vscode-widget-border);border-radius:4px;background:transparent;color:var(--vscode-foreground)}.option:hover{background:var(--vscode-list-hoverBackground)}.option.on{border-color:var(--vscode-focusBorder);background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+			.radio{flex:none;width:14px;height:14px;margin-top:2px;border:1.5px solid currentColor;border-radius:50%;position:relative}.option.on .radio::after{content:'';position:absolute;inset:3px;border-radius:50%;background:currentColor}
+			.option-copy{display:grid;gap:2px;min-width:0}.option-copy strong{font-weight:600}.option-copy small{display:block;overflow-wrap:anywhere;font-size:11px;opacity:.8}
+			.stack-form{display:grid;gap:8px;margin:8px 0 12px}.stack-form label{display:grid;gap:4px;font-size:12px}.stack-form label small{color:var(--vscode-descriptionForeground);font-size:11px}.stack-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.stack-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.row{display:flex;gap:8px}.row button{flex:1}
 			code{display:block;overflow-wrap:anywhere;padding:9px;border:1px solid var(--vscode-widget-border);border-radius:4px;background:var(--vscode-textCodeBlock-background);font-size:11px}code.inline{display:inline;padding:1px 4px}
 			.ok{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:var(--vscode-foreground);margin-bottom:8px}.warn{color:var(--vscode-editorWarning-foreground,var(--vscode-foreground))}.tight{margin-bottom:8px}
 			.manual-form{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin:6px 0 10px}.manual-form input{min-width:0;min-height:30px;padding:0 8px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border));border-radius:2px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);font:inherit;font-size:12px}.manual-form input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}.manual-form button{padding:0 10px}

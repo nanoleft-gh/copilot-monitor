@@ -28,6 +28,8 @@ import { authCookie, clearedAuthCookie, presentedToken, requestIsHttps, tokensMa
 const maximumRequestBytes = 64 * 1024;
 /** Minimum spacing between re-reads of the secret file triggered by rejected tokens. */
 const secretRefreshIntervalMs = 2_000;
+/** Interface enumeration is cheap but runs on every broadcast; reuse the answer briefly. */
+const endpointsCacheMs = 5_000;
 
 export interface GatewayBackend {
 	getState(): GatewayState;
@@ -84,16 +86,39 @@ export class GatewayServer {
 	private address: GatewayAddress | undefined;
 	private pairingSecret = '';
 	private secretRefreshedAt = 0;
+	private endpointsCache: { at: number; value: readonly string[] } | undefined;
 
 	constructor(
 		private readonly backend: GatewayBackend,
 		private readonly options: GatewayServerOptions,
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
-		this.streams = new StateStreamHub<GatewayState>(() => backend.getState(), {
+		this.streams = new StateStreamHub<GatewayState>(() => this.decorate(backend.getState()), {
 			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
 		});
-		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(state));
+		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(this.decorate(state)));
+	}
+
+	/** Call when a tunnel comes up or goes away so connected clients learn the address at once. */
+	notifyEndpointsChanged(): void {
+		this.endpointsCache = undefined;
+		if (this.address) {
+			this.streams.broadcast(this.decorate(this.backend.getState()));
+		}
+	}
+
+	private currentEndpoints(): readonly string[] {
+		const now = Date.now();
+		if (this.endpointsCache && now - this.endpointsCache.at < endpointsCacheMs) {
+			return this.endpointsCache.value;
+		}
+		const value = this.options.getEndpoints?.(this.address?.port ?? this.options.port) ?? [];
+		this.endpointsCache = { at: now, value };
+		return value;
+	}
+
+	private decorate(state: GatewayState): GatewayState {
+		return { ...state, endpoints: this.currentEndpoints() };
 	}
 
 	async start(): Promise<GatewayAddress> {
@@ -189,7 +214,7 @@ export class GatewayServer {
 				throw new MonitorRequestError(401, 'Not paired with this computer. Scan its pairing code again.');
 			}
 			if (request.method === 'GET' && url.pathname === '/api/state') {
-				this.sendJson(response, 200, this.backend.getState());
+				this.sendJson(response, 200, this.decorate(this.backend.getState()));
 				return;
 			}
 			if (url.pathname === '/api/remote-access' && (request.method === 'GET' || request.method === 'POST')) {

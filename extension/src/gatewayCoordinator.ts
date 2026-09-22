@@ -101,6 +101,11 @@ export class GatewayCoordinator {
 		return { dispose: () => this.addressListeners.delete(listener) };
 	}
 
+	/** Owner only: push the current endpoint list to streaming clients. */
+	notifyEndpointsChanged(): void {
+		this.ownedServer?.notifyEndpointsChanged();
+	}
+
 	private async ensureGateway(required: boolean): Promise<void> {
 		if (this.stopped) {
 			return;

@@ -2,6 +2,7 @@ import * as Network from 'expo-network';
 import { AppState, type AppStateStatus } from 'react-native';
 import type { GatewaySnapshot, HostProfile } from './types';
 import { fetchGatewaySnapshot, GatewayHttpError, parseGatewaySnapshot } from './gateway-client';
+import { learnEndpoints } from './host-locator';
 import { authHeaders } from './pairing';
 import { applyPatch, isPatch } from './state-delta';
 
@@ -141,6 +142,7 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
         }
         const snapshot = parseGatewaySnapshot(eventName === 'state' ? payload : base);
         failures = 0;
+        if (snapshot.endpoints) learnEndpoints(host, snapshot.endpoints);
         handlers.onStatus?.('live');
         handlers.onSnapshot(snapshot);
       } catch {

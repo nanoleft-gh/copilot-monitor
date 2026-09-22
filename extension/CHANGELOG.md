@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.4]
+
+- Paired phones now learn address changes **while connected**: the gateway streams its current address list (`endpoints`) in the state snapshot and pushes an update the moment a tunnel comes up or goes away, so a phone paired at home picks up a remote address added later without re-scanning, and a phone on the tunnel learns a changed home IP the same way.
+- **ngrok** as an alternative tunnel service. Pick it under Remote access, paste your authtoken (stored 0600 next to the pairing secret, passed to the agent through `NGROK_AUTHTOKEN`, never on the command line) and optionally the free static domain from dashboard.ngrok.com/domains; the extension runs the installed `ngrok` agent with `--url` pinned to that domain so the address never changes. Requires the ngrok agent on PATH; agent errors (missing token, domain in use) are translated into actionable messages. The tunnel manager is now driver-based, with the VS Code dev tunnel as the default driver.
+- Sidebar: the QR-target picker is now a labelled radio list ("Code opens first via: Home Wi-Fi / Anywhere") showing each address, with a note that the app tries both; a matching picker chooses the tunnel service.
+
 ## [1.3.3]
 
 - One pairing code for home and away. The QR / pairing link now carries every address the gateway answers on (all LAN interfaces, the dev tunnel, a manual URL) in its fragment (`#k=<secret>&e=<addresses>`). The app pairs through whichever address answers and remembers all of them; browsers keep opening the code's primary address. A **Home Wi-Fi / Anywhere** switch above the QR picks that primary address (default: home), and the code regenerates whenever an address changes. *Copy pairing link* follows the switch.

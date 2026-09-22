@@ -1,5 +1,10 @@
 # Mobile Changelog
 
+## [0.2.2]
+
+- Learns the computer's addresses from the live stream: every snapshot carries the gateway's current `endpoints`, and changes are persisted immediately, so a remote address added in VS Code (or a changed home IP) is known before it is ever needed.
+- Sends `ngrok-skip-browser-warning` on every request so ngrok free-tier tunnels answer without the interstitial page.
+
 ## [0.2.1]
 
 - Pairing codes may carry the computer's other addresses (`#e=...`). The code's own address is tried first; if it is silent, every alternate is probed in parallel and the first that answers is used, so one code pairs both at home and away. All addresses are stored for reconnection.

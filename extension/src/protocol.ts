@@ -151,6 +151,8 @@ export interface GatewayState {
 	readonly version: 2;
 	readonly gatewayStartedAt: number;
 	readonly windows: readonly GatewayWindowState[];
+	/** Every address this gateway answers on; streamed so connected clients learn new ones without re-pairing. */
+	readonly endpoints?: readonly string[];
 }
 
 export interface GatewaySendMessageRequest extends SendMessageRequest {
@@ -251,17 +253,25 @@ export type RemoteTunnelStatus =
 	| { readonly status: 'active'; readonly url: string }
 	| { readonly status: 'error'; readonly error: string };
 
+export type RemoteTunnelProvider = 'devtunnel' | 'ngrok';
+
 /** Machine-wide remote access state, owned by whichever window runs the shared gateway. */
 export interface RemoteAccessStatus {
 	readonly enabled: boolean;
+	readonly provider: RemoteTunnelProvider;
 	readonly manualUrl?: string;
 	readonly tunnel: RemoteTunnelStatus;
+	/** ngrok settings, minus the authtoken itself. */
+	readonly ngrok: { readonly hasAuthtoken: boolean; readonly domain?: string };
 }
 
 export interface RemoteAccessUpdateRequest {
 	readonly enabled?: boolean;
+	readonly provider?: RemoteTunnelProvider;
 	/** `null` clears the manual address. */
 	readonly manualUrl?: string | null;
+	/** `null` clears a field; omitted fields are kept. */
+	readonly ngrok?: { readonly authtoken?: string | null; readonly domain?: string | null };
 	/** Re-run the tunnel start (after the user signed in, or to retry an error). */
 	readonly retry?: boolean;
 }

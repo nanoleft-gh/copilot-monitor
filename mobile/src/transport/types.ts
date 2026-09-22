@@ -114,6 +114,8 @@ export type GatewaySnapshot = {
   version: 2;
   gatewayStartedAt: number;
   windows: WindowSnapshot[];
+  /** Every address the gateway answers on right now; learned live so no re-pairing is needed. */
+  endpoints?: string[];
 };
 
 export type HistoryPage = {
