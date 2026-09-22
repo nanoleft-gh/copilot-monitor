@@ -3,10 +3,10 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import * as vscode from 'vscode';
-import { createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, releaseChatSession, selectChatModel, sendPrompt, setChatPermissionLevel } from './chatBridge';
+import { createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, hasVoiceSessionBridge, persistLiveChatsNow, readVoiceCurrentSession, releaseChatSession, selectChatModel, sendPrompt, setChatPermissionLevel, startNewLocalChat } from './chatBridge';
 import { LiveExportFileSystem, liveExportScheme } from './liveExportFileSystem';
 import { LiveExportTracker } from './liveExportTracker';
-import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFields, mergeSessionModelState, ModelCatalog, parseCachedLanguageModels, parseSessionModelState, selectedModelValue, withNativeModelState, withSelectedModel } from './modelCatalog';
+import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFields, mergeSessionModelState, ModelCatalog, parseCachedLanguageModels, parseSessionModelState, selectedModelValue, withNativeModelState } from './modelCatalog';
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
@@ -35,7 +35,7 @@ import {
 } from './protocol';
 import { SessionCore } from './sessionCore';
 import { findMatchingSession } from './sessionMatcher';
-import { sessionIdFromResource } from './sessionResource';
+import { localSessionResource as localSessionResourceOf, sessionIdFromResource } from './sessionResource';
 import { isActivePendingTool } from './toolDecision';
 import { normalizeTranscript, TranscriptTurn } from './transcript';
 
@@ -55,6 +55,8 @@ const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
 /** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
 const stallProbeDelayMs = 3_000;
 const maximumProbedToolCalls = 256;
+/** How long a model selection made from the dashboard outranks storage reads that still show the old model. */
+const modelIntentGraceMs = 15_000;
 
 interface ExportSnapshot {
 	readonly resource: string;
@@ -95,6 +97,12 @@ export class SessionMonitor implements vscode.Disposable {
 	private nativeModelOverride: { resource: string; model: NonNullable<ActiveSessionState['model']> } | undefined;
 	/** The chat VS Code itself has focused, as last observed. */
 	private nativeCurrentSessionResource: string | undefined;
+	/** Whether `_chat.voice.*` exists in this window; re-checked whenever viewing starts. */
+	private voiceBridgeAvailable: boolean | undefined;
+	/** A model the dashboard asked VS Code to select, until storage confirms or the grace period ends. */
+	private modelIntent: { resource: string; modelId: string; at: number } | undefined;
+	/** VS Code's stored per-model effort/context choices (`chat.modelConfiguration.panel`). */
+	private storedModelConfigurations: Readonly<Record<string, Readonly<Record<string, string | number | boolean>>>> = {};
 	private catalog: ModelCatalog = emptyModelCatalog;
 	private catalogRaw: string | undefined;
 	/** Sessions this window created on behalf of a viewer; shown even while still empty. */
@@ -197,6 +205,7 @@ export class SessionMonitor implements vscode.Disposable {
 
 	/** First viewer: open on the chat VS Code has focused, then let the core attach. */
 	private async startViewing(count: number): Promise<void> {
+		this.voiceBridgeAvailable = await hasVoiceSessionBridge();
 		if (!this.core.activeSession) {
 			const focused = await this.readNativeCurrentSession();
 			const sessionId = focused ? sessionIdFromResource(focused) : undefined;
@@ -208,17 +217,94 @@ export class SessionMonitor implements vscode.Disposable {
 		this.nativeInputStateSync.start();
 	}
 
+	/**
+	 * The chat VS Code's panel is showing. With the voice bridge this is exact; without it the
+	 * monitor's own last focus action is the best available answer (every command the monitor
+	 * runs focuses its target first, and the session log corrects any drift on its next flush).
+	 */
 	private async readNativeCurrentSession(): Promise<string | undefined> {
-		try {
-			const resource = await vscode.commands.executeCommand<string | undefined>('_chat.voice.getCurrentSession');
-			if (typeof resource === 'string' && resource) {
+		if (this.voiceBridgeAvailable !== false) {
+			const resource = await readVoiceCurrentSession();
+			if (resource) {
 				this.nativeCurrentSessionResource = resource;
 				return resource;
 			}
-		} catch {
-			// Older builds may not expose the command; the core falls back to the newest chat.
+			if (this.voiceBridgeAvailable) {
+				return undefined;
+			}
 		}
-		return undefined;
+		return this.nativeCurrentSessionResource ?? (this.core.activeSession ? localSessionResourceOf(this.core.activeSession) : undefined);
+	}
+
+	/**
+	 * Creates a local chat and returns its resource. With the voice bridge the panel reports
+	 * the new session directly. Without it, VS Code offers no query for a chat's identity, so the
+	 * monitor makes VS Code persist its live chats and picks up the session file that appears.
+	 */
+	private async createIdentifiedChat(source: ActiveSessionState | undefined): Promise<vscode.Uri> {
+		this.voiceBridgeAvailable ??= await hasVoiceSessionBridge();
+		const sourceResource = source ? vscode.Uri.parse(source.resource) : undefined;
+		this.log(`new chat: voice bridge ${this.voiceBridgeAvailable ? 'available' : 'unavailable'}`);
+		if (this.voiceBridgeAvailable) {
+			return createNewChat(sourceResource, readVoiceCurrentSession);
+		}
+		const before = await this.listSessionIds();
+		await startNewLocalChat(sourceResource);
+		// The anchor receives a no-op rename; a chat mid-response would queue it instead.
+		const anchor = source?.status !== 'working' ? source : undefined;
+		const fallbackAnchor = anchor ?? this.getSessions().find(session => session.isEmpty !== true && session.status !== 'working');
+		await persistLiveChatsNow(fallbackAnchor ? vscode.Uri.parse(fallbackAnchor.resource) : undefined, fallbackAnchor?.title ?? 'Copilot chat');
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			const created = [...await this.listSessionIds()].filter(id => !before.has(id));
+			if (created.length === 1) {
+				return vscode.Uri.parse(localSessionResourceOf(created[0]));
+			}
+			if (created.length > 1) {
+				// Several files appeared at once (a flush of other live chats); take the newest.
+				const newest = await this.newestSessionId(created);
+				return vscode.Uri.parse(localSessionResourceOf(newest));
+			}
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+		throw new MonitorRequestError(504, 'VS Code created a chat but has not persisted it yet. Try again in a moment.');
+	}
+
+	private async listSessionIds(): Promise<Set<string>> {
+		const ids = new Set<string>();
+		for (const directory of this.sessionDirectories) {
+			let names: string[];
+			try {
+				names = await fs.readdir(directory);
+			} catch {
+				continue;
+			}
+			for (const name of names) {
+				if (name.endsWith('.jsonl')) {
+					ids.add(name.slice(0, -'.jsonl'.length));
+				}
+			}
+		}
+		return ids;
+	}
+
+	private async newestSessionId(ids: readonly string[]): Promise<string> {
+		let newest = ids[0];
+		let newestBirth = -1;
+		for (const id of ids) {
+			for (const directory of this.sessionDirectories) {
+				try {
+					const stat = await fs.stat(path.join(directory, `${id}.jsonl`));
+					if (stat.birthtimeMs > newestBirth) {
+						newestBirth = stat.birthtimeMs;
+						newest = id;
+					}
+				} catch {
+					// Removed between listing and stat.
+				}
+			}
+		}
+		return newest;
 	}
 
 	async sendMessage(request: SendMessageRequest): Promise<SendMessageResult> {
@@ -296,7 +382,9 @@ export class SessionMonitor implements vscode.Disposable {
 		this.exportSnapshot = undefined;
 		await this.core.selectSession(targetSession.sessionId);
 		await focusChatSession(vscode.Uri.parse(sessionResource));
+		this.nativeCurrentSessionResource = sessionResource;
 		this.emit();
+		this.nativeInputStateSync.requestRefresh(0);
 	}
 
 	async loadHistory(request: HistoryPageRequest): Promise<HistoryPageResult> {
@@ -332,7 +420,12 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 		await selectChatModel(vscode.Uri.parse(targetSession.resource), { id: model.id, vendor: model.vendor });
 		this.nativeCurrentSessionResource = targetSession.resource;
-		this.nativeModelOverride = { resource: targetSession.resource, model: withSelectedModel(targetSession.model, model) };
+		this.modelIntent = { resource: targetSession.resource, modelId: model.identifier, at: Date.now() };
+		// VS Code applies its remembered per-model configuration when switching; mirror that now.
+		this.nativeModelOverride = {
+			resource: targetSession.resource,
+			model: withNativeModelState(targetSession.model, model, this.storedModelConfigurations[model.identifier] ?? {}),
+		};
 		this.emit();
 		this.nativeInputStateSync.requestRefresh(0);
 	}
@@ -694,7 +787,8 @@ export class SessionMonitor implements vscode.Disposable {
 				this.nativeStateRetryAttempted = false;
 				let changed = this.updateCatalog(rows.find(row => row.key === cachedLanguageModelsStorageKey)?.value);
 				const snapshot = createNativeChatInputStateSnapshot(rows);
-				const fingerprint = JSON.stringify([resource, this.catalogRaw?.length, snapshot.rawModelId, snapshot.rawConfiguration]);
+				this.storedModelConfigurations = snapshot.configurations;
+				const fingerprint = JSON.stringify([resource, this.catalogRaw?.length, snapshot.rawModelId, snapshot.rawConfiguration, this.modelIntent?.modelId]);
 				if (fingerprint !== this.lastNativeInputFingerprint) {
 					this.lastNativeInputFingerprint = fingerprint;
 					changed = this.updateNativeModelOverride(resource, snapshot.state.modelId, snapshot.state.configuration) || changed;
@@ -735,8 +829,23 @@ export class SessionMonitor implements vscode.Disposable {
 	 * The panel's stored selection describes the chat VS Code has focused. When it cannot be
 	 * resolved (no focused chat, model unknown) the override is dropped rather than kept, so
 	 * the session log's own value shows instead of a selection that is no longer current.
+	 *
+	 * VS Code flushes storage lazily, so right after the dashboard picks a model the stored value
+	 * still names the previous one; a fresh intent outranks such reads until storage agrees.
 	 */
-	private updateNativeModelOverride(resource: string | undefined, modelId: string | undefined, configuration: Readonly<Record<string, string | number | boolean>>): boolean {
+	private updateNativeModelOverride(resource: string | undefined, storedModelId: string | undefined, configuration: Readonly<Record<string, string | number | boolean>>): boolean {
+		let modelId = storedModelId;
+		const intent = this.modelIntent;
+		if (intent) {
+			if (intent.resource !== resource || Date.now() - intent.at > modelIntentGraceMs) {
+				this.modelIntent = undefined;
+			} else if (storedModelId === intent.modelId) {
+				this.modelIntent = undefined;
+			} else {
+				modelId = intent.modelId;
+				configuration = this.storedModelConfigurations[intent.modelId] ?? {};
+			}
+		}
 		const session = resource ? this.core.getState().sessions.find(candidate => candidate.resource === resource) : undefined;
 		const model = modelId ? this.catalog.models.find(candidate => candidate.identifier === modelId) : undefined;
 		if (!session || !model) {
@@ -900,7 +1009,7 @@ export class SessionMonitor implements vscode.Disposable {
 		if (request.sourceSessionResource && !source) {
 			throw new MonitorRequestError(404, 'The source Copilot session is no longer available.');
 		}
-		const resource = await createNewChat(source ? vscode.Uri.parse(source.resource) : undefined);
+		const resource = await this.createIdentifiedChat(source);
 		const sessionId = decodeLocalSessionId(resource);
 		this.createdSessionResources.add(resource.toString());
 		this.nativeCurrentSessionResource = resource.toString();

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.2]
+
+- Fixed "VS Code created a chat but did not expose its session identity" when creating a chat from the dashboard or phone. The internal `_chat.voice.*` commands the monitor relied on exist only while `agents.voice.enabled` is on; VS Code offers no other way to ask for a new chat's identity, so the monitor now makes VS Code persist its live chats (a no-op rename of an existing chat runs the chat service's immediate save) and identifies the new chat from the session file that appears.
+- Fixed the selected model snapping back to the previous one after changing it from the phone. The panel's stored selection is read from VS Code's storage, which flushes lazily, so a read right after the change still named the old model and overwrote the new one; a selection the monitor made now outranks such reads until storage confirms it. The same read no longer requires the voice bridge to know which chat is focused.
+- Switching models now applies the effort/context VS Code remembers for that model, as VS Code itself does, instead of the model's schema defaults.
+
 ## [1.2.1]
 
 - Read the model list from VS Code's own cached picker list (`chat.cachedLanguageModels.v2`) instead of Copilot's debug `models.json`, so newly rolled-out models appear in the dashboard and mobile app exactly when they appear in VS Code, with VS Code's own effort/context options. The debug-log file was only written with debug logging enabled and had gone stale.

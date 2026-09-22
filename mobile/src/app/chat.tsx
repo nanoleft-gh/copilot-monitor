@@ -19,6 +19,9 @@ const permissionOptions: PickerOption[] = [
 type OptimisticValue<T> = { sequence: number; value: T };
 type PermissionLevel = 'default' | 'autoApprove' | 'autopilot';
 
+/** How long a confirmed-by-the-computer model change may take to show up in a snapshot before the UI stops waiting. */
+const optimisticModelTimeoutMs = 15_000;
+
 function mergeConfigurationFields(
   catalogFields: readonly ModelConfigurationField[],
   sessionFields: readonly ModelConfigurationField[],
@@ -71,9 +74,23 @@ export default function ChatScreen() {
   const configurationSequence = useRef(0);
   const permissionSequence = useRef(0);
   const optimisticModelRef = useRef<OptimisticValue<string> | undefined>(undefined);
+  const optimisticModelTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const lastAuthoritativeModelRef = useRef<string | undefined>(undefined);
   const optimisticConfigurationsRef = useRef<Record<string, OptimisticValue<string | number | boolean>>>({});
   const optimisticPermissionRef = useRef<OptimisticValue<PermissionLevel> | undefined>(undefined);
   const keyboardHeight = useKeyboardHeight();
+
+  const clearOptimisticModel = useCallback((sequence?: number) => {
+    if (sequence !== undefined && optimisticModelRef.current?.sequence !== sequence) return;
+    optimisticModelRef.current = undefined;
+    if (optimisticModelTimer.current) {
+      clearTimeout(optimisticModelTimer.current);
+      optimisticModelTimer.current = undefined;
+    }
+    setOptimisticModel(current => sequence === undefined || current?.sequence === sequence ? undefined : current);
+  }, []);
+
+  useEffect(() => () => { if (optimisticModelTimer.current) clearTimeout(optimisticModelTimer.current); }, []);
 
   const applySnapshot = useCallback((windows: WindowSnapshot[]) => {
     const nextWindow = windows.find(candidate => candidate.windowId === params.windowId);
@@ -86,10 +103,17 @@ export default function ChatScreen() {
         const intended = nextWindow?.models.find(model => model.identifier === pendingModel.value || model.id === pendingModel.value);
         const authoritative = nextWindow?.models.find(model => model.identifier === authoritativeModelId || model.id === authoritativeModelId);
         if (authoritativeModelId === pendingModel.value || (intended && authoritative?.identifier === intended.identifier)) {
-          optimisticModelRef.current = undefined;
-          setOptimisticModel(current => current?.sequence === pendingModel.sequence ? undefined : current);
+          clearOptimisticModel(pendingModel.sequence);
         }
       }
+
+      // A model change (from here or from VS Code) invalidates effort/context choices made for the old model.
+      if (lastAuthoritativeModelRef.current !== undefined && authoritativeModelId !== lastAuthoritativeModelRef.current
+        && Object.keys(optimisticConfigurationsRef.current).length > 0) {
+        optimisticConfigurationsRef.current = {};
+        setOptimisticConfigurations({});
+      }
+      lastAuthoritativeModelRef.current = authoritativeModelId;
 
       const pendingConfigurations = optimisticConfigurationsRef.current;
       if (Object.keys(pendingConfigurations).length > 0) {
@@ -122,7 +146,7 @@ export default function ChatScreen() {
     }
     loadedRef.current = true;
     setLoading(false);
-  }, [params.sessionResource, params.windowId]);
+  }, [clearOptimisticModel, params.sessionResource, params.windowId]);
 
   useEffect(() => {
     if (!params.hostId || !params.windowId || !params.sessionResource) return;
@@ -250,22 +274,26 @@ export default function ChatScreen() {
     const sequence = ++modelSequence.current;
     const optimistic = { sequence, value: modelId };
     optimisticModelRef.current = optimistic;
+    if (optimisticModelTimer.current) clearTimeout(optimisticModelTimer.current);
     setOptimisticModel(optimistic);
+    // Effort/context chosen for the previous model do not carry over.
+    optimisticConfigurationsRef.current = {};
+    setOptimisticConfigurations({});
     setError(undefined);
     try {
       await selectModel(host, params.windowId, params.sessionResource, modelId);
+      // The computer accepted the change; keep showing it until a snapshot confirms, so a
+      // snapshot that is still in flight with the old model cannot flash it back.
       if (optimisticModelRef.current?.sequence === sequence) {
-        optimisticModelRef.current = undefined;
-        setOptimisticModel(current => current?.sequence === sequence ? undefined : current);
+        optimisticModelTimer.current = setTimeout(() => clearOptimisticModel(sequence), optimisticModelTimeoutMs);
       }
     } catch (modelError) {
       if (modelSequence.current === sequence) {
-        if (optimisticModelRef.current?.sequence === sequence) optimisticModelRef.current = undefined;
-        setOptimisticModel(current => current?.sequence === sequence ? undefined : current);
+        clearOptimisticModel(sequence);
         setError(modelError instanceof Error ? modelError.message : String(modelError));
       }
     }
-  }, [host, params.sessionResource, params.windowId]);
+  }, [clearOptimisticModel, host, params.sessionResource, params.windowId]);
 
   const changeConfiguration = useCallback(async (modelId: string, key: string, value: string | number | boolean) => {
     if (!host || !params.windowId || !params.sessionResource) return;
@@ -325,17 +353,20 @@ export default function ChatScreen() {
   const authoritativeModelId = session?.model?.selectedModelId;
   const selectedModelId = optimisticModel?.value ?? authoritativeModelId;
   const selectedModel = models.find(model => model.identifier === selectedModelId || model.id === selectedModelId);
+  const authoritativeModel = models.find(model => model.identifier === authoritativeModelId || model.id === authoritativeModelId);
+  // While a different model is pending, the old chat's effort/context values belong to the old model.
+  const modelPending = !!optimisticModel && selectedModel?.identifier !== authoritativeModel?.identifier;
   const modelOptions: PickerOption[] = models.map((model: ChatModelDescriptor) => ({
     value: model.identifier,
     label: model.name,
     hint: model.preview ? 'Preview' : model.family,
   }));
-  const sessionFields = session?.model?.configurationFields ?? [];
+  const sessionFields = modelPending ? [] : session?.model?.configurationFields ?? [];
   const catalogFields = selectedModel?.configurationFields ?? [];
   const configFields = mergeConfigurationFields(catalogFields, sessionFields).map(field => ({
     ...field,
     value: optimisticConfigurations[field.key]?.value
-      ?? session?.model?.configuration[field.key]
+      ?? (modelPending ? undefined : session?.model?.configuration[field.key])
       ?? sessionFields.find(candidate => candidate.key === field.key)?.value
       ?? field.defaultValue,
   }));
@@ -485,7 +516,7 @@ export default function ChatScreen() {
             )}
             {configFields.map(field => (
               <PickerField
-                disabled={working || !authoritativeModelId || !!optimisticModel || session?.model?.configurationWritable !== true}
+                disabled={working || !authoritativeModelId || modelPending || session?.model?.configurationWritable !== true}
                 key={field.key}
                 label={field.title}
                 onSelect={value => authoritativeModelId && void changeConfiguration(authoritativeModelId, field.key, value)}
