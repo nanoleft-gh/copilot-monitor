@@ -18,11 +18,11 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 
 ## Current Features
 
-- Discovers every open VS Code window through per-window heartbeat descriptors.
+- Discovers every open VS Code window through a publish-once descriptor registry; liveness comes from the gateway's connection to each window, not from heartbeats.
 - Shows all persisted local Copilot chats for each live window.
-- Reconstructs the session transcript from VS Code's append-only chat operation log.
+- Reconstructs the session transcript from VS Code's append-only chat operation log by tailing only the bytes that changed.
 - Streams live in-memory transcript and working-state changes with Server-Sent Events.
-- Keeps long chats responsive with bounded transcript rendering, sampled message jumpers, lightweight inactive-chat summaries, and throttled live exports.
+- Keeps long chats responsive with bounded transcript rendering, sampled message jumpers, lightweight inactive-chat summaries, and on-demand (never scheduled) live exports.
 - Shows assistant markdown, code blocks, and summarized tool activity.
 - Renders compact semantic headings, lists, quotes, rules, inline code, and emphasis instead of exposing raw markdown spacing.
 - Renders fenced `mermaid` blocks as self-hosted, theme-aware SVG diagrams without a CDN.
@@ -33,7 +33,7 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Shows the selected model, the model used by the latest request, thinking effort, context tier, and available configuration choices.
 - Changes the model for the exact selected window and chat session.
 - Edits a historical user request through VS Code's native chat editor, replacing that request and the subsequent branch after explicit confirmation.
-- Synchronizes native VS Code model and effort/context changes through debounced SQLite notifications, with lightweight correctness polling when events are missed or unavailable.
+- Synchronizes native VS Code model and effort/context changes through debounced SQLite file notifications; no polling while the watcher is healthy.
 - Changes thinking effort and context size for the exact selected window and chat, then briefly reloads that chat so VS Code restores the new configuration through its native editor-scoped store.
 - Places model, effort, and context controls in a compact Copilot-style composer toolbar.
 - Adds a workspace/conversation navigator, per-turn message rail, conversation search, and top/bottom navigation.
@@ -46,7 +46,10 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Deduplicates submitted message IDs and reports accepted, completed, and failed states.
 - Exposes one tokenless dashboard URL on the trusted local network.
 - Elects the gateway owner by binding the shared port and automatically fails over when that window closes.
+- Does nothing while no dashboard or phone is connected: no watchers, no tailers, no timers.
 - Requires no proposed API and no special launch flags.
+
+See [docs/Architecture.md](https://github.com/nanoleft-gh/copilot-monitor/blob/main/docs/Architecture.md) for the event-driven design.
 
 ## Install
 
