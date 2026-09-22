@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import type { RemoteTunnelStatus } from './protocol';
 
 /**
  * Forwards the gateway port through a Microsoft dev tunnel using the `code-tunnel` CLI that
@@ -10,13 +11,7 @@ import * as path from 'node:path';
  * secret. The CLI runs one singleton per machine and returns a stable per-machine address.
  */
 
-export type RemoteTunnelState =
-	| { readonly status: 'inactive' }
-	| { readonly status: 'unavailable'; readonly reason: string }
-	| { readonly status: 'signin-required' }
-	| { readonly status: 'starting' }
-	| { readonly status: 'active'; readonly url: string }
-	| { readonly status: 'error'; readonly error: string };
+export type RemoteTunnelState = RemoteTunnelStatus;
 
 export interface RemoteTunnelCommand {
 	readonly command: string;

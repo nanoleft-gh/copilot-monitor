@@ -105,14 +105,12 @@ Pair once. The phone keeps every address the computer advertises and finds it ag
 
 To reach the computer when the phone is not on your Wi-Fi, without any paid service, open the **Copilot Monitor** view and press **Turn on remote access**. The extension forwards the gateway port through a Microsoft dev tunnel using the `code-tunnel` CLI that ships inside VS Code (the same mechanism as the **Ports** view), shows the resulting `https://…devtunnels.ms/` address, and advertises it to paired phones, which switch to it automatically whenever the local network is unreachable. If you are not signed in to GitHub, the view offers the sign-in first. The tunnel is public because the phone cannot complete the GitHub browser login that private tunnels require; the pairing secret still guards every request, and traffic through the tunnel is HTTPS. Dev tunnels have bandwidth and active-tunnel limits; the delta stream keeps usage small.
 
-Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL.
+Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL. Remote access is a machine-wide choice stored next to the pairing secret, not a VS Code setting; any window can change it and the window that owns the gateway runs the tunnel.
 
 ## Settings
 
 - `githubCopilotMonitor.autoStart`: register each VS Code window with the shared gateway after startup. Default: `true`.
 - `githubCopilotMonitor.port`: stable LAN gateway port shared by all windows. Default: `43121`.
-- `githubCopilotMonitor.remoteAccess`: forward the gateway port through a Microsoft dev tunnel so paired phones can reach this computer from anywhere (GitHub sign-in required). Default: `false`.
-- `githubCopilotMonitor.remoteUrl`: optional manual public address (Tailscale, Cloudflare Tunnel, own proxy) that reaches the gateway. Paired phones learn it automatically. Default: empty.
 
 ## Commands
 `ctrl+shift+p` -> 
@@ -120,7 +118,6 @@ Prefer your own route? *Use my own address instead* in the same view accepts a T
 - `Copilot Monitor: Stop Dashboard`
 - `Copilot Monitor: Open Dashboard`
 - `Copilot Monitor: Copy Pairing Link`
-- `Copilot Monitor: Set Manual Remote URL`
 - `Copilot Monitor: Reset Pairing Secret`
 
 ## Known Limitations for Future Scope

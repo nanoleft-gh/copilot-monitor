@@ -4,27 +4,20 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { GatewayCoordinator } from './gatewayCoordinator';
 import { pairingUrl } from './gatewayAuth';
-import { GatewayAddress } from './gatewayServer';
+import { GatewayAddress, RemoteAccessController } from './gatewayServer';
 import { getOrCreateHostIdentity, getOrCreatePairingSecret, getSharedStateDirectory, resetPairingSecret } from './hostIdentity';
 import { findLanAddress, findLanAddresses } from './lanAddress';
 import { MonitorServer, MonitorServerAddress } from './monitorServer';
 import { MobileViewProvider, mobileViewId, type PairingAddress } from './mobileViewProvider';
+import { MonitorRequestError, type RemoteAccessStatus, type RemoteAccessUpdateRequest } from './protocol';
+import { readRemoteAccessPreferences, writeRemoteAccessPreferences, type RemoteAccessPreferences } from './remoteAccessStore';
 import { RemoteTunnel, readProductInfo, resolveTunnelCli, tunnelCliCandidates } from './remoteTunnel';
 import { SessionMonitor } from './sessionMonitor';
 import { WindowRegistry } from './windowRegistry';
 
 const defaultGatewayPort = 43_121;
 
-function isLanUrl(value: string): boolean {
-	try {
-		const { hostname } = new URL(value);
-		return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|127\.)/.test(hostname) || hostname === 'localhost' || hostname.endsWith('.local');
-	} catch {
-		return false;
-	}
-}
-
-/** Normalises the user's remote access setting to an origin with a trailing slash, or nothing when unusable. */
+/** Normalises a user-supplied remote address to an origin with a trailing slash, or nothing when unusable. */
 export function normalizeRemoteUrl(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed) {
@@ -44,15 +37,8 @@ export function normalizeRemoteUrl(value: string | undefined): string | undefine
 	}
 }
 
-function readRemoteUrl(): string | undefined {
-	return normalizeRemoteUrl(vscode.workspace.getConfiguration('githubCopilotMonitor').get<string>('remoteUrl'));
-}
-
-function readRemoteAccessEnabled(): boolean {
-	return vscode.workspace.getConfiguration('githubCopilotMonitor').get<boolean>('remoteAccess', false) === true;
-}
-
 const githubScopes = ['user:email', 'read:org'];
+const gatewayRequestTimeoutMs = 5_000;
 
 class MonitorRuntime implements vscode.Disposable {
 	private readonly output = vscode.window.createOutputChannel('Copilot Monitor');
@@ -68,6 +54,8 @@ class MonitorRuntime implements vscode.Disposable {
 	private pairingSecret: string | undefined;
 	private startPromise: Promise<GatewayAddress> | undefined;
 	private readonly tunnel: RemoteTunnel;
+	/** Last preferences this window read or wrote; refreshed from disk when the tunnel is (re)synced. */
+	private remotePreferences: RemoteAccessPreferences = { version: 1, enabled: false };
 	readonly onDidChangeAddress = this.addressChanged.event;
 
 	get running(): boolean {
@@ -90,12 +78,6 @@ class MonitorRuntime implements vscode.Disposable {
 			log: message => this.output.appendLine(message),
 		});
 		context.subscriptions.push(this.tunnel.onDidChangeState(() => this.addressChanged.fire()));
-		context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
-			if (event.affectsConfiguration('githubCopilotMonitor.remoteUrl') || event.affectsConfiguration('githubCopilotMonitor.remoteAccess')) {
-				void this.syncRemoteTunnel();
-				this.addressChanged.fire();
-			}
-		}));
 		context.subscriptions.push(vscode.authentication.onDidChangeSessions(event => {
 			if (event.provider.id === 'github' && this.tunnel.state.status === 'signin-required') {
 				void this.syncRemoteTunnel();
@@ -163,75 +145,112 @@ class MonitorRuntime implements vscode.Disposable {
 		void vscode.window.showInformationMessage('Copilot Monitor pairing link copied. It contains this computer\'s pairing secret; share it only with your own devices.');
 	}
 
-	async setRemoteUrl(): Promise<void> {
-		const configuration = vscode.workspace.getConfiguration('githubCopilotMonitor');
-		const value = await vscode.window.showInputBox({
-			title: 'Copilot Monitor: Manual Remote URL',
-			prompt: 'Paste a public address that reaches this computer\'s gateway (Tailscale, Cloudflare Tunnel, your own proxy). Leave empty to clear. Prefer the automatic tunnel in the Copilot Monitor sidebar.',
-			placeHolder: 'https://my-pc.tailnet-name.ts.net:43121/',
-			value: configuration.get<string>('remoteUrl') ?? '',
-			ignoreFocusOut: true,
-			validateInput: input => input.trim() && !normalizeRemoteUrl(input) ? 'Enter an http(s) URL without credentials.' : undefined,
-		});
-		if (value === undefined) {
-			return;
-		}
-		await this.saveManualRemoteUrl(value);
+	// #region remote access
+
+	/**
+	 * Remote access is machine-wide and owned by the gateway window, so every window (this one
+	 * included) changes it through the gateway API. State lives in the shared directory, not in
+	 * VS Code settings, so it needs no registered configuration and survives window reloads.
+	 */
+	async getRemoteAccess(): Promise<RemoteAccessStatus> {
+		const address = await this.getCurrentAddress();
+		return this.gatewayRequest<RemoteAccessStatus>(address.port, 'GET');
 	}
 
-	async saveManualRemoteUrl(value: string): Promise<void> {
-		if (value.trim() && !normalizeRemoteUrl(value)) {
+	async updateRemoteAccess(request: RemoteAccessUpdateRequest): Promise<RemoteAccessStatus> {
+		if (typeof request.manualUrl === 'string' && request.manualUrl.trim() && !normalizeRemoteUrl(request.manualUrl)) {
 			throw new Error('Enter an http(s) URL without credentials.');
 		}
-		await vscode.workspace.getConfiguration('githubCopilotMonitor').update('remoteUrl', normalizeRemoteUrl(value) ?? '', vscode.ConfigurationTarget.Global);
+		const address = await this.getCurrentAddress();
+		return this.gatewayRequest<RemoteAccessStatus>(address.port, 'POST', request);
 	}
 
-	async setRemoteAccess(enabled: boolean): Promise<void> {
-		await vscode.workspace.getConfiguration('githubCopilotMonitor').update('remoteAccess', enabled, vscode.ConfigurationTarget.Global);
-		await this.syncRemoteTunnel(enabled);
+	/** Signs in here (accounts are shared by all windows), then asks the gateway owner to retry. */
+	async signInForRemoteAccess(): Promise<RemoteAccessStatus> {
+		await vscode.authentication.getSession('github', githubScopes, { createIfNone: true });
+		return this.updateRemoteAccess({ enabled: true, retry: true });
 	}
 
-	/** Runs the sign-in flow if needed and (re)starts the tunnel; the user asked for it, so prompts are fine. */
-	async retryRemoteAccess(): Promise<void> {
-		if (!readRemoteAccessEnabled()) {
-			await this.setRemoteAccess(true);
-			return;
-		}
-		await this.syncRemoteTunnel(true);
-	}
-
-	/** The gateway owner runs the tunnel; followers show the address it advertises. */
-	private async syncRemoteTunnel(interactive = false): Promise<void> {
-		const port = this.address?.port;
-		if (readRemoteAccessEnabled() && this.gateway?.isLeader && port) {
-			if (interactive && this.tunnel.state.status !== 'active' && this.tunnel.state.status !== 'starting') {
+	/** Handlers the gateway server calls; they run only in the window that owns the gateway. */
+	private readonly remoteAccessController: RemoteAccessController = {
+		get: async () => this.remoteAccessStatus(await this.loadRemotePreferences()),
+		update: async request => {
+			const current = await this.loadRemotePreferences();
+			const manualUrl = request.manualUrl === undefined
+				? current.manualUrl
+				: request.manualUrl === null ? undefined : normalizeRemoteUrl(request.manualUrl);
+			if (request.manualUrl && !manualUrl) {
+				throw new MonitorRequestError(400, 'Enter an http(s) URL without credentials.');
+			}
+			const next: RemoteAccessPreferences = {
+				version: 1,
+				enabled: request.enabled ?? current.enabled,
+				...(manualUrl ? { manualUrl } : {}),
+			};
+			await writeRemoteAccessPreferences(getSharedStateDirectory(), next);
+			this.remotePreferences = next;
+			if (request.retry && next.enabled) {
 				await this.tunnel.stop();
 			}
-			await this.tunnel.start(port, interactive);
-		} else {
-			await this.tunnel.stop();
-		}
+			await this.syncRemoteTunnel();
+			this.addressChanged.fire();
+			return this.remoteAccessStatus(next);
+		},
+	};
+
+	private remoteAccessStatus(preferences: RemoteAccessPreferences): RemoteAccessStatus {
+		return {
+			enabled: preferences.enabled,
+			...(preferences.manualUrl ? { manualUrl: preferences.manualUrl } : {}),
+			tunnel: this.tunnel.state,
+		};
 	}
 
-	/** Remote (non-LAN) addresses the gateway currently advertises, whichever window owns it. */
-	private async readAdvertisedRemoteUrls(port: number): Promise<string[]> {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 1_000);
-		try {
-			const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: controller.signal });
-			if (!response.ok) {
-				return [];
+	private async loadRemotePreferences(): Promise<RemoteAccessPreferences> {
+		this.remotePreferences = await readRemoteAccessPreferences(getSharedStateDirectory());
+		return this.remotePreferences;
+	}
+
+	/** Only the gateway owner runs the tunnel; called on start, leadership change, and preference change. */
+	private async syncRemoteTunnel(): Promise<void> {
+		const port = this.address?.port;
+		if (this.gateway?.isLeader && port) {
+			const preferences = await this.loadRemotePreferences();
+			if (preferences.enabled) {
+				await this.tunnel.start(port, false);
+				return;
 			}
-			const value = await response.json() as { endpoints?: unknown };
-			return Array.isArray(value.endpoints)
-				? value.endpoints.filter((endpoint): endpoint is string => typeof endpoint === 'string' && !isLanUrl(endpoint))
-				: [];
-		} catch {
-			return [];
+		}
+		await this.tunnel.stop();
+	}
+
+	private async gatewayRequest<T>(port: number, method: 'GET' | 'POST', body?: unknown): Promise<T> {
+		const secret = this.pairingSecret ?? await getOrCreatePairingSecret(getSharedStateDirectory());
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), gatewayRequestTimeoutMs);
+		try {
+			const response = await fetch(`http://127.0.0.1:${port}/api/remote-access`, {
+				method,
+				headers: { authorization: `Bearer ${secret}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+				...(body ? { body: JSON.stringify(body) } : {}),
+				signal: controller.signal,
+			});
+			const value = await response.json().catch(() => ({})) as T & { error?: string };
+			if (!response.ok) {
+				throw new Error(value.error ?? `The shared gateway answered HTTP ${response.status}.`);
+			}
+			return value;
+		} catch (error) {
+			if (error instanceof Error && error.name === 'AbortError') {
+				throw new Error('The shared gateway did not respond.');
+			}
+			throw error;
 		} finally {
 			clearTimeout(timer);
 		}
 	}
+
+	// #endregion
 
 	async resetPairing(): Promise<void> {
 		const confirmed = await vscode.window.showWarningMessage(
@@ -269,19 +288,16 @@ class MonitorRuntime implements vscode.Disposable {
 	async getPairingAddress(): Promise<PairingAddress> {
 		const address = await this.getCurrentAddress();
 		const secret = this.pairingSecret ?? await getOrCreatePairingSecret(getSharedStateDirectory());
-		const manualRemoteUrl = readRemoteUrl();
-		const isLeader = this.gateway?.isLeader === true;
-		const tunnelUrl = this.tunnel.state.status === 'active' ? this.tunnel.state.url : undefined;
-		const advertised = isLeader ? [] : await this.readAdvertisedRemoteUrls(address.port);
-		const remoteUrl = tunnelUrl ?? advertised.find(url => url !== manualRemoteUrl) ?? manualRemoteUrl;
+		const remote = await this.getRemoteAccess().catch((error: unknown): RemoteAccessStatus => ({
+			enabled: false,
+			tunnel: { status: 'error', error: error instanceof Error ? error.message : String(error) },
+		}));
+		const remoteUrl = remote.tunnel.status === 'active' ? remote.tunnel.url : remote.manualUrl;
 		return {
 			...address,
 			pairingUrl: pairingUrl(address.url, secret),
 			...(remoteUrl ? { remoteUrl, remotePairingUrl: pairingUrl(remoteUrl, secret) } : {}),
-			...(manualRemoteUrl ? { manualRemoteUrl } : {}),
-			remoteAccessEnabled: readRemoteAccessEnabled(),
-			isLeader,
-			tunnel: isLeader ? this.tunnel.state : advertised.length > 0 ? { status: 'active', url: advertised[0] } : { status: 'inactive' },
+			remote,
 		};
 	}
 
@@ -336,14 +352,16 @@ class MonitorRuntime implements vscode.Disposable {
 			iconSvg,
 			readPairingSecret: () => getOrCreatePairingSecret(sharedStateDirectory),
 			getEndpoints: port => {
-				const remoteUrl = readRemoteUrl();
+				// Health is served by the owner, whose cached preferences are refreshed by every sync/update.
+				const manualUrl = this.remotePreferences.manualUrl;
 				const tunnelUrl = this.tunnel.state.status === 'active' ? this.tunnel.state.url : undefined;
 				return [
 					...findLanAddresses().map(address => `http://${address}:${port}/`),
 					...(tunnelUrl ? [tunnelUrl] : []),
-					...(remoteUrl && remoteUrl !== tunnelUrl ? [remoteUrl] : []),
+					...(manualUrl && manualUrl !== tunnelUrl ? [manualUrl] : []),
 				];
 			},
+			remoteAccess: this.remoteAccessController,
 		});
 		try {
 			const localAddress: MonitorServerAddress = await localServer.start();
@@ -421,7 +439,6 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.stop', () => runtime.stop()));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.open', () => runtime.open()));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.copyUrl', () => runtime.copyUrl()));
-	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.setRemoteUrl', () => runtime.setRemoteUrl()));
 	context.subscriptions.push(vscode.commands.registerCommand('githubCopilotMonitor.resetPairing', () => runtime.resetPairing()));
 
 	if (vscode.workspace.getConfiguration('githubCopilotMonitor').get<boolean>('autoStart', true)) {

@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { GatewayBackend, GatewayServer } from '../gatewayServer';
 import { GatewayCoordinator } from '../gatewayCoordinator';
-import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewaySyncSessionRequest, GatewayToolDecisionRequest } from '../protocol';
+import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewaySyncSessionRequest, GatewayToolDecisionRequest, RemoteAccessStatus, RemoteAccessUpdateRequest } from '../protocol';
 
 const emptyState: GatewayState = { version: 2, gatewayStartedAt: 1, windows: [] };
 const secret = 'test-secret-0123456789abcdefghijklmnopqrstuv';
@@ -86,6 +86,41 @@ class TestGatewayBackend implements GatewayBackend {
 }
 
 describe('GatewayServer', () => {
+	it('exposes remote access control to authenticated windows only', async () => {
+		let status: RemoteAccessStatus = { enabled: false, tunnel: { status: 'inactive' } };
+		const updates: RemoteAccessUpdateRequest[] = [];
+		const server = new GatewayServer(new TestGatewayBackend(), {
+			host: '127.0.0.1', advertisedHost: '127.0.0.1', port: 0, registryId: 'registry-remote', html: '<!doctype html>', readPairingSecret,
+			remoteAccess: {
+				get: async () => status,
+				update: async request => {
+					updates.push(request);
+					status = { enabled: request.enabled ?? status.enabled, ...(request.manualUrl ? { manualUrl: request.manualUrl } : {}), tunnel: { status: 'active', url: 'https://abc-43121.inc1.devtunnels.ms/' } };
+					return status;
+				},
+			},
+		});
+		const address = await server.start();
+		const baseUrl = `http://127.0.0.1:${address.port}`;
+		try {
+			assert.equal((await fetch(`${baseUrl}/api/remote-access`)).status, 401);
+			assert.deepEqual(await fetch(`${baseUrl}/api/remote-access`, { headers: authorized }).then(response => response.json()), { enabled: false, tunnel: { status: 'inactive' } });
+			const updated = await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }) });
+			assert.equal(updated.status, 200);
+			assert.deepEqual(updates, [{ enabled: true, retry: true, manualUrl: 'https://pc.tail.ts.net/' }]);
+			assert.equal(((await updated.json()) as RemoteAccessStatus).tunnel.status, 'active');
+			assert.equal((await fetch(`${baseUrl}/api/remote-access`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ manualUrl: 5 }) })).status, 400);
+		} finally {
+			await server.stop();
+		}
+		const bare = new GatewayServer(new TestGatewayBackend(), { host: '127.0.0.1', advertisedHost: '127.0.0.1', port: 0, registryId: 'registry-bare', html: '', readPairingSecret });
+		const bareAddress = await bare.start();
+		try {
+			assert.equal((await fetch(`http://127.0.0.1:${bareAddress.port}/api/remote-access`, { headers: authorized })).status, 501);
+		} finally {
+			await bare.stop();
+		}
+	});
 	it('requires the pairing secret on every API route except health, and issues a cookie for browsers', async () => {
 		let current = secret;
 		const server = new GatewayServer(new TestGatewayBackend(), {
@@ -149,7 +184,7 @@ describe('GatewayServer', () => {
 			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json());
 			assert.deepEqual(health, {
 				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 4,
-				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2'],
+				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2', 'remoteAccess'],
 				authRequired: true, authorized: false, endpoints: [],
 			});
 			const page = await fetch(`${baseUrl}/`);

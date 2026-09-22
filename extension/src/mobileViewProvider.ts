@@ -1,20 +1,16 @@
 import * as vscode from 'vscode';
 import type { GatewayAddress } from './gatewayServer';
-import type { RemoteTunnelState } from './remoteTunnel';
+import type { RemoteAccessStatus, RemoteAccessUpdateRequest } from './protocol';
 
 export const mobileViewId = 'githubCopilotMonitor.mobile';
 
 export interface PairingAddress extends GatewayAddress {
 	/** LAN URL carrying the pairing secret in its fragment; what the QR encodes. */
 	readonly pairingUrl: string;
-	/** Best remote address right now: the live tunnel, else what the gateway advertises, else the manual URL. */
+	/** Best remote address right now: the live tunnel, else the manual URL. */
 	readonly remoteUrl?: string;
 	readonly remotePairingUrl?: string;
-	readonly manualRemoteUrl?: string;
-	readonly remoteAccessEnabled: boolean;
-	/** Whether this window owns the shared gateway (and therefore runs the tunnel). */
-	readonly isLeader: boolean;
-	readonly tunnel: RemoteTunnelState;
+	readonly remote: RemoteAccessStatus;
 }
 
 export interface MobileViewRuntime {
@@ -26,18 +22,23 @@ export interface MobileViewRuntime {
 	onDidChangeAddress(listener: () => void): vscode.Disposable;
 	open(): Promise<void>;
 	copyUrl(): Promise<void>;
-	setRemoteAccess(enabled: boolean): Promise<void>;
-	retryRemoteAccess(): Promise<void>;
-	saveManualRemoteUrl(value: string): Promise<void>;
+	updateRemoteAccess(request: RemoteAccessUpdateRequest): Promise<RemoteAccessStatus>;
+	signInForRemoteAccess(): Promise<RemoteAccessStatus>;
 	resetPairing(): Promise<void>;
 }
 
 type ViewMessage = { command?: unknown; value?: unknown };
 
+/** While the owner window brings the tunnel up, re-read its state at this cadence (bounded by `maximumFollowUps`). */
+const followUpDelayMs = 1_500;
+const maximumFollowUps = 40;
+
 export class MobileViewProvider implements vscode.WebviewViewProvider {
 	private view: vscode.WebviewView | undefined;
 	private refreshRunning: Promise<void> | undefined;
 	private renderedUrl: string | undefined;
+	private followUpTimer: NodeJS.Timeout | undefined;
+	private followUpsLeft = 0;
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -62,6 +63,7 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		});
 		view.onDidDispose(() => {
 			addressSubscription.dispose();
+			this.stopFollowUps();
 			if (this.view === view) {
 				this.view = undefined;
 			}
@@ -81,15 +83,23 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (message.command === 'remote:enable') {
-			await this.runtime.setRemoteAccess(true);
+			await this.runtime.updateRemoteAccess({ enabled: true });
+			await this.refreshAndFollowUp();
 			return;
 		}
 		if (message.command === 'remote:disable') {
-			await this.runtime.setRemoteAccess(false);
+			await this.runtime.updateRemoteAccess({ enabled: false });
+			await this.refresh();
 			return;
 		}
 		if (message.command === 'remote:retry') {
-			await this.runtime.retryRemoteAccess();
+			await this.runtime.updateRemoteAccess({ enabled: true, retry: true });
+			await this.refreshAndFollowUp();
+			return;
+		}
+		if (message.command === 'remote:signin') {
+			await this.runtime.signInForRemoteAccess();
+			await this.refreshAndFollowUp();
 			return;
 		}
 		if (message.command === 'remote:copy') {
@@ -101,7 +111,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (message.command === 'remote:saveManual') {
-			await this.runtime.saveManualRemoteUrl(typeof message.value === 'string' ? message.value : '');
+			const value = typeof message.value === 'string' ? message.value.trim() : '';
+			await this.runtime.updateRemoteAccess({ manualUrl: value || null });
 			await this.refresh();
 			return;
 		}
@@ -140,6 +151,38 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	/** The tunnel may be started by another window, which cannot notify this one; keep looking until it settles. */
+	private async refreshAndFollowUp(): Promise<void> {
+		this.stopFollowUps();
+		this.followUpsLeft = maximumFollowUps;
+		await this.refresh();
+		this.scheduleFollowUp();
+	}
+
+	private scheduleFollowUp(): void {
+		if (this.followUpsLeft <= 0 || !this.view?.visible) {
+			return;
+		}
+		this.followUpsLeft--;
+		this.followUpTimer = setTimeout(async () => {
+			this.followUpTimer = undefined;
+			await this.refresh();
+			if (this.lastTunnelStatus === 'starting') {
+				this.scheduleFollowUp();
+			}
+		}, followUpDelayMs);
+	}
+
+	private stopFollowUps(): void {
+		if (this.followUpTimer) {
+			clearTimeout(this.followUpTimer);
+			this.followUpTimer = undefined;
+		}
+		this.followUpsLeft = 0;
+	}
+
+	private lastTunnelStatus: RemoteAccessStatus['tunnel']['status'] | undefined;
+
 	private async refreshNow(): Promise<void> {
 		const view = this.view;
 		if (!view) {
@@ -152,7 +195,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		}
 		try {
 			const address = await this.runtime.getPairingAddress();
-			const rendered = JSON.stringify([address.pairingUrl, address.remotePairingUrl, address.manualRemoteUrl, address.remoteAccessEnabled, address.isLeader, address.tunnel]);
+			this.lastTunnelStatus = address.remote.tunnel.status;
+			const rendered = JSON.stringify([address.pairingUrl, address.remotePairingUrl, address.remote]);
 			if (this.view === view && this.renderedUrl !== rendered) {
 				this.renderedUrl = rendered;
 				view.webview.html = this.readyHtml(view.webview, address);
@@ -237,8 +281,8 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private remoteSection(address: PairingAddress): string {
-		const tunnel = address.tunnel;
-		const manual = address.manualRemoteUrl;
+		const tunnel = address.remote.tunnel;
+		const manual = address.remote.manualUrl;
 		const manualBlock = `
 			<div id="manual" ${manual ? '' : 'hidden'}>
 				<p class="tight">Have your own route (Tailscale, Cloudflare Tunnel, a reverse proxy)? Paste the address that reaches <code class="inline">${escapeHtml(address.url)}</code> from the internet.</p>
@@ -251,8 +295,12 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 			</div>`;
 		const manualToggle = manual ? '' : '<button class="link" id="manual-toggle">Use my own address instead</button>';
 
-		if (!address.remoteAccessEnabled) {
+		if (!address.remote.enabled) {
+			const gatewayProblem = tunnel.status === 'error'
+				? `<p class="warn">${escapeHtml(tunnel.error)}</p>`
+				: '';
 			return `
+				${gatewayProblem}
 				<p>Turn this on to reach the computer when the phone is not on your Wi-Fi. The gateway port is forwarded through a free Microsoft dev tunnel (the same service behind VS Code's Ports view) using your GitHub account; paired phones pick the address up on their own. Requests still need the pairing secret.</p>
 				<div class="actions"><button class="primary" data-command="remote:enable">Turn on remote access</button></div>
 				<p class="tight">${manualToggle}</p>
@@ -260,37 +308,35 @@ export class MobileViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		let status: string;
-		if (!address.isLeader && tunnel.status !== 'active') {
-			status = `<p class="status"><span class="spinner"></span>The VS Code window that owns the shared gateway is bringing the tunnel up. If it has no GitHub sign-in, open this view there.</p>`;
-		} else {
-			switch (tunnel.status) {
-				case 'active':
-					status = `
-						<p class="ok"><span class="dot"></span>Reachable from anywhere</p>
-						<code>${escapeHtml(tunnel.url)}</code>
-						<p class="tight">Paired phones learn this address automatically and use it whenever your Wi-Fi is out of reach. Nothing to type on the phone.</p>
-						<div class="actions"><button data-command="remote:copy">Copy remote address</button></div>`;
-					break;
-				case 'starting':
-					status = `<p class="status"><span class="spinner"></span>Starting the dev tunnel…</p>`;
-					break;
-				case 'signin-required':
-					status = `
-						<p class="warn">Sign in to GitHub so VS Code can create the tunnel. Dev tunnels are free; the sign-in happens in your browser once.</p>
-						<div class="actions"><button class="primary" data-command="remote:retry">Sign in with GitHub</button></div>`;
-					break;
-				case 'unavailable':
-					status = `
-						<p class="warn">${escapeHtml(tunnel.reason)} You can still use your own address below.</p>`;
-					break;
-				case 'error':
-					status = `
-						<p class="warn">${escapeHtml(tunnel.error)} Retrying in the background.</p>
-						<div class="actions"><button data-command="remote:retry">Retry now</button></div>`;
-					break;
-				default:
-					status = `<p class="status"><span class="spinner"></span>Preparing…</p>`;
-			}
+		switch (tunnel.status) {
+			case 'active':
+				status = `
+					<p class="ok"><span class="dot"></span>Reachable from anywhere</p>
+					<code>${escapeHtml(tunnel.url)}</code>
+					<p class="tight">Paired phones learn this address automatically and use it whenever your Wi-Fi is out of reach. Nothing to type on the phone.</p>
+					<div class="actions"><button data-command="remote:copy">Copy remote address</button></div>`;
+				break;
+			case 'starting':
+				status = `<p class="status"><span class="spinner"></span>Starting the dev tunnel…</p>`;
+				break;
+			case 'signin-required':
+				status = `
+					<p class="warn">Sign in to GitHub so VS Code can create the tunnel. Dev tunnels are free; the sign-in happens in your browser once.</p>
+					<div class="actions"><button class="primary" data-command="remote:signin">Sign in with GitHub</button></div>`;
+				break;
+			case 'unavailable':
+				status = `
+					<p class="warn">${escapeHtml(tunnel.reason)} You can still use your own address below.</p>`;
+				break;
+			case 'error':
+				status = `
+					<p class="warn">${escapeHtml(tunnel.error)} Retrying in the background.</p>
+					<div class="actions"><button data-command="remote:retry">Retry now</button></div>`;
+				break;
+			default:
+				status = `
+					<p class="status"><span class="spinner"></span>Preparing…</p>
+					<div class="actions"><button data-command="remote:retry">Start now</button></div>`;
 		}
 		return `
 			${status}

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.2]
+
+- Fixed "Unable to write to User Settings because githubCopilotMonitor.remoteAccess is not a registered configuration" when turning on remote access. VS Code's settings writer only accepts keys present in the running window's configuration registry, which is refreshed on a full window reload; an extension-host restart after a VSIX install can leave it stale. Remote access state (on/off, manual URL) is therefore no longer a VS Code setting at all: it lives in the shared state directory next to the host identity, is owned by the window that runs the gateway, and every window (this one included) reads and changes it through the authenticated `GET`/`POST /api/remote-access` gateway routes. This also makes the choice machine-wide and consistent across VS Code Stable and Insiders windows.
+- "Sign in with GitHub" now signs in from the window you clicked in (accounts are shared) and then asks the gateway owner to start the tunnel, so it works from any window.
+- The sidebar re-reads the tunnel state while it is starting so the address appears without reopening the view.
+- Removed the `githubCopilotMonitor.remoteAccess` / `remoteUrl` settings and the `Set Manual Remote URL` command; the sidebar is the single place to manage remote access.
+
 ## [1.3.1]
 
 - Remote access is now one click. "Turn on remote access" in the Copilot Monitor sidebar forwards the gateway port through a Microsoft dev tunnel by running the `code-tunnel` CLI that ships inside VS Code with the same stdin/stderr protocol the Ports view uses (`tunnel forward-internal`), so no proposed API or manual forwarding is needed. The address appears in the sidebar and is advertised to paired phones automatically. If GitHub is not signed in, the sidebar offers the sign-in and continues on its own afterwards; the CLI is restarted with backoff if it exits. Only the window that owns the shared gateway runs the tunnel, and leadership changes now notify the runtime so failover moves it.

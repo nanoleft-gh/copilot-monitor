@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as http from 'node:http';
 import { AggregateMonitor } from './aggregateMonitor';
 import { GatewayLease, GatewayLeaseStore } from './gatewayLease';
-import { GatewayAddress, GatewayServer } from './gatewayServer';
+import { GatewayAddress, GatewayServer, RemoteAccessController } from './gatewayServer';
 
 /** Delays between attempts to re-reach a gateway whose presence stream dropped, before running an election. */
 const presenceReconnectDelaysMs = [250, 1_000, 2_000];
@@ -20,6 +20,7 @@ export interface GatewayCoordinatorOptions {
 	readonly iconSvg?: string;
 	readonly readPairingSecret: () => Promise<string>;
 	readonly getEndpoints?: (port: number) => readonly string[];
+	readonly remoteAccess?: RemoteAccessController;
 	/** @deprecated No periodic re-check exists anymore; kept for call-site compatibility. */
 	readonly retryIntervalMs?: number;
 }
@@ -229,6 +230,7 @@ export class GatewayCoordinator {
 			iconSvg: this.options.iconSvg,
 			readPairingSecret: this.options.readPairingSecret,
 			getEndpoints: this.options.getEndpoints,
+			remoteAccess: this.options.remoteAccess,
 		});
 	}
 

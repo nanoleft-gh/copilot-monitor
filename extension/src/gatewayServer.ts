@@ -18,6 +18,8 @@ import {
 	GatewayToolDecisionRequest,
 	HistoryPageResult,
 	MonitorRequestError,
+	RemoteAccessStatus,
+	RemoteAccessUpdateRequest,
 	SendMessageResult,
 } from './protocol';
 import { StateStreamHub } from './stateStream';
@@ -60,6 +62,13 @@ export interface GatewayServerOptions {
 	readonly secretRefreshIntervalMs?: number;
 	/** Every URL a client may reach this gateway through (LAN addresses, tunnels); re-read per health request. */
 	readonly getEndpoints?: (port: number) => readonly string[];
+	/** Remote access (dev tunnel) control; absent when the owner cannot run tunnels. */
+	readonly remoteAccess?: RemoteAccessController;
+}
+
+export interface RemoteAccessController {
+	get(): Promise<RemoteAccessStatus>;
+	update(request: RemoteAccessUpdateRequest): Promise<RemoteAccessStatus>;
 }
 
 export interface GatewayAddress {
@@ -181,6 +190,25 @@ export class GatewayServer {
 			}
 			if (request.method === 'GET' && url.pathname === '/api/state') {
 				this.sendJson(response, 200, this.backend.getState());
+				return;
+			}
+			if (url.pathname === '/api/remote-access' && (request.method === 'GET' || request.method === 'POST')) {
+				if (!this.options.remoteAccess) {
+					throw new MonitorRequestError(501, 'Remote access is not available on this computer.');
+				}
+				if (request.method === 'GET') {
+					this.sendJson(response, 200, await this.options.remoteAccess.get());
+					return;
+				}
+				const body = await this.readJsonBody(request) as Partial<RemoteAccessUpdateRequest>;
+				if (body.manualUrl !== undefined && body.manualUrl !== null && typeof body.manualUrl !== 'string') {
+					throw new MonitorRequestError(400, 'manualUrl must be a string or null.');
+				}
+				this.sendJson(response, 200, await this.options.remoteAccess.update({
+					...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+					...(body.manualUrl !== undefined ? { manualUrl: body.manualUrl } : {}),
+					...(body.retry === true ? { retry: true } : {}),
+				}));
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {

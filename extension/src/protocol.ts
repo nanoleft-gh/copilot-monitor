@@ -2,7 +2,7 @@ import type { TranscriptTurn } from './transcript';
 
 /** Advertised by `/api/health` on both the per-window bridge and the shared gateway. */
 export const apiVersion = 4;
-export const apiCapabilities = ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2'] as const;
+export const apiCapabilities = ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2', 'remoteAccess'] as const;
 
 export interface ActiveSessionState {
 	readonly resource: string;
@@ -241,6 +241,29 @@ export class MonitorRequestError extends Error {
 		super(message);
 		this.name = 'MonitorRequestError';
 	}
+}
+
+export type RemoteTunnelStatus =
+	| { readonly status: 'inactive' }
+	| { readonly status: 'unavailable'; readonly reason: string }
+	| { readonly status: 'signin-required' }
+	| { readonly status: 'starting' }
+	| { readonly status: 'active'; readonly url: string }
+	| { readonly status: 'error'; readonly error: string };
+
+/** Machine-wide remote access state, owned by whichever window runs the shared gateway. */
+export interface RemoteAccessStatus {
+	readonly enabled: boolean;
+	readonly manualUrl?: string;
+	readonly tunnel: RemoteTunnelStatus;
+}
+
+export interface RemoteAccessUpdateRequest {
+	readonly enabled?: boolean;
+	/** `null` clears the manual address. */
+	readonly manualUrl?: string | null;
+	/** Re-run the tunnel start (after the user signed in, or to retry an error). */
+	readonly retry?: boolean;
 }
 
 export interface HistoryPageRequest {

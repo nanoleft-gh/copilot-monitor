@@ -227,6 +227,7 @@ capabilities `sessionSync` and `eventsV2`.
 | `POST /api/sessions/sync` | Request one export snapshot for a session (user action) |
 | `GET /api/presence` (gateway) | Idle SSE stream followers hold open; does not count as a dashboard client |
 | `POST /api/auth` (gateway) | Browser-only: trades the pairing secret for an `HttpOnly; SameSite=Strict` cookie |
+| `GET` / `POST /api/remote-access` (gateway) | Machine-wide remote access (dev tunnel on/off, manual URL, tunnel state); every window manages it through the owner |
 
 ### 9.0 Pairing secret and reachability (`gatewayAuth.ts`, `hostIdentity.ts`)
 
@@ -254,10 +255,12 @@ the `code-tunnel` CLI shipped inside VS Code with `tunnel forward-internal --pro
 the same stdin (port list JSON) / stderr (`{"port_format"}`) protocol the built-in Ports view
 uses, authenticated with a token from `vscode.authentication.getSession('github', …)`. The CLI
 is a per-machine singleton with a stable address, so multiple windows and the Ports view can
-share it. Only the gateway owner runs it; followers display the address the gateway advertises.
+share it. Only the gateway owner runs it; the on/off choice and an optional manual URL are
+stored in `<shared>/remote-access.json` (not VS Code settings, whose writer rejects keys the
+running window has not registered) and every window reads/changes them via
+`/api/remote-access`, so the sidebar behaves identically in owner and follower windows.
 `env.asExternalUri` is a no-op in local windows and `workspace.openTunnel` is a proposed API,
-which is why the CLI is driven directly. A manual URL (Tailscale, Cloudflare Tunnel) can be
-advertised as well.
+which is why the CLI is driven directly.
 
 ### 9.1 Protocol 2 deltas (`stateDelta.ts`, `stateStream.ts`)
 
