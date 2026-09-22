@@ -53,6 +53,9 @@ const persistWaitAttempts = 40;
 const persistWaitDelayMs = 50;
 const maximumProgressiveIndexCacheFiles = 64;
 const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
+/** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
+const stallProbeDelayMs = 3_000;
+const maximumProbedToolCalls = 256;
 
 interface ExportSnapshot {
 	readonly resource: string;
@@ -93,6 +96,8 @@ export class SessionMonitor implements vscode.Disposable {
 	private modelCatalogRefreshing: Promise<boolean> | undefined;
 	private exportSnapshot: ExportSnapshot | undefined;
 	private exportRunning: Promise<void> | undefined;
+	private readonly probedToolCalls = new Set<string>();
+	private stallProbeTimer: NodeJS.Timeout | undefined;
 	private error: string | undefined;
 	private lastEmittedSignature: string | undefined;
 	private eventClientCount = 0;
@@ -165,6 +170,7 @@ export class SessionMonitor implements vscode.Disposable {
 		} else if (count === 0 && hadClients) {
 			this.nativeInputStateSync.stop();
 			this.exportSnapshot = undefined;
+			this.clearStallProbe();
 			void this.core.setViewerCount(0);
 		} else if (count > 0) {
 			void this.core.setViewerCount(count);
@@ -412,6 +418,7 @@ export class SessionMonitor implements vscode.Disposable {
 
 	dispose(): void {
 		this.disposed = true;
+		this.clearStallProbe();
 		this.progressiveAbortController.abort();
 		this.nativeInputStateSync.dispose();
 		this.core.dispose();
@@ -425,14 +432,67 @@ export class SessionMonitor implements vscode.Disposable {
 	// #region state assembly
 
 	private onCoreChanged(): void {
-		for (const session of this.core.getState().sessions) {
+		const coreState = this.core.getState();
+		for (const session of coreState.sessions) {
 			if (session.turns.length > 0) {
 				this.completePendingTurn(session.resource, session.turns);
 			}
 		}
 		this.error = undefined;
 		void this.refreshModelCatalog(false);
+		this.scheduleStallProbe(coreState.sessions.find(session => session.resource === coreState.activeSessionResource));
 		this.emit();
+	}
+
+	/**
+	 * Live sources cannot distinguish a tool waiting for confirmation from one that is simply
+	 * slow. When the newest turn has an approvable tool nobody has probed yet, run one export
+	 * after a grace period so the dashboard learns the renderer's real confirmation state.
+	 */
+	private scheduleStallProbe(active: ActiveSessionState | undefined): void {
+		if (!active || this.eventClientCount === 0 || this.stallProbeTimer) {
+			return;
+		}
+		const lastTurn = active.turns.at(-1);
+		const candidate = lastTurn?.status === 'working'
+			? lastTurn.activities.find(activity => activity.canApprove && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
+			: undefined;
+		if (!candidate) {
+			return;
+		}
+		const key = `${active.resource}:${candidate.id}`;
+		this.stallProbeTimer = setTimeout(() => {
+			this.stallProbeTimer = undefined;
+			if (this.disposed || this.eventClientCount === 0) {
+				return;
+			}
+			const current = this.getSessions().find(session => session.resource === active.resource);
+			const stillPending = current?.turns.at(-1)?.activities.some(activity => activity.id === candidate.id && activity.status !== 'completed');
+			if (!stillPending) {
+				return;
+			}
+			this.rememberProbe(key);
+			void this.syncNow(active.resource);
+		}, stallProbeDelayMs);
+		this.stallProbeTimer.unref();
+	}
+
+	private rememberProbe(key: string): void {
+		this.probedToolCalls.add(key);
+		while (this.probedToolCalls.size > maximumProbedToolCalls) {
+			const oldest = this.probedToolCalls.values().next().value as string | undefined;
+			if (!oldest) {
+				break;
+			}
+			this.probedToolCalls.delete(oldest);
+		}
+	}
+
+	private clearStallProbe(): void {
+		if (this.stallProbeTimer) {
+			clearTimeout(this.stallProbeTimer);
+			this.stallProbeTimer = undefined;
+		}
 	}
 
 	private decorateSession(session: ActiveSessionState): ActiveSessionState {

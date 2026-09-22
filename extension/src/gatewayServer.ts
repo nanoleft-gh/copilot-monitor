@@ -10,6 +10,7 @@ import {
 	GatewayModelSelectionRequest,
 	GatewayModelConfigurationRequest,
 	GatewaySelectSessionRequest,
+	GatewaySyncSessionRequest,
 	GatewaySendMessageRequest,
 	GatewayState,
 	GatewayToolDecisionRequest,
@@ -32,6 +33,7 @@ export interface GatewayBackend {
 	sendMessage(request: GatewaySendMessageRequest): Promise<SendMessageResult>;
 	editTurn(request: GatewayEditTurnRequest): Promise<SendMessageResult>;
 	selectSession(request: GatewaySelectSessionRequest): Promise<void>;
+	syncSession(request: GatewaySyncSessionRequest): Promise<void>;
 	loadHistory(request: GatewayHistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel(request: GatewayModelSelectionRequest): Promise<void>;
 	configureModel(request: GatewayModelConfigurationRequest): Promise<void>;
@@ -157,8 +159,8 @@ export class GatewayServer {
 					...(this.options.hostId ? { hostId: this.options.hostId } : {}),
 					...(this.options.leaseNonce ? { leaseNonce: this.options.leaseNonce } : {}),
 					...(this.options.ownerId ? { ownerId: this.options.ownerId } : {}),
-					apiVersion: 3,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
+					apiVersion: 4,
+					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
 				});
 				return;
 			}
@@ -204,6 +206,17 @@ export class GatewayServer {
 					throw new MonitorRequestError(400, 'Window id and session resource are required.');
 				}
 				await this.backend.selectSession({ windowId, sessionResource });
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/sync') {
+				const body = await this.readJsonBody(request) as Partial<GatewaySyncSessionRequest>;
+				const windowId = typeof body.windowId === 'string' ? body.windowId : '';
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				if (!windowId || !sessionResource) {
+					throw new MonitorRequestError(400, 'Window id and session resource are required.');
+				}
+				await this.backend.syncSession({ windowId, sessionResource });
 				this.sendJson(response, 204, undefined);
 				return;
 			}

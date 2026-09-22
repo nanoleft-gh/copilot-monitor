@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { GatewayBackend, GatewayServer } from '../gatewayServer';
 import { GatewayCoordinator } from '../gatewayCoordinator';
-import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewayToolDecisionRequest } from '../protocol';
+import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewaySyncSessionRequest, GatewayToolDecisionRequest } from '../protocol';
 
 const emptyState: GatewayState = { version: 2, gatewayStartedAt: 1, windows: [] };
 
@@ -14,6 +14,7 @@ class TestGatewayBackend implements GatewayBackend {
 	messages: GatewaySendMessageRequest[] = [];
 	edits: GatewayEditTurnRequest[] = [];
 	selections: GatewaySelectSessionRequest[] = [];
+	syncs: GatewaySyncSessionRequest[] = [];
 	historyRequests: GatewayHistoryPageRequest[] = [];
 	clientCounts: number[] = [];
 	toolDecisions: GatewayToolDecisionRequest[] = [];
@@ -45,6 +46,10 @@ class TestGatewayBackend implements GatewayBackend {
 
 	async selectSession(request: GatewaySelectSessionRequest): Promise<void> {
 		this.selections.push(request);
+	}
+
+	async syncSession(request: GatewaySyncSessionRequest): Promise<void> {
+		this.syncs.push(request);
 	}
 
 	async loadHistory(request: GatewayHistoryPageRequest) {
@@ -93,8 +98,8 @@ describe('GatewayServer', () => {
 		try {
 			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json());
 			assert.deepEqual(health, {
-				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 3,
-				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
+				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 4,
+				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
 			});
 			const page = await fetch(`${baseUrl}/`);
 			assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' 'unsafe-inline'/);
@@ -125,6 +130,11 @@ describe('GatewayServer', () => {
 				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selection),
 			})).status, 204);
 			assert.deepEqual(backend.selections, [selection]);
+
+			assert.equal((await fetch(`${baseUrl}/api/sessions/sync`, {
+				method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selection),
+			})).status, 204);
+			assert.deepEqual(backend.syncs, [selection]);
 
 			const history = { windowId: 'w1', sessionResource: 's1', sessionRevision: 'rev-1', before: 40, limit: 40 };
 			const historyResponse = await fetch(`${baseUrl}/api/sessions/history`, {

@@ -8,6 +8,7 @@ import {
 	GatewayModelSelectionRequest,
 	GatewayModelConfigurationRequest,
 	GatewaySelectSessionRequest,
+	GatewaySyncSessionRequest,
 	GatewaySendMessageRequest,
 	GatewayState,
 	GatewayToolDecisionRequest,
@@ -90,6 +91,11 @@ export class AggregateMonitor {
 		await connection.postJson('/api/sessions/select', {
 			sessionResource: request.sessionResource,
 		});
+	}
+
+	async syncSession(request: GatewaySyncSessionRequest): Promise<void> {
+		const connection = this.requireConnection(request.windowId);
+		await connection.postJson('/api/sessions/sync', { sessionResource: request.sessionResource });
 	}
 
 	async loadHistory(request: GatewayHistoryPageRequest): Promise<HistoryPageResult> {

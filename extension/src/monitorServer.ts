@@ -1,6 +1,6 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, ToolDecisionRequest } from './protocol';
+import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, SyncSessionRequest, ToolDecisionRequest } from './protocol';
 
 const maximumRequestBytes = 64 * 1024;
 
@@ -17,6 +17,7 @@ export interface MonitorBackend {
 	sendMessage(request: SendMessageRequest): Promise<SendMessageResult>;
 	editTurn?(request: EditTurnRequest): Promise<EditTurnResult>;
 	selectSession?(sessionResource: string): Promise<void>;
+	syncNow?(sessionResource?: string): Promise<void>;
 	loadHistory?(request: HistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel?(request: ModelSelectionRequest): Promise<void>;
 	configureModel?(request: ModelConfigurationRequest): Promise<void>;
@@ -141,8 +142,8 @@ export class MonitorServer {
 			if (request.method === 'GET' && url.pathname === '/api/health') {
 				this.sendJson(response, 200, {
 					service: 'githubcopilot-monitor-window',
-					apiVersion: 3,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
+					apiVersion: 4,
+					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
 				});
 				return;
 			}
@@ -201,6 +202,15 @@ export class MonitorServer {
 					throw new MonitorRequestError(501, 'Session selection is unavailable.');
 				}
 				await this.backend.selectSession(sessionResource);
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/sync') {
+				const body = await this.readJsonBody(request) as Partial<SyncSessionRequest>;
+				if (!this.backend.syncNow) {
+					throw new MonitorRequestError(501, 'On-demand sync is unavailable.');
+				}
+				await this.backend.syncNow(typeof body.sessionResource === 'string' ? body.sessionResource : undefined);
 				this.sendJson(response, 204, undefined);
 				return;
 			}

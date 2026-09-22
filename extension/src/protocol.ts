@@ -111,6 +111,14 @@ export interface SelectSessionRequest {
 	readonly sessionResource: string;
 }
 
+export interface SyncSessionRequest {
+	readonly sessionResource: string;
+}
+
+export interface GatewaySyncSessionRequest extends SyncSessionRequest {
+	readonly windowId: string;
+}
+
 export interface HistoryPageRequest {
 	readonly sessionResource: string;
 	readonly sessionRevision: string;
