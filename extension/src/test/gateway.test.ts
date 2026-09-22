@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { GatewayBackend, GatewayServer } from '../gatewayServer';
 import { GatewayCoordinator } from '../gatewayCoordinator';
+import type { WatchTarget } from '../stateStream';
 import { GatewayCreateSessionRequest, GatewayEditTurnRequest, GatewayHistoryPageRequest, GatewayModelConfigurationRequest, GatewayModelSelectionRequest, GatewayPermissionLevelRequest, GatewayRenameSessionRequest, GatewaySelectSessionRequest, GatewaySendMessageRequest, GatewayState, GatewaySyncSessionRequest, GatewayToolDecisionRequest, RemoteAccessStatus, RemoteAccessUpdateRequest } from '../protocol';
 
 const emptyState: GatewayState = { version: 2, gatewayStartedAt: 1, windows: [] };
@@ -63,6 +64,11 @@ class TestGatewayBackend implements GatewayBackend {
 
 	setEventClientCount(count: number): void {
 		this.clientCounts.push(count);
+	}
+
+	watched: WatchTarget[][] = [];
+	setWatched(targets: readonly WatchTarget[]): void {
+		this.watched.push([...targets]);
 	}
 
 	async decideTool(request: GatewayToolDecisionRequest): Promise<void> {
@@ -185,7 +191,7 @@ describe('GatewayServer', () => {
 			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json());
 			assert.deepEqual(health, {
 				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 4,
-				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2', 'remoteAccess'],
+				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2', 'remoteAccess', 'lazyHistory'],
 				authRequired: true, authorized: false, endpoints: [],
 			});
 			const page = await fetch(`${baseUrl}/`);
@@ -197,10 +203,14 @@ describe('GatewayServer', () => {
 			assert.equal(await mermaid.text(), 'globalThis.mermaid = {};');
 			assert.equal(await fetch(`${baseUrl}/assets/icon.svg`).then(response => response.text()), '<svg/>');
 			const abortController = new AbortController();
-			const events = await fetch(`${baseUrl}/api/events`, { signal: abortController.signal, headers: authorized });
+			const watchQuery = `watch=${encodeURIComponent('w2|s2')}&watch=${encodeURIComponent('w1|s1')}`;
+			const events = await fetch(`${baseUrl}/api/events?v=2&${watchQuery}`, { signal: abortController.signal, headers: authorized });
 			assert.equal(events.status, 200);
 			assert.equal(backend.clientCounts.at(-1), 1);
+			assert.deepEqual(backend.watched.at(-1), [{ windowId: 'w2', sessionResource: 's2' }, { windowId: 'w1', sessionResource: 's1' }]);
 			abortController.abort();
+			await waitFor(() => backend.clientCounts.at(-1) === 0, 2_000);
+			assert.deepEqual(backend.watched.at(-1), [], 'watch ends with the stream');
 
 			const message = { windowId: 'w2', id: 'm1', sessionResource: 's2', text: 'Hello' };
 			assert.equal((await fetch(`${baseUrl}/api/messages`, {

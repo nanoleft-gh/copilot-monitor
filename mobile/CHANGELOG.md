@@ -1,5 +1,12 @@
 # Mobile Changelog
 
+## [2.1.0]
+
+Opening the app no longer makes every VS Code window re-read its chat history.
+
+- **Watches only the chat on screen.** The conversation screen tells the computer which chat it shows through its event stream (`watch=`), so the computer tails that one chat and streams its newest turns; the list screen asks for nothing but metadata. Requires extension 2.1.0 (`lazyHistory` capability); against an older extension the list works and chats stay in the old always-on mode.
+- **Lighter first load.** A chat opens with its newest 8 turns; *Load earlier messages* fetches 20 at a time from the computer's on-disk digest instead of its in-memory copy.
+
 ## [2.0.0]
 
 Pair once, stay connected: pairing secret, self-healing connections, remote access, and markdown replies.

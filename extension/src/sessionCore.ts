@@ -1,28 +1,37 @@
 import * as fs from 'node:fs/promises';
+import { mkdirSync } from 'node:fs';
 import * as path from 'node:path';
 import { DirectoryEvent, DirectoryWatcher } from './directoryWatcher';
 import { LineTailer } from './lineTailer';
 import { mergeLiveTurns } from './liveMerge';
 import { LiveTurnAccumulator, relevantDebugLogTypes, sniffDebugLogType } from './liveTurns';
+import { parseSessionModelState } from './modelCatalog';
 import type { ActiveSessionState, ChatPermissionLevel } from './protocol';
+import { SessionDigest } from './sessionDigest';
+import type { DigestSyncResult } from './sessionDigestBuilder';
+import { syncDigestForSession } from './sessionDigestClient';
 import { readSessionHead } from './sessionHeadTitle';
 import { readSessionIndex, SessionIndexEntry } from './sessionIndex';
-import { SessionLogProjection } from './sessionLogProjection';
 import { localSessionResource } from './sessionResource';
-import type { TranscriptTurn } from './transcript';
+import { findTailStart } from './tailScan';
+import type { JsonObject, TranscriptTurn } from './transcript';
 
 /**
  * Event-driven model of one VS Code window's chat sessions.
  *
- * Sources (all consumed by byte-offset tailing on fs.watch events, never re-read whole):
- * - `state.vscdb` → session list (title, dates, last state) via {@link readSessionIndex};
- * - `chatSessions/<id>.jsonl` → authoritative turns of the *selected* session;
- * - `transcripts/<id>.jsonl` and `debug-logs/<id>/main.jsonl` → live progress overlay and
- *   an activity signal ("working") for the list.
+ * The session *list* is metadata only: `state.vscdb` (title, dates, last state), `fs.stat`
+ * of each log, and directory events on the live logs as a "working" signal. No session log
+ * is parsed for it.
  *
- * Nothing runs while no viewer is connected: watchers and tailers exist only between
- * `setViewerCount(>0)` and `setViewerCount(0)`. There are no periodic timers; the only
- * timers are event debounces and the one-shot "activity aged out" transition.
+ * A session a client *watches* additionally gets: its on-disk digest brought up to date
+ * (only bytes appended since last time are read; a rewrite is detected and rebuilt in a
+ * worker), the newest `liveWindowTurns` turns from that digest, and live overlays tailed from
+ * the newest turns of Copilot's transcript and debug log. Everything else is paged from the
+ * digest on demand. Watching ends a grace period after the last client stops watching, so a
+ * phone going to the background briefly does not redo the attach.
+ *
+ * Nothing runs while no viewer is connected. There are no periodic timers; the only timers
+ * are event debounces, the one-shot "activity aged out" transition, and the unwatch grace.
  */
 
 export interface SessionCorePaths {
@@ -30,21 +39,27 @@ export interface SessionCorePaths {
 	readonly transcriptDirectories: readonly string[];
 	readonly debugLogDirectories: readonly string[];
 	readonly indexDatabasePath: string;
+	/** SQLite file holding the per-session digests; created on first use. */
+	readonly digestDatabasePath: string;
 }
 
 export interface SessionCoreOptions {
 	readonly paths: SessionCorePaths;
 	readonly log?: (message: string) => void;
 	readonly now?: () => number;
-	/** Newest turns kept exact for the selected session and sent to viewers. */
-	readonly retainedTurns?: number;
+	/** Newest persisted turns kept in memory and streamed for a watched session. */
+	readonly liveWindowTurns?: number;
 	readonly fileDebounceMs?: number;
 	readonly indexDebounceMs?: number;
-	/** How long a transcript/debug-log write keeps a non-selected session marked as working. */
+	/** How long a transcript/debug-log write keeps a non-watched session marked as working. */
 	readonly activityWindowMs?: number;
-	/** Session logs larger than this start tailing near EOF (history unavailable). */
-	readonly oversizedSessionBytes?: number;
-	readonly maximumLineBytes?: number;
+	/** How long a session stays attached after its last watcher left. */
+	readonly detachGraceMs?: number;
+	readonly maximumWatchedSessions?: number;
+	/** Bytes read back from the end of a live log on attach. */
+	readonly liveLookbackBytes?: number;
+	/** Test hook: replaces the inline/worker digest sync. */
+	readonly syncDigest?: (digest: SessionDigest, sessionId: string, filePath: string, signal: AbortSignal) => Promise<DigestSyncResult>;
 }
 
 export interface SessionCoreState {
@@ -75,36 +90,59 @@ interface SessionRecord {
 	lastActivityAt: number | undefined;
 }
 
-interface ActiveTail {
+interface DigestView {
+	status: 'loading' | 'ready' | 'oversized' | 'error';
+	requestCount: number;
+	generation: number;
+	customTitle: string | undefined;
+	inputState: JsonObject;
+	lastModelId: string | undefined;
+	error: string | undefined;
+}
+
+interface WatchedTail {
 	readonly sessionId: string;
-	readonly projection: SessionLogProjection;
-	readonly sessionTailer: LineTailer;
+	readonly filePath: string;
+	readonly digest: DigestView;
+	liveWindow: TranscriptTurn[];
 	readonly transcript: LiveTurnAccumulator;
 	readonly transcriptTailer: LineTailer;
 	readonly debug: LiveTurnAccumulator;
 	readonly debugTailer: LineTailer;
 	readonly debugWatcher: DirectoryWatcher;
+	readonly abort: AbortController;
 	revision: number;
-	loading: boolean;
-	sessionLogError: string | undefined;
+	/** False until the first pass over the live logs finished; replayed lines are not activity. */
+	liveReplayed: boolean;
+	syncing: Promise<void> | undefined;
+	syncRequested: boolean;
+	syncFailures: number;
+	detachTimer: NodeJS.Timeout | undefined;
 }
 
-const defaultRetainedTurns = 40;
+const defaultLiveWindowTurns = 8;
 const defaultFileDebounceMs = 50;
 const defaultIndexDebounceMs = 400;
 const defaultActivityWindowMs = 15_000;
-const defaultOversizedSessionBytes = 256 * 1024 * 1024;
-const defaultMaximumLineBytes = 64 * 1024 * 1024;
+const defaultDetachGraceMs = 60_000;
+const defaultMaximumWatchedSessions = 3;
+const defaultLiveLookbackBytes = 4 * 1024 * 1024;
 const fallbackTitleBytes = 64 * 1024;
+const maximumSyncFailures = 3;
+const transcriptTurnMarker = '"type":"user.message"';
+const debugTurnMarker = '"type":"user_message"';
 
 export class SessionCore {
 	private readonly listeners = new Set<() => void>();
 	private readonly records = new Map<string, SessionRecord>();
 	private readonly watchers: DirectoryWatcher[] = [];
 	private readonly debounces = new Map<string, NodeJS.Timeout>();
-	private active: ActiveTail | undefined;
+	private readonly tails = new Map<string, WatchedTail>();
+	/** Sessions clients asked for, in the order they were asked; applied while viewers exist. */
+	private desiredWatched: string[] = [];
 	private activeSessionId: string | undefined;
 	private viewerCount = 0;
+	private teardownTimer: NodeJS.Timeout | undefined;
 	private indexRevision: string | undefined;
 	private indexEntries = new Map<string, SessionIndexEntry>();
 	private activityTimer: NodeJS.Timeout | undefined;
@@ -112,6 +150,7 @@ export class SessionCore {
 	private error: string | undefined;
 	private disposed = false;
 	private listRefresh: Promise<void> | undefined;
+	private digestStore: SessionDigest | undefined;
 
 	constructor(private readonly options: SessionCoreOptions) {}
 
@@ -128,42 +167,57 @@ export class SessionCore {
 		return this.activeSessionId;
 	}
 
-	/** Viewers gate all work. 0 → tear everything down; >0 → attach watchers and refresh. */
+	/** Sessions currently attached (including those in their unwatch grace period). */
+	get watchedSessions(): readonly string[] {
+		return [...this.tails.keys()];
+	}
+
+	/** Viewers gate all work. 0 → tear everything down after the grace; >0 → attach watchers and refresh. */
 	async setViewerCount(count: number): Promise<void> {
 		if (this.disposed) {
 			return;
 		}
 		const hadViewers = this.viewerCount > 0;
 		this.viewerCount = count;
-		if (count > 0 && !hadViewers) {
-			this.attachWatchers();
-			await this.refreshAll();
-		} else if (count === 0 && hadViewers) {
-			this.detachEverything();
+		if (count > 0) {
+			this.clearTeardown();
+			if (!hadViewers && this.watchers.length === 0) {
+				this.attachWatchers();
+				await this.refreshAll();
+			}
+			this.reconcileWatched();
+		} else if (hadViewers) {
+			this.scheduleTeardown();
 		}
 	}
 
-	/** Point the core at a session: its log, transcript and debug log get tailed. */
-	async selectSession(sessionId: string): Promise<void> {
+	/** The sessions clients are looking at right now; only these are tailed and carry turns. */
+	setWatched(sessionIds: readonly string[]): void {
 		if (this.disposed) {
 			return;
 		}
-		if (this.activeSessionId === sessionId && this.active) {
+		this.desiredWatched = [...new Set(sessionIds)];
+		if (this.viewerCount > 0) {
+			this.reconcileWatched();
+		}
+	}
+
+	/** Marks the session VS Code (or the dashboard) is focused on; does not attach anything. */
+	async selectSession(sessionId: string): Promise<void> {
+		if (this.disposed || this.activeSessionId === sessionId) {
 			return;
 		}
 		this.activeSessionId = sessionId;
-		if (this.viewerCount > 0) {
-			await this.attachActive(sessionId);
-		}
 		this.scheduleEmit();
 	}
 
-	/** Re-read the selected session's files now (after the monitor itself appended to them). */
+	/** Re-read the session's files now (after the monitor itself appended to them). */
 	async pokeSession(sessionId: string): Promise<void> {
-		if (this.active?.sessionId === sessionId) {
-			await this.pokeActive('all');
-		}
 		await this.refreshSessionList(`${sessionId}.jsonl`);
+		const tail = this.tails.get(sessionId);
+		if (tail) {
+			await Promise.all([this.syncDigest(tail), this.pokeLive(tail, 'all')]);
+		}
 	}
 
 	async refreshAll(): Promise<void> {
@@ -178,58 +232,53 @@ export class SessionCore {
 			const records = this.orderedRecords();
 			this.activeSessionId = (records.find(record => this.isEmpty(record) !== true) ?? records[0])?.sessionId;
 		}
-		if (this.activeSessionId && this.viewerCount > 0) {
-			if (this.active?.sessionId !== this.activeSessionId) {
-				await this.attachActive(this.activeSessionId);
-			} else {
-				await this.pokeActive('all');
-			}
-		}
 		this.scheduleEmit();
 	}
 
 	getState(): SessionCoreState {
 		const now = this.now();
-		const sessions = this.orderedRecords().map(record => record.sessionId === this.active?.sessionId
-			? this.buildActiveState(record, this.active, now)
-			: this.buildSummaryState(record, now));
+		const sessions = this.orderedRecords().map(record => {
+			const tail = this.tails.get(record.sessionId);
+			return tail ? this.buildWatchedState(record, tail, now) : this.buildSummaryState(record, now);
+		});
 		return {
 			sessions,
 			activeSessionResource: this.activeSessionId ? localSessionResource(this.activeSessionId) : undefined,
-			error: this.error ?? this.active?.sessionLogError,
+			error: this.error,
 		};
 	}
 
-	/** Absolute index of a request in the selected session, from the exact projection. */
+	/** Absolute index of a request in a digested session. */
 	requestIndexOf(sessionId: string, requestId: string): number | undefined {
-		const tail = this.active;
-		if (!tail || tail.sessionId !== sessionId) {
-			return undefined;
-		}
-		const count = tail.projection.snapshot.turnCount;
-		for (let index = count - 1; index >= 0; index--) {
-			const turn = tail.projection.turns(index, index + 1)[0];
-			if (turn?.id === requestId) {
-				return index;
-			}
-		}
-		return undefined;
+		return this.digestStore?.requestIndex(sessionId, requestId);
 	}
 
-	/** Pages persisted history of the selected session out of the projection. */
+	/**
+	 * Pages persisted history out of the digest. Available for watched sessions and for any
+	 * session whose digest still matches the log on disk.
+	 */
 	historyPage(sessionId: string, before: number, limit: number): HistoryPage | undefined {
-		const tail = this.active;
-		if (!tail || tail.sessionId !== sessionId) {
+		const digest = this.digestStore;
+		const record = this.records.get(sessionId);
+		if (!digest || !record) {
 			return undefined;
 		}
-		const snapshot = tail.projection.snapshot;
-		if (!snapshot.initialised || snapshot.oversized) {
+		const tail = this.tails.get(sessionId);
+		if (tail && tail.digest.status !== 'ready') {
 			return undefined;
 		}
-		const total = snapshot.turnCount;
+		const row = digest.session(sessionId);
+		if (!row || row.filePath !== record.filePath) {
+			return undefined;
+		}
+		// The digest records a bigint (whole-ms) mtime; the record holds the float form.
+		if (!tail && (row.cursor.size !== record.size || Math.abs(row.cursor.mtimeMs - record.mtimeMs) >= 1)) {
+			return undefined;
+		}
+		const total = row.requestCount;
 		const end = Math.max(0, Math.min(Math.floor(before), total));
 		const start = Math.max(0, end - Math.max(1, Math.min(Math.floor(limit), 100)));
-		return { turns: tail.projection.turns(start, end), totalCount: total, start, end, hasEarlier: start > 0 };
+		return { turns: digest.turns(sessionId, start, end), totalCount: total, start, end, hasEarlier: start > 0 };
 	}
 
 	sessionFile(sessionId: string): { filePath: string; size: number; mtimeMs: number } | undefined {
@@ -237,14 +286,13 @@ export class SessionCore {
 		return record ? { filePath: record.filePath, size: record.size, mtimeMs: record.mtimeMs } : undefined;
 	}
 
-	isOversized(sessionId: string): boolean {
-		return this.active?.sessionId === sessionId && this.active.projection.snapshot.oversized;
-	}
-
 	dispose(): void {
 		this.disposed = true;
+		this.clearTeardown();
 		this.detachEverything();
 		this.listeners.clear();
+		this.digestStore?.close();
+		this.digestStore = undefined;
 	}
 
 	// #region watchers
@@ -261,7 +309,7 @@ export class SessionCore {
 
 	private addWatcher(directory: string, listener: (event: DirectoryEvent) => void): void {
 		const watcher = new DirectoryWatcher(directory, event => {
-			if (!this.disposed && this.viewerCount > 0) {
+			if (!this.disposed && this.watchers.includes(watcher)) {
 				listener(event);
 			}
 		});
@@ -270,23 +318,33 @@ export class SessionCore {
 	}
 
 	private onSessionDirectoryEvent(directory: string, event: DirectoryEvent): void {
+		const debounceMs = this.options.fileDebounceMs ?? defaultFileDebounceMs;
 		if (event.type === 'reconcile') {
-			this.debounce('list', () => void this.refreshSessionList(undefined), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+			this.debounce('list', () => void this.refreshSessionList(undefined), debounceMs);
+			for (const tail of this.tails.values()) {
+				this.debounce(`digest:${tail.sessionId}`, () => void this.syncDigest(tail), debounceMs);
+			}
 			return;
 		}
 		const name = event.name;
 		if (name && !name.endsWith('.jsonl')) {
 			return;
 		}
-		if (name && this.active && path.join(directory, name) === this.active.sessionTailer.filePath) {
-			this.debounce('active:session', () => void this.pokeActive('session'), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+		if (name) {
+			const tail = this.tails.get(name.slice(0, -'.jsonl'.length));
+			if (tail && path.join(directory, name) === tail.filePath) {
+				this.debounce(`digest:${tail.sessionId}`, () => void this.syncDigest(tail), debounceMs);
+			}
 		}
-		this.debounce(`list:${name ?? '*'}`, () => void this.refreshSessionList(name), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+		this.debounce(`list:${name ?? '*'}`, () => void this.refreshSessionList(name), debounceMs);
 	}
 
 	private onTranscriptDirectoryEvent(event: DirectoryEvent): void {
+		const debounceMs = this.options.fileDebounceMs ?? defaultFileDebounceMs;
 		if (event.type === 'reconcile') {
-			this.debounce('active:transcript', () => void this.pokeActive('transcript'), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+			for (const tail of this.tails.values()) {
+				this.debounce(`transcript:${tail.sessionId}`, () => void this.pokeLive(tail, 'transcript'), debounceMs);
+			}
 			return;
 		}
 		const name = event.name;
@@ -295,8 +353,9 @@ export class SessionCore {
 		}
 		const sessionId = name.slice(0, -'.jsonl'.length);
 		this.noteActivity(sessionId);
-		if (this.active?.sessionId === sessionId) {
-			this.debounce('active:transcript', () => void this.pokeActive('transcript'), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+		const tail = this.tails.get(sessionId);
+		if (tail) {
+			this.debounce(`transcript:${sessionId}`, () => void this.pokeLive(tail, 'transcript'), debounceMs);
 		}
 	}
 
@@ -336,6 +395,37 @@ export class SessionCore {
 		this.debounces.set(key, timer);
 	}
 
+	private clearDebounce(key: string): void {
+		const timer = this.debounces.get(key);
+		if (timer) {
+			clearTimeout(timer);
+			this.debounces.delete(key);
+		}
+	}
+
+	private scheduleTeardown(): void {
+		const grace = this.options.detachGraceMs ?? defaultDetachGraceMs;
+		if (grace <= 0) {
+			this.detachEverything();
+			return;
+		}
+		this.clearTeardown();
+		this.teardownTimer = setTimeout(() => {
+			this.teardownTimer = undefined;
+			if (!this.disposed && this.viewerCount === 0) {
+				this.detachEverything();
+			}
+		}, grace);
+		this.teardownTimer.unref();
+	}
+
+	private clearTeardown(): void {
+		if (this.teardownTimer) {
+			clearTimeout(this.teardownTimer);
+			this.teardownTimer = undefined;
+		}
+	}
+
 	private detachEverything(): void {
 		for (const watcher of this.watchers.splice(0)) {
 			watcher.dispose();
@@ -348,7 +438,9 @@ export class SessionCore {
 			clearTimeout(this.activityTimer);
 			this.activityTimer = undefined;
 		}
-		this.detachActive();
+		for (const tail of [...this.tails.values()]) {
+			this.detach(tail);
+		}
 	}
 
 	// #endregion
@@ -423,13 +515,7 @@ export class SessionCore {
 				return;
 			}
 		}
-		const record = this.records.get(sessionId);
-		if (record) {
-			this.records.delete(sessionId);
-			if (this.active?.sessionId === sessionId) {
-				await this.pokeActive('session');
-			}
-		}
+		this.records.delete(sessionId);
 	}
 
 	private async upsertRecord(filePath: string): Promise<boolean> {
@@ -537,95 +623,228 @@ export class SessionCore {
 
 	// #endregion
 
-	// #region active session
+	// #region watched sessions
 
-	private async attachActive(sessionId: string): Promise<void> {
-		this.detachActive();
+	private reconcileWatched(): void {
+		const limit = Math.max(1, this.options.maximumWatchedSessions ?? defaultMaximumWatchedSessions);
+		const wanted = new Set(this.desiredWatched.slice(-limit));
+		for (const tail of this.tails.values()) {
+			if (wanted.has(tail.sessionId)) {
+				this.cancelDetach(tail);
+			} else {
+				this.scheduleDetach(tail);
+			}
+		}
+		for (const sessionId of wanted) {
+			if (!this.tails.has(sessionId)) {
+				this.attach(sessionId);
+			}
+		}
+	}
+
+	private attach(sessionId: string): void {
 		const record = this.records.get(sessionId);
-		const sessionPath = record?.filePath ?? path.join(this.options.paths.sessionDirectories[0] ?? '', `${sessionId}.jsonl`);
+		const filePath = record?.filePath ?? path.join(this.options.paths.sessionDirectories[0] ?? '', `${sessionId}.jsonl`);
 		const transcriptPath = path.join(this.options.paths.transcriptDirectories[0] ?? '', `${sessionId}.jsonl`);
 		const debugDirectory = path.join(this.options.paths.debugLogDirectories[0] ?? '', sessionId);
 		const debugPath = path.join(debugDirectory, 'main.jsonl');
-
-		const projection = new SessionLogProjection({ retainedRawTurns: this.options.retainedTurns ?? defaultRetainedTurns });
-		const transcript = new LiveTurnAccumulator();
-		const debug = new LiveTurnAccumulator();
-		const tail: ActiveTail = {
+		const lookback = this.options.liveLookbackBytes ?? defaultLiveLookbackBytes;
+		const liveTurns = this.liveWindow();
+		const transcript = new LiveTurnAccumulator(liveTurns);
+		const debug = new LiveTurnAccumulator(liveTurns);
+		const tail: WatchedTail = {
 			sessionId,
-			projection,
+			filePath,
+			digest: { status: 'loading', requestCount: 0, generation: 0, customTitle: undefined, inputState: {}, lastModelId: undefined, error: undefined },
+			liveWindow: [],
 			transcript,
-			debug,
-			revision: 0,
-			loading: true,
-			sessionLogError: undefined,
-			sessionTailer: new LineTailer(sessionPath, {
-				onLines: (lines, generation) => this.applySessionLines(tail, lines, generation),
-				onReset: () => { projection.reset(); this.bump(tail); },
-				onLineSkipped: (_bytes, index) => {
-					if (index === 0) {
-						projection.markInitialSkipped();
-						this.bump(tail);
-					}
-				},
-				onGone: () => { projection.reset(); this.bump(tail); },
-			}, {
-				maximumLineBytes: this.options.maximumLineBytes ?? defaultMaximumLineBytes,
-				skipToTailIfLargerThan: this.options.oversizedSessionBytes ?? defaultOversizedSessionBytes,
-			}),
 			transcriptTailer: new LineTailer(transcriptPath, {
-				onLines: lines => this.applyLiveLines(tail, transcript, lines, line => transcript.applyTranscriptLine(line)),
+				onLines: lines => this.applyLiveLines(tail, lines, line => transcript.applyTranscriptLine(line)),
 				onReset: () => { transcript.reset(); this.bump(tail); },
 				onGone: () => { transcript.reset(); this.bump(tail); },
+			}, {
+				initialOffset: size => findTailStart(transcriptPath, size, { marker: transcriptTurnMarker, maximumLookbackBytes: lookback }),
 			}),
+			debug,
 			debugTailer: new LineTailer(debugPath, {
-				onLines: lines => this.applyLiveLines(tail, debug, lines, line => {
+				onLines: lines => this.applyLiveLines(tail, lines, line => {
 					const type = sniffDebugLogType(line);
 					return type !== undefined && relevantDebugLogTypes.has(type) && debug.applyDebugLogLine(line);
 				}),
 				onReset: () => { debug.reset(); this.bump(tail); },
 				onGone: () => { debug.reset(); this.bump(tail); },
-			}, { maximumLineBytes: 8 * 1024 * 1024 }),
+			}, {
+				maximumLineBytes: 8 * 1024 * 1024,
+				initialOffset: size => findTailStart(debugPath, size, { marker: debugTurnMarker, maximumLookbackBytes: lookback }),
+			}),
 			debugWatcher: new DirectoryWatcher(debugDirectory, event => {
-				if (this.active !== tail || this.viewerCount === 0) {
+				if (this.tails.get(sessionId) !== tail) {
 					return;
 				}
 				if (event.type === 'reconcile' || !event.name || event.name === 'main.jsonl') {
-					this.debounce('active:debug', () => void this.pokeActive('debug'), this.options.fileDebounceMs ?? defaultFileDebounceMs);
+					this.debounce(`debug:${sessionId}`, () => void this.pokeLive(tail, 'debug'), this.options.fileDebounceMs ?? defaultFileDebounceMs);
 				}
 			}),
+			abort: new AbortController(),
+			revision: 0,
+			liveReplayed: false,
+			syncing: undefined,
+			syncRequested: false,
+			syncFailures: 0,
+			detachTimer: undefined,
 		};
-		this.active = tail;
+		this.tails.set(sessionId, tail);
 		tail.debugWatcher.start();
 		this.scheduleEmit();
-		await this.pokeActive('all');
-		tail.loading = false;
-		this.scheduleEmit();
+		void this.syncDigest(tail);
+		void this.pokeLive(tail, 'all').then(() => {
+			tail.liveReplayed = true;
+		});
 	}
 
-	private detachActive(): void {
-		const tail = this.active;
-		this.active = undefined;
-		if (!tail) {
+	private scheduleDetach(tail: WatchedTail): void {
+		if (tail.detachTimer) {
 			return;
 		}
-		tail.sessionTailer.dispose();
+		const grace = this.options.detachGraceMs ?? defaultDetachGraceMs;
+		if (grace <= 0) {
+			this.detach(tail);
+			this.scheduleEmit();
+			return;
+		}
+		tail.detachTimer = setTimeout(() => {
+			tail.detachTimer = undefined;
+			if (this.tails.get(tail.sessionId) === tail) {
+				this.detach(tail);
+				this.scheduleEmit();
+			}
+		}, grace);
+		tail.detachTimer.unref();
+	}
+
+	private cancelDetach(tail: WatchedTail): void {
+		if (tail.detachTimer) {
+			clearTimeout(tail.detachTimer);
+			tail.detachTimer = undefined;
+		}
+	}
+
+	private detach(tail: WatchedTail): void {
+		this.cancelDetach(tail);
+		this.tails.delete(tail.sessionId);
+		tail.abort.abort();
 		tail.transcriptTailer.dispose();
 		tail.debugTailer.dispose();
 		tail.debugWatcher.dispose();
+		for (const key of ['digest', 'transcript', 'debug']) {
+			this.clearDebounce(`${key}:${tail.sessionId}`);
+		}
 	}
 
-	private async pokeActive(which: 'all' | 'session' | 'transcript' | 'debug'): Promise<void> {
-		const tail = this.active;
-		if (!tail) {
+	/** Brings the digest up to date; concurrent requests coalesce into one follow-up pass. */
+	private syncDigest(tail: WatchedTail): Promise<void> {
+		if (this.tails.get(tail.sessionId) !== tail || tail.abort.signal.aborted) {
+			return Promise.resolve();
+		}
+		if (tail.syncing) {
+			tail.syncRequested = true;
+			return tail.syncing;
+		}
+		tail.syncing = this.runDigestSync(tail).finally(() => {
+			tail.syncing = undefined;
+			if (tail.syncRequested && this.tails.get(tail.sessionId) === tail) {
+				tail.syncRequested = false;
+				void this.syncDigest(tail);
+			}
+		});
+		return tail.syncing;
+	}
+
+	private async runDigestSync(tail: WatchedTail): Promise<void> {
+		let digest: SessionDigest;
+		try {
+			digest = this.digest();
+		} catch (error) {
+			this.failDigest(tail, error);
+			return;
+		}
+		try {
+			const sync = this.options.syncDigest ?? ((store, sessionId, filePath, signal) => syncDigestForSession(store, sessionId, filePath, { signal }));
+			const result = await sync(digest, tail.sessionId, tail.filePath, tail.abort.signal);
+			if (this.tails.get(tail.sessionId) !== tail) {
+				return;
+			}
+			tail.syncFailures = 0;
+			if (result.status === 'oversized') {
+				tail.digest.status = 'oversized';
+				tail.digest.requestCount = 0;
+				tail.liveWindow = [];
+				this.bump(tail);
+				return;
+			}
+			if (result.status === 'gone') {
+				tail.digest.status = 'ready';
+				tail.digest.requestCount = 0;
+				tail.digest.customTitle = undefined;
+				tail.digest.inputState = {};
+				tail.digest.lastModelId = undefined;
+				tail.liveWindow = [];
+				this.bump(tail);
+				return;
+			}
+			const row = digest.session(tail.sessionId);
+			if (!row) {
+				return;
+			}
+			const window = this.liveWindow();
+			const wasReady = tail.digest.status === 'ready';
+			tail.digest.status = 'ready';
+			tail.digest.error = undefined;
+			tail.digest.requestCount = row.requestCount;
+			tail.digest.generation = row.generation;
+			tail.digest.customTitle = row.customTitle;
+			tail.digest.inputState = row.inputState;
+			tail.digest.lastModelId = digest.lastModelId(tail.sessionId);
+			tail.liveWindow = digest.turns(tail.sessionId, Math.max(0, row.requestCount - window), row.requestCount);
+			if (result.status !== 'unchanged' || !wasReady) {
+				this.bump(tail);
+			}
+		} catch (error) {
+			if (tail.abort.signal.aborted) {
+				return;
+			}
+			this.failDigest(tail, error);
+		}
+	}
+
+	private failDigest(tail: WatchedTail, error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		this.log(`digest sync failed for ${tail.sessionId}: ${message}`);
+		tail.syncFailures++;
+		if (tail.digest.status === 'loading') {
+			tail.digest.status = 'error';
+		}
+		tail.digest.error = message;
+		this.bump(tail);
+		if (tail.syncFailures < maximumSyncFailures) {
+			this.debounce(`digest:${tail.sessionId}`, () => void this.syncDigest(tail), 1_000 * tail.syncFailures);
+		}
+	}
+
+	private digest(): SessionDigest {
+		if (!this.digestStore) {
+			mkdirSync(path.dirname(this.options.paths.digestDatabasePath), { recursive: true });
+			// Short wait: the extension host must never block on a worker's write transaction.
+			this.digestStore = new SessionDigest(this.options.paths.digestDatabasePath, { busyTimeoutMs: 250 });
+		}
+		return this.digestStore;
+	}
+
+	private async pokeLive(tail: WatchedTail, which: 'all' | 'transcript' | 'debug'): Promise<void> {
+		if (this.tails.get(tail.sessionId) !== tail) {
 			return;
 		}
 		const jobs: Promise<void>[] = [];
-		if (which === 'all' || which === 'session') {
-			jobs.push(tail.sessionTailer.poke().catch(error => {
-				tail.sessionLogError = error instanceof Error ? error.message : String(error);
-				this.log(`session log tail failed: ${tail.sessionLogError}`);
-			}));
-		}
 		if (which === 'all' || which === 'transcript') {
 			jobs.push(tail.transcriptTailer.poke().catch(error => this.log(`transcript tail failed: ${String(error)}`)));
 		}
@@ -635,37 +854,14 @@ export class SessionCore {
 		await Promise.all(jobs);
 	}
 
-	private applySessionLines(tail: ActiveTail, lines: readonly string[], generation: number): void {
-		let changed = false;
-		for (const line of lines) {
-			try {
-				changed = tail.projection.applyLine(line) || changed;
-			} catch (error) {
-				this.log(`session log desync (${generation}): ${error instanceof Error ? error.message : String(error)}`);
-				tail.projection.reset();
-				void tail.sessionTailer.resync();
-				return;
-			}
-		}
-		if (tail.projection.snapshot.needsFullReload) {
-			tail.projection.reset();
-			void tail.sessionTailer.resync();
-			return;
-		}
-		tail.sessionLogError = undefined;
-		if (changed) {
-			this.bump(tail);
-		}
-	}
-
-	private applyLiveLines(tail: ActiveTail, _source: LiveTurnAccumulator, lines: readonly string[], apply: (line: string) => boolean): void {
+	private applyLiveLines(tail: WatchedTail, lines: readonly string[], apply: (line: string) => boolean): void {
 		let changed = false;
 		for (const line of lines) {
 			changed = apply(line) || changed;
 		}
 		// Replaying an existing file on attach, or log chatter that touched no turn, is not evidence
 		// of work; counting it made a chat show "working" right after being opened and closed.
-		const record = changed && !tail.loading ? this.records.get(tail.sessionId) : undefined;
+		const record = changed && tail.liveReplayed ? this.records.get(tail.sessionId) : undefined;
 		if (record) {
 			record.lastActivityAt = this.now();
 			this.scheduleActivityDecay();
@@ -675,9 +871,13 @@ export class SessionCore {
 		}
 	}
 
-	private bump(tail: ActiveTail): void {
+	private bump(tail: WatchedTail): void {
 		tail.revision++;
 		this.scheduleEmit();
+	}
+
+	private liveWindow(): number {
+		return Math.max(1, this.options.liveWindowTurns ?? defaultLiveWindowTurns);
 	}
 
 	// #endregion
@@ -702,39 +902,38 @@ export class SessionCore {
 		};
 	}
 
-	private buildActiveState(record: SessionRecord, tail: ActiveTail, now: number): ActiveSessionState {
-		const snapshot = tail.projection.snapshot;
-		const retained = this.options.retainedTurns ?? defaultRetainedTurns;
-		const persisted = tail.projection.tail(retained);
+	private buildWatchedState(record: SessionRecord, tail: WatchedTail, now: number): ActiveSessionState {
+		const view = tail.digest;
+		const ready = view.status === 'ready';
+		const persisted = tail.liveWindow;
 		const live = tail.transcript.turns.length > 0 ? tail.transcript.turns : tail.debug.turns;
 		const merged = mergeLiveTurns({
-			persisted: persisted.turns,
-			persistedStart: persisted.start,
-			persistedCount: snapshot.turnCount,
+			persisted,
+			persistedStart: Math.max(0, view.requestCount - persisted.length),
+			persistedCount: view.requestCount,
 			live,
 			now,
 		});
-		const status: ActiveSessionState['status'] = tail.loading && !snapshot.initialised ? 'loading' : merged.status;
-		const permissionLevel: ChatPermissionLevel = snapshot.initialised && !snapshot.oversized
-			? snapshot.permissionLevel
-			: record.index?.permissionLevel ?? snapshot.permissionLevel;
-		const isEmpty = snapshot.initialised || merged.turns.length > 0
+		const status: ActiveSessionState['status'] = view.status === 'loading' ? 'loading' : merged.status;
+		const permissionLevel: ChatPermissionLevel = ready ? parsePermissionLevel(view.inputState) : record.index?.permissionLevel ?? 'default';
+		const isEmpty = ready || merged.turns.length > 0
 			? merged.turnCount === 0 && merged.turns.length === 0
 			: this.isEmpty(record);
+		const modelSource: JsonObject = { inputState: view.inputState, requests: view.lastModelId ? [{ modelId: view.lastModelId }] : [] };
 		return {
 			resource: record.resource,
 			sessionId: record.sessionId,
-			title: this.titleOf(record, snapshot.title),
+			title: this.titleOf(record, ready ? view.customTitle : undefined),
 			status,
-			revision: `live:${tail.sessionTailer.cursor.generation}:${tail.revision}`,
+			revision: `live:${view.generation}:${tail.revision}`,
 			updatedAt: Math.max(this.updatedAt(record), merged.turns.at(-1)?.timestamp ?? 0),
 			turns: merged.turns,
 			turnCount: merged.turnCount,
 			...(isEmpty === undefined ? {} : { isEmpty }),
 			historyStart: merged.historyStart,
 			historyTruncated: merged.historyStart > 0,
-			...(snapshot.oversized ? { historyUnavailable: 'oversized' as const } : {}),
-			model: snapshot.model,
+			...(view.status === 'oversized' ? { historyUnavailable: 'oversized' as const } : {}),
+			model: ready ? parseSessionModelState(modelSource) : undefined,
 			permissionLevel,
 		};
 	}
@@ -759,8 +958,6 @@ export class SessionCore {
 		});
 	}
 
-	// #endregion
-
 	private now(): number {
 		return this.options.now?.() ?? Date.now();
 	}
@@ -768,4 +965,11 @@ export class SessionCore {
 	private log(message: string): void {
 		this.options.log?.(message);
 	}
+
+	// #endregion
+}
+
+function parsePermissionLevel(inputState: JsonObject): ChatPermissionLevel {
+	const level = inputState.permissionLevel;
+	return level === 'autoApprove' || level === 'autopilot' ? level : 'default';
 }

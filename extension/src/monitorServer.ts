@@ -20,6 +20,8 @@ export interface MonitorBackend {
 	setPermissionLevel?(request: PermissionLevelRequest): Promise<void>;
 	decideTool?(request: ToolDecisionRequest): Promise<void>;
 	setEventClientCount?(count: number): void;
+	/** Chats viewers have open right now; only these are tailed and carry turns. */
+	setWatchedSessions?(sessionResources: readonly string[]): void;
 }
 
 export interface MonitorServerOptions {
@@ -42,6 +44,8 @@ export class MonitorServer {
 	private readonly streams: StateStreamHub<MonitorState>;
 	private readonly backendSubscription: { dispose(): void };
 	private address: MonitorServerAddress | undefined;
+	/** Viewers the gateway relays on behalf of its own clients; merged with streams opened here directly. */
+	private relayedViewers: { count: number; watched: readonly string[] } = { count: 0, watched: [] };
 
 	constructor(
 		private readonly backend: MonitorBackend,
@@ -49,9 +53,15 @@ export class MonitorServer {
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
 		this.streams = new StateStreamHub<MonitorState>(() => backend.getState(), {
-			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+			onDidChangeViewers: viewers => this.applyViewers(viewers.count, viewers.watched.map(target => target.sessionResource)),
 		});
 		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(state));
+	}
+
+	private applyViewers(directCount: number, directWatched: readonly string[]): void {
+		const watched = [...new Set([...directWatched, ...this.relayedViewers.watched])];
+		this.backend.setWatchedSessions?.(watched);
+		this.backend.setEventClientCount?.(directCount + this.relayedViewers.count);
 	}
 
 	async start(): Promise<MonitorServerAddress> {
@@ -86,6 +96,8 @@ export class MonitorServer {
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
 		this.streams.closeAll();
+		this.relayedViewers = { count: 0, watched: [] };
+		this.backend.setWatchedSessions?.([]);
 		this.backend.setEventClientCount?.(0);
 		if (!this.server.listening) {
 			return;
@@ -133,21 +145,26 @@ export class MonitorServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
+				const relay = url.searchParams.get('relay') === '1';
 				this.streams.open(request, response, {
 					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
-					countsAsViewer: url.searchParams.get('relay') !== '1',
+					countsAsViewer: !relay,
+					...(relay ? {} : { watch: StateStreamHub.watchFromQuery(url.searchParams.getAll('watch')) }),
 				});
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/clients') {
-				const body = await this.readJsonBody(request) as { count?: unknown };
+				const body = await this.readJsonBody(request) as { count?: unknown; watched?: unknown };
 				const count = typeof body.count === 'number' && Number.isInteger(body.count) && body.count >= 0
 					? body.count
 					: undefined;
 				if (count === undefined) {
 					throw new MonitorRequestError(400, 'A non-negative client count is required.');
 				}
-				this.backend.setEventClientCount?.(count);
+				const watched = Array.isArray(body.watched) ? body.watched.filter((value): value is string => typeof value === 'string').slice(0, 8) : [];
+				this.relayedViewers = { count, watched };
+				const direct = this.streams.viewers();
+				this.applyViewers(direct.count, direct.watched.map(target => target.sessionResource));
 				this.sendJson(response, 204, undefined);
 				return;
 			}

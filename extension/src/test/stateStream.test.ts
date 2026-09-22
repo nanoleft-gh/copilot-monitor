@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import type * as http from 'node:http';
 import { describe, it } from 'node:test';
 import { applyPatch, Patch } from '../stateDelta';
-import { StateStreamHub } from '../stateStream';
+import { StateStreamHub, ViewerSummary, WatchTarget } from '../stateStream';
 
 interface Frame { event: string; id?: string; data: unknown }
 
@@ -46,10 +46,10 @@ class FakeResponse extends EventEmitter {
 	}
 }
 
-function openClient(hub: StateStreamHub<unknown>, protocol: 1 | 2, countsAsViewer = true) {
+function openClient(hub: StateStreamHub<unknown>, protocol: 1 | 2, countsAsViewer = true, watch?: WatchTarget[]) {
 	const request = new EventEmitter();
 	const response = new FakeResponse();
-	hub.open(request as unknown as http.IncomingMessage, response as unknown as http.ServerResponse, { protocol, countsAsViewer });
+	hub.open(request as unknown as http.IncomingMessage, response as unknown as http.ServerResponse, { protocol, countsAsViewer, ...(watch ? { watch } : {}) });
 	return { request, response, close: () => request.emit('close') };
 }
 
@@ -111,7 +111,7 @@ describe('StateStreamHub', () => {
 	it('reports viewer counts only for viewer streams and stops diffing when nobody listens', () => {
 		const counts: number[] = [];
 		let state: unknown = { version: 1, n: 0 };
-		const hub = new StateStreamHub<unknown>(() => state, { onDidChangeViewerCount: count => counts.push(count) });
+		const hub = new StateStreamHub<unknown>(() => state, { onDidChangeViewers: viewers => counts.push(viewers.count) });
 		const relay = openClient(hub, 2, false);
 		assert.deepEqual(counts, []);
 		const viewer = openClient(hub, 1, true);
@@ -128,5 +128,25 @@ describe('StateStreamHub', () => {
 		assert.deepEqual(late.response.frames[0].data, state);
 		hub.closeAll();
 		assert.equal(late.response.ended, true);
+	});
+
+	it('unions watch targets across viewers and drops them the moment a stream closes', () => {
+		const seen: ViewerSummary[] = [];
+		const hub = new StateStreamHub<unknown>(() => ({ version: 1 }), { onDidChangeViewers: viewers => seen.push(viewers) });
+		const phone = openClient(hub, 2, true, [{ windowId: 'w1', sessionResource: 'chat://a' }]);
+		const dashboard = openClient(hub, 2, true, [{ windowId: 'w2', sessionResource: 'chat://b' }, { windowId: 'w1', sessionResource: 'chat://a' }]);
+		assert.deepEqual(seen.at(-1), { count: 2, watched: [{ windowId: 'w1', sessionResource: 'chat://a' }, { windowId: 'w2', sessionResource: 'chat://b' }] });
+		phone.close();
+		assert.deepEqual(seen.at(-1)?.watched, [{ windowId: 'w2', sessionResource: 'chat://b' }, { windowId: 'w1', sessionResource: 'chat://a' }]);
+		dashboard.close();
+		assert.deepEqual(seen.at(-1), { count: 0, watched: [] });
+	});
+
+	it('parses watch query values with and without a window id', () => {
+		assert.deepEqual(StateStreamHub.watchFromQuery(['w1|vscode-chat://x/abc', 'vscode-chat://y/def', '']), [
+			{ windowId: 'w1', sessionResource: 'vscode-chat://x/abc' },
+			{ sessionResource: 'vscode-chat://y/def' },
+		]);
+		assert.equal(StateStreamHub.watchFromQuery(Array.from({ length: 20 }, (_, index) => `w|s${index}`)).length, 8, 'bounded');
 	});
 });

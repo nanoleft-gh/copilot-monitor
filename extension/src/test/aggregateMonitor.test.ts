@@ -20,6 +20,7 @@ class TestWindowBackend implements MonitorBackend {
 	permissions: PermissionLevelRequest[] = [];
 	historyRequests: HistoryPageRequest[] = [];
 	eventClientCounts: number[] = [];
+	watched: (readonly string[])[] = [];
 	private readonly listeners = new Set<(state: MonitorState) => void>();
 
 	constructor(readonly state: MonitorState) {}
@@ -50,6 +51,10 @@ class TestWindowBackend implements MonitorBackend {
 
 	setEventClientCount(count: number): void {
 		this.eventClientCounts.push(count);
+	}
+
+	setWatchedSessions(sessionResources: readonly string[]): void {
+		this.watched.push(sessionResources);
 	}
 
 	async decideTool(request: ToolDecisionRequest): Promise<void> {
@@ -91,6 +96,10 @@ describe('AggregateMonitor', () => {
 			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 0 && secondBackend.eventClientCounts.at(-1) === 0, 2_000);
 			aggregate.setEventClientCount(2);
 			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 2 && secondBackend.eventClientCounts.at(-1) === 2, 2_000);
+			// Watch targets are routed to the window they name; the other window learns it has nothing watched.
+			aggregate.setWatched([{ windowId: 'window-2', sessionResource: 'session-2' }]);
+			await waitFor(() => JSON.stringify(secondBackend.watched.at(-1)) === JSON.stringify(['session-2']), 2_000);
+			assert.deepEqual(firstBackend.watched.at(-1), []);
 			assert.deepEqual(
 				aggregate.getState().windows.map(window => [window.windowId, window.workspaceName]),
 				[['window-1', 'Workspace One'], ['window-2', 'Workspace Two']],

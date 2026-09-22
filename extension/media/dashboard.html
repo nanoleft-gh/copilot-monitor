@@ -2786,6 +2786,7 @@
 					session = sessions.find(item => item.resource === activeResource) || sessions[0];
 					selectedSessionResource = session?.resource || '';
 				}
+				ensureWatch();
 
 				// Clear the optimistic bubble once the real turn shows up in the log.
 				if (pendingMessage
@@ -4651,11 +4652,21 @@
 			let eventSource;
 			let eventResyncTimer;
 			let eventResyncDelay = 250;
+			let watchedTarget = '';
+			// Turns are streamed only for the chat this page watches; the watch lives on the stream, so a
+			// changed selection reopens it (a snapshot is small: metadata plus the newest turns of one chat).
+			function currentWatchTarget() {
+				return selectedWindowId && selectedSessionResource ? `${selectedWindowId}|${selectedSessionResource}` : '';
+			}
+			function ensureWatch() {
+				if (eventSource && currentWatchTarget() !== watchedTarget) connectEvents();
+			}
 			function connectEvents() {
 				if (eventSource) eventSource.close();
 				// v2: one snapshot, then patches. Every (re)connection starts with a fresh snapshot,
 				// so a patch that fails to apply just means we resync by reconnecting.
-				const events = new EventSource('/api/events?v=2');
+				watchedTarget = currentWatchTarget();
+				const events = new EventSource(`/api/events?v=2${watchedTarget ? `&watch=${encodeURIComponent(watchedTarget)}` : ''}`);
 				eventSource = events;
 				let base;
 				const resync = () => {

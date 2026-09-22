@@ -10,8 +10,6 @@ import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFi
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
-import { indexPagedMutationHistoryInWorker, loadPagedMutationHistoryInWorker } from './pagedMutationHistoryWorkerClient';
-import { deserializePagedMutationHistoryIndex, PagedMutationHistoryIndex, serializePagedMutationHistoryIndex, SerializedPagedMutationHistoryIndex } from './pagedMutationHistory';
 import {
 	ActiveSessionState,
 	ChatModelDescriptor,
@@ -50,8 +48,6 @@ const maximumOutboundHistory = 20;
 const nativeStateDatabaseFiles = new Set(['state.vscdb', 'state.vscdb-wal', 'state.vscdb-shm']);
 const persistWaitAttempts = 20;
 const persistWaitDelayMs = 50;
-const maximumProgressiveIndexCacheFiles = 64;
-const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
 /** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
 const stallProbeDelayMs = 3_000;
 const maximumProbedToolCalls = 256;
@@ -80,10 +76,6 @@ export class SessionMonitor implements vscode.Disposable {
 	private readonly profileStateDatabasePath: string;
 	/** APPLICATION-scoped storage: cached model list and per-model configuration. */
 	private readonly applicationStateDatabasePath: string;
-	private readonly progressiveIndexDirectory: string;
-	private readonly progressiveAbortController = new AbortController();
-	private readonly progressiveMutationIndexes = new Map<string, PagedMutationHistoryIndex>();
-	private readonly progressiveMutationIndexing = new Map<string, Promise<PagedMutationHistoryIndex>>();
 	private readonly liveExportTracker = new LiveExportTracker();
 	private readonly liveExportUri: vscode.Uri;
 	private readonly liveExportFileSystem = new LiveExportFileSystem();
@@ -127,7 +119,6 @@ export class SessionMonitor implements vscode.Disposable {
 		this.sessionDirectories = resolveSessionDirectories(context);
 		this.copilotTranscriptDirectories = resolveCopilotTranscriptDirectories(context);
 		this.copilotDebugLogDirectories = resolveCopilotDebugLogDirectories(context);
-		this.progressiveIndexDirectory = path.join(context.globalStorageUri.fsPath, 'progressive-history');
 		this.languageModelsConfigurationPath = path.join(
 			path.dirname(path.dirname(context.globalStorageUri.fsPath)),
 			'chatLanguageModels.json',
@@ -140,6 +131,7 @@ export class SessionMonitor implements vscode.Disposable {
 				transcriptDirectories: this.copilotTranscriptDirectories,
 				debugLogDirectories: this.copilotDebugLogDirectories,
 				indexDatabasePath: resolveSessionIndexDatabasePath(context),
+				digestDatabasePath: resolveDigestDatabasePath(context),
 			},
 			log: message => this.log(`[core] ${message}`),
 		});
@@ -201,6 +193,12 @@ export class SessionMonitor implements vscode.Disposable {
 		} else if (count > 0) {
 			void this.core.setViewerCount(count);
 		}
+	}
+
+	/** The chats viewers currently have open; only these are tailed and carry turns. */
+	setWatchedSessions(sessionResources: readonly string[]): void {
+		const ids = sessionResources.map(resource => sessionIdFromResource(resource)).filter((id): id is string => id !== undefined);
+		this.core.setWatched(ids);
 	}
 
 	/** First viewer: open on the chat VS Code has focused, then let the core attach. */
@@ -347,13 +345,7 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(409, 'The conversation changed before the edited request could be submitted.');
 		}
 		const sessionId = requireSessionId(request.sessionResource);
-		let requestIndex = this.core.requestIndexOf(sessionId, request.requestId) ?? -1;
-		if (requestIndex < 0 && this.core.isOversized(sessionId)) {
-			const index = await this.getProgressiveMutationIndex(sessionId);
-			requestIndex = request.sourceText
-				? findProgressiveRequestIndex(index.requests, request.sourceText, request.sourceTimestamp)
-				: index.requests.findIndex(value => value.requestId === request.requestId);
-		}
+		const requestIndex = this.core.requestIndexOf(sessionId, request.requestId) ?? -1;
 		if (requestIndex < 0) {
 			throw new MonitorRequestError(409, 'The selected request is no longer editable.');
 		}
@@ -398,18 +390,12 @@ export class SessionMonitor implements vscode.Disposable {
 		const sessionId = session.sessionId;
 		const limit = Math.max(1, Math.min(Math.floor(request.limit ?? 40), 40));
 		const page = this.core.historyPage(sessionId, request.before, limit);
-		if (page) {
-			return { ...page, revision: session.revision };
+		if (!page) {
+			throw new MonitorRequestError(409, session.historyUnavailable === 'oversized'
+				? 'This chat is too large to page remotely; open it in VS Code.'
+				: 'History is available only while the chat is open. Open it and try again.');
 		}
-		if (!this.core.isOversized(sessionId)) {
-			throw new MonitorRequestError(409, 'Earlier history remains available only in VS Code.');
-		}
-		const index = await this.getProgressiveMutationIndex(sessionId);
-		const total = index.requests.length;
-		const end = Math.max(0, Math.min(Math.floor(request.before), total));
-		const start = Math.max(0, end - limit);
-		const result = await loadPagedMutationHistoryInWorker(index, start, end - start, session.revision, this.progressiveAbortController.signal);
-		return { ...result, revision: session.revision };
+		return { ...page, revision: session.revision };
 	}
 
 	async selectModel(request: ModelSelectionRequest): Promise<void> {
@@ -577,7 +563,6 @@ export class SessionMonitor implements vscode.Disposable {
 	dispose(): void {
 		this.disposed = true;
 		this.clearStallProbe();
-		this.progressiveAbortController.abort();
 		this.nativeInputStateSync.dispose();
 		this.core.dispose();
 		this.closeNativeStateDatabases();
@@ -954,52 +939,6 @@ export class SessionMonitor implements vscode.Disposable {
 		throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
 	}
 
-	private async getProgressiveMutationIndex(sessionId: string): Promise<PagedMutationHistoryIndex> {
-		const cached = this.progressiveMutationIndexes.get(sessionId);
-		const file = this.core.sessionFile(sessionId);
-		if (!file) {
-			throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
-		}
-		if (cached && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
-			return cached;
-		}
-		const existing = this.progressiveMutationIndexing.get(sessionId);
-		if (existing) {
-			return existing;
-		}
-		const indexing = this.loadOrBuildProgressiveMutationIndex(sessionId, file);
-		this.progressiveMutationIndexing.set(sessionId, indexing);
-		try {
-			const index = await indexing;
-			this.progressiveMutationIndexes.set(sessionId, index);
-			return index;
-		} finally {
-			this.progressiveMutationIndexing.delete(sessionId);
-		}
-	}
-
-	private async loadOrBuildProgressiveMutationIndex(sessionId: string, file: { filePath: string; size: number; mtimeMs: number }): Promise<PagedMutationHistoryIndex> {
-		const cachePath = path.join(this.progressiveIndexDirectory, `${sessionId}.json`);
-		try {
-			const cached = JSON.parse(await fs.readFile(cachePath, 'utf8')) as SerializedPagedMutationHistoryIndex;
-			if (cached.filePath === file.filePath && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
-				return deserializePagedMutationHistoryIndex(cached);
-			}
-		} catch {
-			// Missing or stale cache is rebuilt below.
-		}
-		const index = await indexPagedMutationHistoryInWorker(file.filePath, this.progressiveAbortController.signal);
-		await fs.mkdir(this.progressiveIndexDirectory, { recursive: true });
-		const temporaryPath = `${cachePath}.${process.pid}.tmp`;
-		await fs.writeFile(temporaryPath, JSON.stringify(serializePagedMutationHistoryIndex(index)), 'utf8');
-		await fs.rename(temporaryPath, cachePath).catch(async () => {
-			await fs.rm(cachePath, { force: true });
-			await fs.rename(temporaryPath, cachePath);
-		});
-		await pruneProgressiveIndexCache(this.progressiveIndexDirectory, cachePath);
-		return index;
-	}
-
 	// #endregion
 
 	// #region commands helpers
@@ -1118,6 +1057,14 @@ export function resolveSessionIndexDatabasePath(context: vscode.ExtensionContext
 	return path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
 }
 
+/** The digest lives next to the sessions it describes: per workspace, or global for empty windows. */
+export function resolveDigestDatabasePath(context: vscode.ExtensionContext): string {
+	if (context.storageUri) {
+		return path.join(context.storageUri.fsPath, 'history.db');
+	}
+	return path.join(context.globalStorageUri.fsPath, 'history-empty-window.db');
+}
+
 /**
  * Overlays the renderer's exported view of the session onto the file-derived one. The
  * export is the only source that knows about pending tool confirmations immediately, so
@@ -1203,64 +1150,6 @@ function decodeLocalSessionId(resource: vscode.Uri): string {
 		throw new MonitorRequestError(409, 'VS Code created an unsupported chat session resource.');
 	}
 	return sessionId;
-}
-
-function findProgressiveRequestIndex(
-	requests: readonly Record<string, unknown>[],
-	sourceText: string,
-	sourceTimestamp: number | undefined,
-): number {
-	const expected = normalizeComparablePrompt(sourceText);
-	let bestIndex = -1;
-	let bestDistance = Number.POSITIVE_INFINITY;
-	for (let index = 0; index < requests.length; index++) {
-		const request = requests[index];
-		const message = isRecord(request.message) ? request.message : undefined;
-		if (normalizeComparablePrompt(typeof message?.text === 'string' ? message.text : '') !== expected) {
-			continue;
-		}
-		const timestamp = typeof request.timestamp === 'number' ? request.timestamp : undefined;
-		const distance = sourceTimestamp !== undefined && timestamp !== undefined ? Math.abs(timestamp - sourceTimestamp) : index;
-		if (distance < bestDistance) {
-			bestDistance = distance;
-			bestIndex = index;
-		}
-	}
-	return bestIndex;
-}
-
-function normalizeComparablePrompt(value: string): string {
-	return value.replace(/^User:\s*/i, '').replace(/\s+/g, ' ').trim();
-}
-
-async function pruneProgressiveIndexCache(directory: string, retainedPath: string): Promise<void> {
-	let entries: Array<{ path: string; size: number; mtimeMs: number }> = [];
-	try {
-		entries = await Promise.all((await fs.readdir(directory))
-			.filter(name => name.endsWith('.json'))
-			.map(async name => {
-				const filePath = path.join(directory, name);
-				const stat = await fs.stat(filePath);
-				return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs };
-			}));
-	} catch {
-		return;
-	}
-	entries.sort((left, right) => right.mtimeMs - left.mtimeMs);
-	let retainedBytes = 0;
-	let retainedFiles = 0;
-	for (const entry of entries) {
-		const keep = entry.path === retainedPath || (
-			retainedFiles < maximumProgressiveIndexCacheFiles
-			&& retainedBytes + entry.size <= maximumProgressiveIndexCacheBytes
-		);
-		if (keep) {
-			retainedFiles++;
-			retainedBytes += entry.size;
-		} else {
-			await fs.rm(entry.path, { force: true }).catch(() => undefined);
-		}
-	}
 }
 
 function summarize(value: string, length: number): string {
