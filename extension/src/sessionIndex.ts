@@ -34,6 +34,10 @@ export interface SessionIndexSnapshot {
 	readonly revision: string;
 }
 
+/**
+ * Returns `undefined` only when the database cannot be read right now (missing, locked,
+ * no table); a readable database without an index yields an empty snapshot.
+ */
 export function readSessionIndex(databasePath: string): SessionIndexSnapshot | undefined {
 	let raw: string | undefined;
 	try {
@@ -47,13 +51,12 @@ export function readSessionIndex(databasePath: string): SessionIndexSnapshot | u
 			database.close();
 		}
 	} catch {
-		// Missing database, locked database, or missing table: the caller retries on the next change event.
 		return undefined;
 	}
 	if (raw === undefined) {
-		return undefined;
+		return { entries: [], revision: 'empty' };
 	}
-	return parseSessionIndex(raw);
+	return parseSessionIndex(raw) ?? { entries: [], revision: `invalid:${raw.length}:${hashString(raw)}` };
 }
 
 export function parseSessionIndex(raw: string): SessionIndexSnapshot | undefined {

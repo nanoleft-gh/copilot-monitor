@@ -75,6 +75,17 @@ describe('LiveTurnAccumulator (transcript)', () => {
 		live.reset();
 		assert.equal(live.turns.length, 0);
 	});
+
+	it('collapses a replayed user message that had no assistant activity', () => {
+		const live = new LiveTurnAccumulator();
+		live.applyTranscriptLine(transcript('user.message', { content: 'same' }, 0));
+		live.applyTranscriptLine(transcript('user.message', { content: 'same' }, 5));
+		assert.equal(live.turns.length, 1);
+		assert.equal(live.turns[0].startedAt, t0 + 5);
+		live.applyTranscriptLine(transcript('assistant.turn_start', { turnId: '0' }, 6));
+		live.applyTranscriptLine(transcript('user.message', { content: 'same' }, 7));
+		assert.equal(live.turns.length, 2);
+	});
 });
 
 describe('LiveTurnAccumulator (debug log)', () => {

@@ -88,12 +88,12 @@ describe('sessionIndex', () => {
 		assert.notEqual(readSessionIndex(databasePath)!.revision, first.revision);
 	});
 
-	it('returns undefined when the database, table, key, or JSON is unusable', () => {
+	it('distinguishes an unreadable database from a readable one without an index', () => {
 		assert.equal(readSessionIndex(path.join(root, 'missing.vscdb')), undefined);
 		writeDatabase(undefined);
-		assert.equal(readSessionIndex(databasePath), undefined);
+		assert.deepEqual(readSessionIndex(databasePath), { entries: [], revision: 'empty' });
 		writeDatabase('{not json');
-		assert.equal(readSessionIndex(databasePath), undefined);
+		assert.deepEqual(readSessionIndex(databasePath)?.entries, []);
 		assert.equal(parseSessionIndex(JSON.stringify({ version: 2, entries: {} })), undefined);
 		assert.equal(parseSessionIndex(JSON.stringify({ version: 1, entries: [] })), undefined);
 	});

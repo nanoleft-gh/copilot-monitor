@@ -228,6 +228,12 @@ export class LiveTurnAccumulator {
 	}
 
 	private beginTurn(userText: string, at: number): void {
+		const last = this.turnsInternal.at(-1);
+		// A repeated user message with no assistant activity in between is a replay of the same turn.
+		if (last && last.userText === userText && last.rounds === 0 && last.assistantParts.length === 0 && last.tools.length === 0) {
+			last.startedAt = at;
+			return;
+		}
 		this.turnsInternal.push({
 			index: this.turnsInternal.length === 0 ? 0 : this.turnsInternal[this.turnsInternal.length - 1].index + 1,
 			userText,
