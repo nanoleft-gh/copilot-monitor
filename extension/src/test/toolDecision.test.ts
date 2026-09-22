@@ -17,6 +17,11 @@ describe('isActivePendingTool', () => {
 		assert.equal(isActivePendingTool(sessions, decision()), true);
 	});
 
+	it('accepts a live activity that is still running but approvable', () => {
+		const sessions = [session('session-1', [turn('request-current', [{ ...pending, status: 'running' }])])];
+		assert.equal(isActivePendingTool(sessions, decision()), true);
+	});
+
 	it('rejects stale request, wrong session, completed tool, and second pending tool', () => {
 		const sessions = [session('session-1', [turn('request-current', [
 			pending,
