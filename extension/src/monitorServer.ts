@@ -1,15 +1,9 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, SyncSessionRequest, ToolDecisionRequest } from './protocol';
+import { apiCapabilities, apiVersion, CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, SyncSessionRequest, ToolDecisionRequest } from './protocol';
+import { StateStreamHub } from './stateStream';
 
 const maximumRequestBytes = 64 * 1024;
-
-interface EventClient {
-	readonly response: http.ServerResponse;
-	readonly countsAsDashboard: boolean;
-	waitingForDrain: boolean;
-	pendingState?: string;
-}
 
 export interface MonitorBackend {
 	getState(): MonitorState;
@@ -45,9 +39,8 @@ export interface MonitorServerAddress {
 
 export class MonitorServer {
 	private readonly server: http.Server;
-	private readonly eventClients = new Set<EventClient>();
+	private readonly streams: StateStreamHub<MonitorState>;
 	private readonly backendSubscription: { dispose(): void };
-	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private address: MonitorServerAddress | undefined;
 
 	constructor(
@@ -55,7 +48,10 @@ export class MonitorServer {
 		private readonly options: MonitorServerOptions,
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
-		this.backendSubscription = backend.onDidChange(state => this.broadcastState(state));
+		this.streams = new StateStreamHub<MonitorState>(() => backend.getState(), {
+			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+		});
+		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(state));
 	}
 
 	async start(): Promise<MonitorServerAddress> {
@@ -89,11 +85,7 @@ export class MonitorServer {
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		for (const client of this.eventClients) {
-			client.response.end();
-		}
-		this.eventClients.clear();
-		this.syncHeartbeatTimer();
+		this.streams.closeAll();
 		this.backend.setEventClientCount?.(0);
 		if (!this.server.listening) {
 			return;
@@ -131,8 +123,8 @@ export class MonitorServer {
 			if (request.method === 'GET' && url.pathname === '/api/health') {
 				this.sendJson(response, 200, {
 					service: 'githubcopilot-monitor-window',
-					apiVersion: 4,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
+					apiVersion,
+					capabilities: apiCapabilities,
 				});
 				return;
 			}
@@ -141,7 +133,10 @@ export class MonitorServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
-				this.openEventStream(request, response, url.searchParams.get('relay') !== '1');
+				this.streams.open(request, response, {
+					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
+					countsAsViewer: url.searchParams.get('relay') !== '1',
+				});
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/clients') {
@@ -346,85 +341,6 @@ export class MonitorServer {
 			'X-Content-Type-Options': 'nosniff',
 		});
 		response.end(JSON.stringify(value));
-	}
-
-	private openEventStream(request: http.IncomingMessage, response: http.ServerResponse, countsAsDashboard: boolean): void {
-		response.writeHead(200, {
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'X-Accel-Buffering': 'no',
-		});
-		response.flushHeaders();
-		const client: EventClient = { response, countsAsDashboard, waitingForDrain: false };
-		this.eventClients.add(client);
-		this.syncHeartbeatTimer();
-		this.updateDashboardClientCount();
-		this.writeState(client, JSON.stringify(this.backend.getState()));
-		request.on('close', () => {
-			this.eventClients.delete(client);
-			this.syncHeartbeatTimer();
-			this.updateDashboardClientCount();
-		});
-	}
-
-	/** SSE keepalive comments are only worth sending while somebody is listening. */
-	private syncHeartbeatTimer(): void {
-		if (this.eventClients.size === 0) {
-			if (this.heartbeatTimer) {
-				clearInterval(this.heartbeatTimer);
-				this.heartbeatTimer = undefined;
-			}
-			return;
-		}
-		if (this.heartbeatTimer) {
-			return;
-		}
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
-	}
-
-	private updateDashboardClientCount(): void {
-		const count = [...this.eventClients].filter(client => client.countsAsDashboard).length;
-		this.backend.setEventClientCount?.(count);
-	}
-
-	private broadcastState(state: MonitorState): void {
-		const serialized = JSON.stringify(state);
-		for (const client of this.eventClients) {
-			this.writeState(client, serialized);
-		}
-	}
-
-	private writeState(client: EventClient, serializedState: string): void {
-		if (client.waitingForDrain) {
-			client.pendingState = serializedState;
-			return;
-		}
-
-		const writable = client.response.write(`event: state\ndata: ${serializedState}\n\n`);
-		if (writable) {
-			return;
-		}
-
-		client.waitingForDrain = true;
-		client.response.once('drain', () => {
-			if (!this.eventClients.has(client)) {
-				return;
-			}
-			client.waitingForDrain = false;
-			const pendingState = client.pendingState;
-			client.pendingState = undefined;
-			if (pendingState !== undefined) {
-				this.writeState(client, pendingState);
-			}
-		});
 	}
 
 	private async readJsonBody(request: http.IncomingMessage): Promise<unknown> {

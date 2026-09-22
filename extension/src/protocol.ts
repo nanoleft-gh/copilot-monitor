@@ -1,5 +1,9 @@
 import type { TranscriptTurn } from './transcript';
 
+/** Advertised by `/api/health` on both the per-window bridge and the shared gateway. */
+export const apiVersion = 4;
+export const apiCapabilities = ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2'] as const;
+
 export interface ActiveSessionState {
 	readonly resource: string;
 	readonly sessionId: string;

@@ -87,8 +87,8 @@ describe('AggregateMonitor', () => {
 			await aggregate.start();
 
 			await waitFor(() => aggregate.getState().windows.every(window => window.connected), 2_000);
-			assert.equal(firstBackend.eventClientCounts.at(-1), 0);
-			assert.equal(secondBackend.eventClientCounts.at(-1), 0);
+			// The relay link is not a viewer; the gateway forwards its own viewer count (currently 0).
+			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 0 && secondBackend.eventClientCounts.at(-1) === 0, 2_000);
 			aggregate.setEventClientCount(2);
 			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 2 && secondBackend.eventClientCounts.at(-1) === 2, 2_000);
 			assert.deepEqual(

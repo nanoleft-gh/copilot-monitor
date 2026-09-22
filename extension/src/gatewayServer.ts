@@ -1,6 +1,8 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
 import {
+	apiCapabilities,
+	apiVersion,
 	CreateSessionResult,
 	GatewayCreateSessionRequest,
 	GatewayEditTurnRequest,
@@ -18,14 +20,9 @@ import {
 	MonitorRequestError,
 	SendMessageResult,
 } from './protocol';
+import { StateStreamHub } from './stateStream';
 
 const maximumRequestBytes = 64 * 1024;
-
-interface EventClient {
-	readonly response: http.ServerResponse;
-	waitingForDrain: boolean;
-	pendingState?: string;
-}
 
 export interface GatewayBackend {
 	getState(): GatewayState;
@@ -65,10 +62,8 @@ export interface GatewayAddress {
 
 export class GatewayServer {
 	private readonly server: http.Server;
-	private readonly eventClients = new Set<EventClient>();
-	private readonly presenceClients = new Set<http.ServerResponse>();
+	private readonly streams: StateStreamHub<GatewayState>;
 	private readonly backendSubscription: { dispose(): void };
-	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private address: GatewayAddress | undefined;
 
 	constructor(
@@ -76,7 +71,10 @@ export class GatewayServer {
 		private readonly options: GatewayServerOptions,
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
-		this.backendSubscription = backend.onDidChange(state => this.broadcastState(state));
+		this.streams = new StateStreamHub<GatewayState>(() => backend.getState(), {
+			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+		});
+		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(state));
 	}
 
 	async start(): Promise<GatewayAddress> {
@@ -108,15 +106,7 @@ export class GatewayServer {
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		for (const client of this.eventClients) {
-			client.response.end();
-		}
-		this.eventClients.clear();
-		for (const response of this.presenceClients) {
-			response.end();
-		}
-		this.presenceClients.clear();
-		this.syncHeartbeatTimer();
+		this.streams.closeAll();
 		this.backend.setEventClientCount?.(0);
 		if (this.server.listening) {
 			await new Promise<void>((resolve, reject) => {
@@ -153,8 +143,8 @@ export class GatewayServer {
 					...(this.options.hostId ? { hostId: this.options.hostId } : {}),
 					...(this.options.leaseNonce ? { leaseNonce: this.options.leaseNonce } : {}),
 					...(this.options.ownerId ? { ownerId: this.options.ownerId } : {}),
-					apiVersion: 4,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
+					apiVersion,
+					capabilities: apiCapabilities,
 				});
 				return;
 			}
@@ -163,11 +153,17 @@ export class GatewayServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
-				this.openEventStream(request, response);
+				this.streams.open(request, response, {
+					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
+					countsAsViewer: true,
+				});
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/presence') {
-				this.openPresenceStream(request, response);
+				// Follower windows hold this stream open; its closure tells them the gateway is gone.
+				// It carries no state and is not a viewer.
+				const client = this.streams.open(request, response, { protocol: 'none', countsAsViewer: false });
+				client.write(`event: gateway\ndata: ${JSON.stringify({ registryId: this.options.registryId, leaseNonce: this.options.leaseNonce ?? null })}\n\n`);
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/messages') {
@@ -358,101 +354,6 @@ export class GatewayServer {
 			'X-Content-Type-Options': 'nosniff',
 		});
 		response.end(JSON.stringify(value));
-	}
-
-	private openEventStream(request: http.IncomingMessage, response: http.ServerResponse): void {
-		response.writeHead(200, {
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'X-Accel-Buffering': 'no',
-		});
-		response.flushHeaders();
-		const client: EventClient = { response, waitingForDrain: false };
-		this.eventClients.add(client);
-		this.syncHeartbeatTimer();
-		this.backend.setEventClientCount?.(this.eventClients.size);
-		this.writeState(client, JSON.stringify(this.backend.getState()));
-		request.on('close', () => {
-			this.eventClients.delete(client);
-			this.syncHeartbeatTimer();
-			this.backend.setEventClientCount?.(this.eventClients.size);
-		});
-	}
-
-	/** SSE keepalive comments are only worth sending while somebody is listening. */
-	private syncHeartbeatTimer(): void {
-		if (this.eventClients.size === 0 && this.presenceClients.size === 0) {
-			if (this.heartbeatTimer) {
-				clearInterval(this.heartbeatTimer);
-				this.heartbeatTimer = undefined;
-			}
-			return;
-		}
-		if (this.heartbeatTimer) {
-			return;
-		}
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-			for (const response of this.presenceClients) {
-				response.write(': heartbeat\n\n');
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
-	}
-
-	private broadcastState(state: GatewayState): void {
-		const serialized = JSON.stringify(state);
-		for (const client of this.eventClients) {
-			this.writeState(client, serialized);
-		}
-	}
-
-	/**
-	 * Follower windows hold this stream open; its closure is their signal that the gateway
-	 * went away. It carries no state, so it does not count as a dashboard client.
-	 */
-	private openPresenceStream(request: http.IncomingMessage, response: http.ServerResponse): void {
-		response.writeHead(200, {
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'X-Accel-Buffering': 'no',
-		});
-		response.flushHeaders();
-		response.write(`event: gateway\ndata: ${JSON.stringify({ registryId: this.options.registryId, leaseNonce: this.options.leaseNonce ?? null })}\n\n`);
-		this.presenceClients.add(response);
-		this.syncHeartbeatTimer();
-		request.on('close', () => {
-			this.presenceClients.delete(response);
-			this.syncHeartbeatTimer();
-		});
-	}
-
-	private writeState(client: EventClient, serializedState: string): void {
-		if (client.waitingForDrain) {
-			client.pendingState = serializedState;
-			return;
-		}
-		if (client.response.write(`event: state\ndata: ${serializedState}\n\n`)) {
-			return;
-		}
-		client.waitingForDrain = true;
-		client.response.once('drain', () => {
-			if (!this.eventClients.has(client)) {
-				return;
-			}
-			client.waitingForDrain = false;
-			const pendingState = client.pendingState;
-			client.pendingState = undefined;
-			if (pendingState !== undefined) {
-				this.writeState(client, pendingState);
-			}
-		});
 	}
 
 	private async readJsonBody(request: http.IncomingMessage): Promise<unknown> {

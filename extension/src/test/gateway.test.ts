@@ -99,7 +99,7 @@ describe('GatewayServer', () => {
 			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json());
 			assert.deepEqual(health, {
 				service: 'githubcopilot-monitor-gateway', registryId: 'registry-1', apiVersion: 4,
-				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync'],
+				capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2'],
 			});
 			const page = await fetch(`${baseUrl}/`);
 			assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' 'unsafe-inline'/);

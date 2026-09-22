@@ -21,6 +21,7 @@ import {
 	CreateSessionResult,
 } from './protocol';
 import { readWindowDescriptors, removeWindowDescriptor, WindowDescriptor } from './windowRegistry';
+import { applyPatch, isPatch } from './stateDelta';
 
 const defaultScanDebounceMs = 100;
 const relayRequestTimeoutMs = 15_000;
@@ -363,7 +364,7 @@ class WindowConnection {
 		const request = http.get({
 			host: '127.0.0.1',
 			port: this.descriptor.localPort,
-			path: '/api/events?relay=1',
+			path: '/api/events?relay=1&v=2',
 		}, response => {
 			this.response = response;
 			if (response.statusCode !== 200) {
@@ -436,19 +437,35 @@ class WindowConnection {
 		while ((boundary = this.buffer.indexOf('\n\n')) >= 0) {
 			const event = this.buffer.slice(0, boundary);
 			this.buffer = this.buffer.slice(boundary + 2);
-			const dataLine = event.split('\n').find(line => line.startsWith('data: '));
+			const lines = event.split('\n');
+			const eventName = lines.find(line => line.startsWith('event: '))?.slice(7) ?? 'message';
+			const dataLine = lines.find(line => line.startsWith('data: '));
 			if (!dataLine) {
 				continue;
 			}
 			try {
-				const state = JSON.parse(dataLine.slice(6)) as MonitorState;
-				if (state.version === 1 && state.windowId === this.descriptor.windowId) {
-					this.state = state;
-					this.onChange();
+				const payload = JSON.parse(dataLine.slice(6)) as unknown;
+				if (eventName === 'patch') {
+					if (!this.state || !isPatch(payload)) {
+						throw new Error('patch without a base state');
+					}
+					this.acceptState(applyPatch(this.state, payload));
+				} else if (eventName === 'snapshot' || eventName === 'state') {
+					this.acceptState(payload);
 				}
 			} catch {
-				// Ignore malformed or partially received events.
+				// The stream is out of sync (malformed frame or inapplicable patch): reconnect for a snapshot.
+				this.handleDisconnect();
+				return;
 			}
+		}
+	}
+
+	private acceptState(value: unknown): void {
+		const state = value as MonitorState;
+		if (state.version === 1 && state.windowId === this.descriptor.windowId) {
+			this.state = state;
+			this.onChange();
 		}
 	}
 
