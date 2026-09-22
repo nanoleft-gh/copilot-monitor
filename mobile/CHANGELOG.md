@@ -1,5 +1,10 @@
 # Mobile Changelog
 
+## [0.2.3]
+
+- Markdown rendering now uses `react-native-markdown-display` (markdown-it), the renderer most widely deployed on Expo Go; `react-native-marked` threw at render time on the device. The dependency had also been dropped from `package.json` by an editor save racing `pnpm add`, so fresh installs lacked it.
+- Assistant text is wrapped in an error boundary: if the markdown renderer ever throws, the message falls back to plain text and the error is logged instead of taking the whole chat screen down.
+
 ## [0.2.2]
 
 - Learns the computer's addresses from the live stream: every snapshot carries the gateway's current `endpoints`, and changes are persisted immediately, so a remote address added in VS Code (or a changed home IP) is known before it is ever needed.

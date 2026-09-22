@@ -2,7 +2,7 @@
   "expo": {
     "name": "Copilot Monitor",
     "slug": "copilot-monitor",
-    "version": "0.2.2",
+    "version": "0.2.3",
     "orientation": "default",
     "icon": "./assets/images/copilot-monitor-icon.png",
     "scheme": "copilot-monitor",
