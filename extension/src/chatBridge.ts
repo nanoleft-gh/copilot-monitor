@@ -13,6 +13,7 @@ const openSessionInEditorCommand = 'workbench.action.chat.openSessionInEditorGro
 const acceptToolCommand = 'workbench.action.chat.acceptTool';
 const skipToolCommand = 'workbench.action.chat.skipTool';
 const closeActiveEditorCommand = 'workbench.action.closeActiveEditor';
+const moveChatEditorToSidebarCommand = 'workbench.action.chat.openInSidebar';
 const newLocalChatCommand = 'workbench.action.chat.newLocalChat';
 const getCurrentSessionCommand = '_chat.voice.getCurrentSession';
 const agentSessionContextMarshalledId = 25;
@@ -75,6 +76,12 @@ export async function editAndResubmitPrompt(
 	await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: prompt });
 }
 
+/**
+ * Shows the session in the chat panel. The voice bridge switches the panel directly; without
+ * it the session is opened as an editor and moved into the side bar, which is the only public
+ * route into the panel. The panel is the target because `workbench.action.chat.open` (used for
+ * model selection) always acts on the panel's session.
+ */
 export async function focusChatSession(resource: vscode.Uri, availableCommands?: readonly string[]): Promise<void> {
 	const commands = availableCommands ?? await vscode.commands.getCommands(true);
 	if (commands.includes(internalSwitchSessionCommand)) {
@@ -95,6 +102,9 @@ export async function focusChatSession(resource: vscode.Uri, availableCommands?:
 
 	if (commands.includes(openSessionInEditorCommand)) {
 		await openChatSessionInEditor(resource);
+		if (commands.includes(moveChatEditorToSidebarCommand)) {
+			await vscode.commands.executeCommand(moveChatEditorToSidebarCommand);
+		}
 		return;
 	}
 
@@ -129,23 +139,30 @@ export async function selectChatModel(resource: vscode.Uri, selector: ChatModelS
 		if (activeResource !== expectedResource) {
 			throw new Error('VS Code activated a different Copilot chat session than requested.');
 		}
-	} else if (commands.includes(openSessionInEditorCommand)) {
-		await openChatSessionInEditor(resource);
 	} else {
 		await focusChatSession(resource, commands);
 	}
 	await vscode.commands.executeCommand(activeChatOpenCommand, { modelSelector: selector });
 }
 
+/**
+ * Makes VS Code drop every live reference to the session so the next focus loads it from its
+ * session log again — the only way to hand VS Code a change written to that log. The session
+ * is first gathered into the panel (closing its editor tab), then the panel is moved on to a
+ * fresh blank chat, which VS Code discards once it is left empty. Disposal makes VS Code
+ * persist the session's own pending state; callers must let that write land before appending.
+ */
 export async function releaseChatSession(resource: vscode.Uri): Promise<void> {
 	const commands = await vscode.commands.getCommands(true);
-	if (!commands.includes(openSessionInEditorCommand)
-		|| !commands.includes(closeActiveEditorCommand)) {
-		throw new Error('VS Code does not expose the commands required to reload a chat configuration.');
+	if (!commands.includes(newLocalChatCommand) || !commands.includes(openSessionInEditorCommand) || !commands.includes(closeActiveEditorCommand)) {
+		throw new Error('VS Code does not expose the commands required to reload a chat.');
 	}
-
+	// An editor tab showing the session would keep it alive; focusing it and closing it drops that holder.
 	await openChatSessionInEditor(resource);
 	await vscode.commands.executeCommand(closeActiveEditorCommand);
+	// Focus decides which widget "New Local Chat" replaces; after this it is the panel showing the session.
+	await focusChatSession(resource, commands);
+	await vscode.commands.executeCommand(newLocalChatCommand);
 }
 
 async function openChatSessionInEditor(resource: vscode.Uri): Promise<void> {

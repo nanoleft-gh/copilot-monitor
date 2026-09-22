@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.3]
+
+- Fixed effort/context (and rename, approval-mode fallback) changes made from the dashboard or phone not reaching VS Code. These are written to the session log, which VS Code reads only when it loads a session; the previous "open in editor and close it" release did nothing while the chat panel still held the session. The session is now gathered into the panel, the panel is moved to a fresh blank chat so the last reference drops, VS Code's own dispose-time write is allowed to land, the change is appended, and the session is shown again from disk.
+- Without the voice bridge, focusing a chat now lands it in the chat panel (open as editor, then "Move Chat into Side Bar") instead of leaving editor tabs behind; the panel is also what VS Code's own model-selection command acts on.
+
 ## [1.2.2]
 
 - Fixed "VS Code created a chat but did not expose its session identity" when creating a chat from the dashboard or phone. The internal `_chat.voice.*` commands the monitor relied on exist only while `agents.voice.enabled` is on; VS Code offers no other way to ask for a new chat's identity, so the monitor now makes VS Code persist its live chats (a no-op rename of an existing chat runs the chat service's immediate save) and identifies the new chat from the session file that appears.

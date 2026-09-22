@@ -449,29 +449,41 @@ export class SessionMonitor implements vscode.Disposable {
 		const sessionId = targetSession.sessionId;
 		const file = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		// Opening and closing the session in an editor makes VS Code persist its current state now.
-		await releaseChatSession(resource);
-		try {
+		await this.rewriteSessionLog(resource, file.filePath, async () => {
 			const selectedModel = await this.waitForPersistedModel(sessionId, request.modelId)
-				?? this.selectedModelFromCatalog(request.modelId, targetSession.model.configuration);
+				?? this.selectedModelFromCatalog(request.modelId, targetSession.model?.configuration ?? {});
 			if (!selectedModel) {
 				throw new MonitorRequestError(409, 'VS Code has not persisted the selected model for this chat yet. Try again in a moment.');
 			}
 			const mutation = createSessionModelConfigurationMutation({ inputState: { selectedModel } }, request.modelId, request.key, request.value);
 			await this.appendMutation(file.filePath, mutation);
-			await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
-			await this.core.pokeSession(sessionId);
-			if (this.nativeModelOverride?.resource === request.sessionResource) {
-				const current = this.nativeModelOverride.model;
-				const configuration = { ...current.configuration, [request.key]: request.value };
-				this.nativeModelOverride = {
-					resource: request.sessionResource,
-					model: { ...current, configuration, configurationFields: current.configurationFields.map(item => ({ ...item, value: configuration[item.key] ?? item.value })) },
-				};
-			}
-			this.emit();
+		});
+		await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
+		await this.core.pokeSession(sessionId);
+		if (this.nativeModelOverride?.resource === request.sessionResource) {
+			const current = this.nativeModelOverride.model;
+			const configuration = { ...current.configuration, [request.key]: request.value };
+			this.nativeModelOverride = {
+				resource: request.sessionResource,
+				model: { ...current, configuration, configurationFields: current.configurationFields.map(item => ({ ...item, value: configuration[item.key] ?? item.value })) },
+			};
+		}
+		this.emit();
+	}
+
+	/**
+	 * VS Code only reads a session log when it loads the session, so a change written to the log
+	 * reaches VS Code by releasing every live reference, letting VS Code persist its own pending
+	 * state, appending ours, and showing the session again so it is loaded from disk.
+	 */
+	private async rewriteSessionLog(resource: vscode.Uri, filePath: string, append: () => Promise<void>): Promise<void> {
+		await releaseChatSession(resource);
+		try {
+			await waitForFileToSettle(filePath);
+			await append();
 		} finally {
 			await focusChatSession(resource);
+			this.nativeCurrentSessionResource = resource.toString();
 		}
 	}
 
@@ -493,13 +505,8 @@ export class SessionMonitor implements vscode.Disposable {
 		const target = this.requireIdleSession(request.sessionResource);
 		const file = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		await releaseChatSession(resource);
-		try {
-			await this.appendMutation(file.filePath, createSessionValueMutation(['customTitle'], title));
-			await this.core.pokeSession(target.sessionId);
-		} finally {
-			await focusChatSession(resource);
-		}
+		await this.rewriteSessionLog(resource, file.filePath, () => this.appendMutation(file.filePath, createSessionValueMutation(['customTitle'], title)));
+		await this.core.pokeSession(target.sessionId);
 		this.emit();
 	}
 
@@ -534,14 +541,9 @@ export class SessionMonitor implements vscode.Disposable {
 			return;
 		}
 		const file = await this.requireSessionFile(request.sessionResource);
-		await releaseChatSession(resource);
-		try {
-			await this.appendMutation(file.filePath, createSessionValueMutation(['inputState', 'permissionLevel'], request.permissionLevel));
-			await this.core.pokeSession(target.sessionId);
-			this.emit();
-		} finally {
-			await focusChatSession(resource);
-		}
+		await this.rewriteSessionLog(resource, file.filePath, () => this.appendMutation(file.filePath, createSessionValueMutation(['inputState', 'permissionLevel'], request.permissionLevel)));
+		await this.core.pokeSession(target.sessionId);
+		this.emit();
 	}
 
 	async decideTool(request: ToolDecisionRequest): Promise<void> {
@@ -1152,6 +1154,28 @@ export function applyExportSnapshot(session: ActiveSessionState, snapshot: Expor
 		model: snapshot.model ? mergeSessionModelState(session.model, snapshot.model) : session.model,
 		revision: `${session.revision}+x${snapshot.capturedAt}`,
 	};
+}
+
+/** Resolves once the file's size has stopped changing (VS Code's dispose-time write has landed). */
+async function waitForFileToSettle(filePath: string, quietMs = 150, maximumMs = 2_000): Promise<void> {
+	const deadline = Date.now() + maximumMs;
+	let lastSize = -1;
+	let quietSince = Date.now();
+	while (Date.now() < deadline) {
+		let size: number;
+		try {
+			size = (await fs.stat(filePath)).size;
+		} catch {
+			size = -1;
+		}
+		if (size !== lastSize) {
+			lastSize = size;
+			quietSince = Date.now();
+		} else if (Date.now() - quietSince >= quietMs) {
+			return;
+		}
+		await new Promise(resolve => setTimeout(resolve, 50));
+	}
 }
 
 function stateSignature(state: MonitorState): string {
