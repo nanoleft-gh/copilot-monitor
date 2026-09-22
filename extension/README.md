@@ -103,19 +103,16 @@ Pair once. The phone keeps every address the computer advertises and finds it ag
 
 ## Remote access
 
-To reach the computer when the phone is not on your Wi-Fi, without any paid service:
+To reach the computer when the phone is not on your Wi-Fi, without any paid service, open the **Copilot Monitor** view and press **Turn on remote access**. The extension forwards the gateway port through a Microsoft dev tunnel using the `code-tunnel` CLI that ships inside VS Code (the same mechanism as the **Ports** view), shows the resulting `https://…devtunnels.ms/` address, and advertises it to paired phones, which switch to it automatically whenever the local network is unreachable. If you are not signed in to GitHub, the view offers the sign-in first. The tunnel is public because the phone cannot complete the GitHub browser login that private tunnels require; the pairing secret still guards every request, and traffic through the tunnel is HTTPS. Dev tunnels have bandwidth and active-tunnel limits; the delta stream keeps usage small.
 
-1. Open the **Ports** view (Panel > Ports, or the sidebar's *Open Ports view* button), choose **Forward a Port**, and enter `43121`. VS Code uses Microsoft dev tunnels; sign in with GitHub when asked.
-2. Right-click the port and set **Port Visibility > Public**. Private ports require a GitHub browser login the app cannot perform; the pairing secret still protects every request.
-3. Copy the **Forwarded Address** and run `Copilot Monitor: Set Remote Access URL` (or use the sidebar's *Set remote URL*).
-
-The next time the phone connects at home it learns the address and switches to it automatically whenever the local network is unreachable. Traffic through the tunnel is HTTPS. A Tailscale (free personal plan; the phone reaches the PC's stable `100.x` address from anywhere, nothing is public) or Cloudflare Tunnel URL works the same way. Dev tunnels have bandwidth and active-tunnel limits; the delta stream keeps usage small.
+Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL.
 
 ## Settings
 
 - `githubCopilotMonitor.autoStart`: register each VS Code window with the shared gateway after startup. Default: `true`.
 - `githubCopilotMonitor.port`: stable LAN gateway port shared by all windows. Default: `43121`.
-- `githubCopilotMonitor.remoteUrl`: public HTTPS address (Ports view Forwarded Address, Tailscale, Cloudflare Tunnel) that reaches the gateway from outside your Wi-Fi. Paired phones learn it automatically. Default: empty.
+- `githubCopilotMonitor.remoteAccess`: forward the gateway port through a Microsoft dev tunnel so paired phones can reach this computer from anywhere (GitHub sign-in required). Default: `false`.
+- `githubCopilotMonitor.remoteUrl`: optional manual public address (Tailscale, Cloudflare Tunnel, own proxy) that reaches the gateway. Paired phones learn it automatically. Default: empty.
 
 ## Commands
 `ctrl+shift+p` -> 
@@ -123,7 +120,7 @@ The next time the phone connects at home it learns the address and switches to i
 - `Copilot Monitor: Stop Dashboard`
 - `Copilot Monitor: Open Dashboard`
 - `Copilot Monitor: Copy Pairing Link`
-- `Copilot Monitor: Set Remote Access URL`
+- `Copilot Monitor: Set Manual Remote URL`
 - `Copilot Monitor: Reset Pairing Secret`
 
 ## Known Limitations for Future Scope

@@ -249,10 +249,15 @@ requirement blocks cross-site requests; no CORS headers are issued.
 `endpoints`: every URL the gateway can be reached through — all physical LAN IPv4
 interfaces plus the `githubCopilotMonitor.remoteUrl` setting. Phones persist the list and,
 when the last-good address fails, probe LAN candidates in parallel, then remote ones, then
-scan the subnet (`mobile/src/transport/host-locator.ts`). Remote access relies on an
-externally provided tunnel (VS Code Ports view / dev tunnels, Tailscale, Cloudflare Tunnel):
-`env.asExternalUri` is a no-op in local windows and `workspace.openTunnel` is a proposed
-API, so the URL is pasted once and advertised from then on.
+scan the subnet (`mobile/src/transport/host-locator.ts`). Remote access (`remoteTunnel.ts`) runs
+the `code-tunnel` CLI shipped inside VS Code with `tunnel forward-internal --provider github`,
+the same stdin (port list JSON) / stderr (`{"port_format"}`) protocol the built-in Ports view
+uses, authenticated with a token from `vscode.authentication.getSession('github', …)`. The CLI
+is a per-machine singleton with a stable address, so multiple windows and the Ports view can
+share it. Only the gateway owner runs it; followers display the address the gateway advertises.
+`env.asExternalUri` is a no-op in local windows and `workspace.openTunnel` is a proposed API,
+which is why the CLI is driven directly. A manual URL (Tailscale, Cloudflare Tunnel) can be
+advertised as well.
 
 ### 9.1 Protocol 2 deltas (`stateDelta.ts`, `stateStream.ts`)
 

@@ -44,6 +44,7 @@ export class GatewayCoordinator {
 	private presenceRetryAttempt = 0;
 	private readonly addressListeners = new Set<(address: GatewayAddress | undefined) => void>();
 	private lastNotifiedPort: number | undefined;
+	private lastNotifiedLeader = false;
 	private stopped = false;
 
 	constructor(private readonly options: GatewayCoordinatorOptions) {
@@ -118,10 +119,12 @@ export class GatewayCoordinator {
 
 	private notifyAddressIfChanged(): void {
 		const port = this.currentAddress?.port;
-		if (port === this.lastNotifiedPort) {
+		const leader = this.isLeader;
+		if (port === this.lastNotifiedPort && leader === this.lastNotifiedLeader) {
 			return;
 		}
 		this.lastNotifiedPort = port;
+		this.lastNotifiedLeader = leader;
 		for (const listener of this.addressListeners) {
 			listener(this.currentAddress);
 		}

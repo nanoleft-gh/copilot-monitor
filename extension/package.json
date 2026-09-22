@@ -3,7 +3,7 @@
   "publisher": "nanoleft",
   "displayName": "Copilot Monitor",
   "description": "Monitor and remotely control local GitHub Copilot Chat sessions from a responsive LAN dashboard.",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -83,7 +83,7 @@
       },
       {
         "command": "githubCopilotMonitor.setRemoteUrl",
-        "title": "Copilot Monitor: Set Remote Access URL"
+        "title": "Copilot Monitor: Set Manual Remote URL"
       },
       {
         "command": "githubCopilotMonitor.resetPairing",
@@ -106,11 +106,17 @@
           "scope": "machine",
           "description": "Stable LAN port shared by all open VS Code windows."
         },
+        "githubCopilotMonitor.remoteAccess": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Forward the gateway port through a Microsoft dev tunnel (the same free service behind VS Code's **Ports** view) so paired phones can reach this computer from anywhere. Requires a GitHub sign-in; the tunnel is public because phones cannot complete the browser login private tunnels require, and every request still needs the pairing secret. Only the VS Code window that owns the shared gateway runs the tunnel."
+        },
         "githubCopilotMonitor.remoteUrl": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "markdownDescription": "Public HTTPS address that reaches this computer's gateway from outside your Wi-Fi, for example the **Forwarded Address** VS Code shows after you forward the gateway port in the **Ports** view (set its visibility to *Public*), or a Tailscale/Cloudflare Tunnel URL. Paired phones learn it automatically and use it whenever the local network is unreachable. Every request still requires the pairing secret."
+          "markdownDescription": "Optional manual public address that reaches this computer's gateway (Tailscale, Cloudflare Tunnel, your own proxy). Prefer `#githubCopilotMonitor.remoteAccess#`, which needs no setup. Paired phones learn either address automatically. Every request still requires the pairing secret."
         }
       }
     }
@@ -121,7 +127,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "npm run compile && node --test out/test/aggregateMonitor.test.js out/test/chatBridge.test.js out/test/directoryWatcher.test.js out/test/gateway.test.js out/test/gatewayAuth.test.js out/test/gatewayLease.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/lineTailer.test.js out/test/liveExportTracker.test.js out/test/liveMerge.test.js out/test/liveTurns.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/monitorServer.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/pagedMutationHistory.test.js out/test/sessionCore.test.js out/test/sessionIndex.test.js out/test/sessionLogProjection.test.js out/test/sessionMatcher.test.js out/test/stateDelta.test.js out/test/stateStream.test.js out/test/toolDecision.test.js out/test/transcript.test.js out/test/windowRegistry.test.js",
+    "test": "npm run compile && node --test out/test/aggregateMonitor.test.js out/test/chatBridge.test.js out/test/directoryWatcher.test.js out/test/gateway.test.js out/test/gatewayAuth.test.js out/test/gatewayLease.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/lineTailer.test.js out/test/liveExportTracker.test.js out/test/liveMerge.test.js out/test/liveTurns.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/monitorServer.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/pagedMutationHistory.test.js out/test/remoteTunnel.test.js out/test/sessionCore.test.js out/test/sessionIndex.test.js out/test/sessionLogProjection.test.js out/test/sessionMatcher.test.js out/test/stateDelta.test.js out/test/stateStream.test.js out/test/toolDecision.test.js out/test/transcript.test.js out/test/windowRegistry.test.js",
     "test:integration": "vscode-test",
     "package": "npm run compile && npx --yes @vscode/vsce package",
     "publish:marketplace": "npm test && npx --yes @vscode/vsce publish"

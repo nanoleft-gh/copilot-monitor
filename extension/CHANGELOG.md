@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1]
+
+- Remote access is now one click. "Turn on remote access" in the Copilot Monitor sidebar forwards the gateway port through a Microsoft dev tunnel by running the `code-tunnel` CLI that ships inside VS Code with the same stdin/stderr protocol the Ports view uses (`tunnel forward-internal`), so no proposed API or manual forwarding is needed. The address appears in the sidebar and is advertised to paired phones automatically. If GitHub is not signed in, the sidebar offers the sign-in and continues on its own afterwards; the CLI is restarted with backoff if it exits. Only the window that owns the shared gateway runs the tunnel, and leadership changes now notify the runtime so failover moves it.
+- The manual remote URL (Tailscale, Cloudflare Tunnel, own proxy) is edited inside the sidebar instead of an input box; save errors are shown instead of being swallowed.
+- New setting `githubCopilotMonitor.remoteAccess` (machine scope, off by default).
+
 ## [1.3.0]
 
 Pairing secret and connection resilience. Phones pair once and keep working through Wi-Fi drops, IP changes, and from outside the home network.
