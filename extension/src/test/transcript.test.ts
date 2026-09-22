@@ -88,8 +88,23 @@ describe('normalizeTranscript', () => {
 				{ kind: 'activity', activity: { id: 'call-1', label: 'Reading parser.ts', status: 'running' } },
 			],
 			status: 'working',
+			error: undefined,
 			completedAt: undefined,
 		});
+	});
+
+	it('marks completed model state with response error details as failed', () => {
+		const transcript = normalizeTranscript({
+			sessionId: 'failed-session',
+			requests: [{
+				requestId: 'request-failed',
+				message: { text: 'Try this' },
+				modelState: { value: 1, completedAt: 42 },
+				result: { errorDetails: { code: 'conversation_error', message: 'Error on conversation request.' } },
+			}],
+		});
+		assert.equal(transcript.turns[0].status, 'failed');
+		assert.equal(transcript.turns[0].error, 'Error on conversation request.');
 	});
 
 	it('does not expose generated fallback request ids as editable', () => {

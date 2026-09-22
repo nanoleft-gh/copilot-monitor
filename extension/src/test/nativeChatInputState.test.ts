@@ -35,6 +35,24 @@ describe('parseNativeChatInputState', () => {
 				modelId: 'copilot/model-b',
 				configuration: { reasoningEffort: 'high' },
 			},
+			configurations: { 'copilot/model-b': { reasoningEffort: 'high' } },
+		});
+	});
+
+	it('exposes every model\'s stored configuration so a switch can apply VS Code\'s remembered value', () => {
+		const snapshot = createNativeChatInputStateSnapshot([
+			{ key: 'chat.modelConfiguration.panel', value: JSON.stringify({
+				'copilot/model-a': { contextSize: 922000 },
+				'copilot/model-b': {},
+				'copilot/model-c': { reasoningEffort: 'max', junk: [1] },
+			}) },
+		]);
+		assert.equal(snapshot.state.modelId, undefined);
+		assert.deepEqual(snapshot.state.configuration, {});
+		assert.deepEqual(snapshot.configurations, {
+			'copilot/model-a': { contextSize: 922000 },
+			'copilot/model-b': {},
+			'copilot/model-c': { reasoningEffort: 'max' },
 		});
 	});
 });

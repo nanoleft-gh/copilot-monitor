@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 export const liveExportScheme = 'copilot-monitor-live';
+const maximumLiveExportBytes = 16 * 1024 * 1024;
 
 export class LiveExportFileSystem implements vscode.FileSystemProvider, vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
@@ -38,7 +39,7 @@ export class LiveExportFileSystem implements vscode.FileSystemProvider, vscode.D
 	}
 
 	writeFile(uri: vscode.Uri, content: Uint8Array): void {
-		this.data = content.slice();
+		this.data = content.byteLength <= maximumLiveExportBytes ? content.slice() : new Uint8Array();
 		this.modifiedAt = Date.now();
 		this.changeEmitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
 	}

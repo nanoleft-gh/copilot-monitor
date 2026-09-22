@@ -101,7 +101,7 @@ describe('NativeInputStateSync', () => {
 		sync.dispose();
 	});
 
-	it('uses a slow watched poll and the 250 ms fallback when watching fails', async () => {
+	it('never polls while watched and only polls slowly when watching fails', async () => {
 		const scheduler = new ManualScheduler();
 		let refreshes = 0;
 		const watched = new NativeInputStateSync({
@@ -112,11 +112,9 @@ describe('NativeInputStateSync', () => {
 		watched.start();
 		scheduler.advance(0);
 		await flushPromises();
-		scheduler.advance(999);
-		assert.equal(refreshes, 1);
-		scheduler.advance(1);
+		scheduler.advance(10 * 60_000);
 		await flushPromises();
-		assert.equal(refreshes, 2);
+		assert.equal(refreshes, 1);
 		watched.dispose();
 
 		const fallbackScheduler = new ManualScheduler();
@@ -129,12 +127,34 @@ describe('NativeInputStateSync', () => {
 		fallback.start();
 		fallbackScheduler.advance(0);
 		await flushPromises();
-		fallbackScheduler.advance(249);
+		fallbackScheduler.advance(29_999);
 		assert.equal(fallbackRefreshes, 1);
 		fallbackScheduler.advance(1);
 		await flushPromises();
 		assert.equal(fallbackRefreshes, 2);
 		fallback.dispose();
+	});
+
+	it('stop() releases the watcher and start() attaches again', async () => {
+		const scheduler = new ManualScheduler();
+		const watchers: FakeWatcher[] = [];
+		let refreshes = 0;
+		const sync = new NativeInputStateSync({
+			scheduler,
+			refresh: async () => { refreshes++; },
+			createWatcher: () => { const watcher = new FakeWatcher(); watchers.push(watcher); return watcher; },
+		});
+		sync.start();
+		scheduler.advance(0);
+		await flushPromises();
+		sync.stop();
+		assert.equal(watchers[0].disposed, true);
+		sync.start();
+		scheduler.advance(0);
+		await flushPromises();
+		assert.equal(watchers.length, 2);
+		assert.equal(refreshes, 2);
+		sync.dispose();
 	});
 
 	it('falls back after watcher errors and recovers on retry', async () => {
@@ -157,23 +177,20 @@ describe('NativeInputStateSync', () => {
 		await flushPromises();
 		onError();
 		assert.equal(firstWatcher.disposed, true);
-		scheduler.advance(250);
+		// Watcher retry after 5 s; the slow fallback poll runs once at 30 s and then stops
+		// because the watcher is back.
+		scheduler.advance(4_999);
+		assert.equal(watcherAttempts, 1);
+		scheduler.advance(1);
+		assert.equal(watcherAttempts, 2);
+		scheduler.advance(24_999);
+		assert.equal(refreshes, 1);
+		scheduler.advance(1);
 		await flushPromises();
 		assert.equal(refreshes, 2);
-		scheduler.advance(750);
-		assert.equal(watcherAttempts, 2);
-		assert.equal(refreshes, 3);
+		scheduler.advance(120_000);
 		await flushPromises();
-		scheduler.advance(74);
-		assert.equal(refreshes, 3);
-		scheduler.advance(1);
-		await flushPromises();
-		assert.equal(refreshes, 4);
-		scheduler.advance(924);
-		assert.equal(refreshes, 4);
-		scheduler.advance(1);
-		await flushPromises();
-		assert.equal(refreshes, 5);
+		assert.equal(refreshes, 2);
 		sync.dispose();
 	});
 

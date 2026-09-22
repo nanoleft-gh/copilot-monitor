@@ -3,7 +3,7 @@
   "publisher": "nanoleft",
   "displayName": "Copilot Monitor",
   "description": "Monitor and remotely control local GitHub Copilot Chat sessions from a responsive LAN dashboard.",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -79,7 +79,11 @@
       },
       {
         "command": "githubCopilotMonitor.copyUrl",
-        "title": "Copilot Monitor: Copy Dashboard URL"
+        "title": "Copilot Monitor: Copy Pairing Link"
+      },
+      {
+        "command": "githubCopilotMonitor.resetPairing",
+        "title": "Copilot Monitor: Reset Pairing Secret"
       }
     ],
     "configuration": {
@@ -103,27 +107,31 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\" && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "npm run compile && node --test out/test/transcript.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/gatewayLease.test.js out/test/liveExportTracker.test.js out/test/sessionMatcher.test.js out/test/sessionStateCache.test.js out/test/toolDecision.test.js out/test/windowRegistry.test.js out/test/aggregateMonitor.test.js out/test/gateway.test.js out/test/monitorServer.test.js",
+    "test": "npm run compile && node --test out/test/aggregateMonitor.test.js out/test/chatBridge.test.js out/test/directoryWatcher.test.js out/test/gateway.test.js out/test/gatewayAuth.test.js out/test/gatewayLease.test.js out/test/hostIdentity.test.js out/test/lanAddress.test.js out/test/lineTailer.test.js out/test/liveExportTracker.test.js out/test/liveMerge.test.js out/test/liveTurns.test.js out/test/modelCatalog.test.js out/test/modelConfigurationUpdate.test.js out/test/monitorServer.test.js out/test/nativeChatInputState.test.js out/test/nativeInputStateSync.test.js out/test/ngrokApi.test.js out/test/pagedMutationHistory.test.js out/test/remoteAccessStore.test.js out/test/remoteTunnel.test.js out/test/sessionCore.test.js out/test/sessionIndex.test.js out/test/sessionLogProjection.test.js out/test/sessionMatcher.test.js out/test/stateDelta.test.js out/test/stateStream.test.js out/test/toolDecision.test.js out/test/transcript.test.js out/test/windowRegistry.test.js",
     "test:integration": "vscode-test",
-    "package": "npm run compile && npx --yes @vscode/vsce package --no-dependencies",
-    "publish:marketplace": "npm test && npx --yes @vscode/vsce publish --no-dependencies"
+    "package": "npm run compile && npx --yes @vscode/vsce package",
+    "publish:marketplace": "npm test && npx --yes @vscode/vsce publish"
   },
   "devDependencies": {
-    "@types/vscode": "^1.125.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "typescript-eslint": "^8.61.1",
+    "@types/stream-json": "1.7.8",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
+    "typescript-eslint": "^8.61.1"
   },
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
+  },
+  "dependencies": {
+    "stream-json": "1.9.1"
   }
 }

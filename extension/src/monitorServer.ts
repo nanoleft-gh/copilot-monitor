@@ -1,15 +1,9 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, ToolDecisionRequest } from './protocol';
+import { apiCapabilities, apiVersion, CreateSessionRequest, CreateSessionResult, EditTurnRequest, EditTurnResult, HistoryPageRequest, HistoryPageResult, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SelectSessionRequest, SendMessageRequest, SendMessageResult, SyncSessionRequest, ToolDecisionRequest } from './protocol';
+import { StateStreamHub } from './stateStream';
 
 const maximumRequestBytes = 64 * 1024;
-
-interface EventClient {
-	readonly response: http.ServerResponse;
-	readonly countsAsDashboard: boolean;
-	waitingForDrain: boolean;
-	pendingState?: string;
-}
 
 export interface MonitorBackend {
 	getState(): MonitorState;
@@ -17,6 +11,8 @@ export interface MonitorBackend {
 	sendMessage(request: SendMessageRequest): Promise<SendMessageResult>;
 	editTurn?(request: EditTurnRequest): Promise<EditTurnResult>;
 	selectSession?(sessionResource: string): Promise<void>;
+	syncNow?(sessionResource?: string): Promise<void>;
+	loadHistory?(request: HistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel?(request: ModelSelectionRequest): Promise<void>;
 	configureModel?(request: ModelConfigurationRequest): Promise<void>;
 	renameSession?(request: RenameSessionRequest): Promise<void>;
@@ -43,9 +39,8 @@ export interface MonitorServerAddress {
 
 export class MonitorServer {
 	private readonly server: http.Server;
-	private readonly eventClients = new Set<EventClient>();
+	private readonly streams: StateStreamHub<MonitorState>;
 	private readonly backendSubscription: { dispose(): void };
-	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private address: MonitorServerAddress | undefined;
 
 	constructor(
@@ -53,7 +48,10 @@ export class MonitorServer {
 		private readonly options: MonitorServerOptions,
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
-		this.backendSubscription = backend.onDidChange(state => this.broadcastState(state));
+		this.streams = new StateStreamHub<MonitorState>(() => backend.getState(), {
+			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+		});
+		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(state));
 	}
 
 	async start(): Promise<MonitorServerAddress> {
@@ -82,27 +80,12 @@ export class MonitorServer {
 			port: info.port,
 			url: `http://${displayHost}:${info.port}/`,
 		};
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
 		return this.address;
 	}
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		if (this.heartbeatTimer) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = undefined;
-		}
-		for (const client of this.eventClients) {
-			client.response.end();
-		}
-		this.eventClients.clear();
+		this.streams.closeAll();
 		this.backend.setEventClientCount?.(0);
 		if (!this.server.listening) {
 			return;
@@ -140,8 +123,8 @@ export class MonitorServer {
 			if (request.method === 'GET' && url.pathname === '/api/health') {
 				this.sendJson(response, 200, {
 					service: 'githubcopilot-monitor-window',
-					apiVersion: 3,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
+					apiVersion,
+					capabilities: apiCapabilities,
 				});
 				return;
 			}
@@ -150,7 +133,10 @@ export class MonitorServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
-				this.openEventStream(request, response, url.searchParams.get('relay') !== '1');
+				this.streams.open(request, response, {
+					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
+					countsAsViewer: url.searchParams.get('relay') !== '1',
+				});
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/clients') {
@@ -184,6 +170,8 @@ export class MonitorServer {
 					sessionRevision: typeof body.sessionRevision === 'string' ? body.sessionRevision : '',
 					requestId: typeof body.requestId === 'string' ? body.requestId : '',
 					text: typeof body.text === 'string' ? body.text : '',
+					...(typeof body.sourceText === 'string' ? { sourceText: body.sourceText } : {}),
+					...(typeof body.sourceTimestamp === 'number' ? { sourceTimestamp: body.sourceTimestamp } : {}),
 				});
 				this.sendJson(response, 202, result);
 				return;
@@ -201,6 +189,32 @@ export class MonitorServer {
 				this.sendJson(response, 204, undefined);
 				return;
 			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/sync') {
+				const body = await this.readJsonBody(request) as Partial<SyncSessionRequest>;
+				if (!this.backend.syncNow) {
+					throw new MonitorRequestError(501, 'On-demand sync is unavailable.');
+				}
+				await this.backend.syncNow(typeof body.sessionResource === 'string' ? body.sessionResource : undefined);
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/history') {
+				if (!this.backend.loadHistory) {throw new MonitorRequestError(501, 'Progressive history loading is unavailable.');}
+				const body = await this.readJsonBody(request) as Partial<HistoryPageRequest>;
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				const sessionRevision = typeof body.sessionRevision === 'string' ? body.sessionRevision : '';
+				if (!sessionResource || !sessionRevision) {
+					throw new MonitorRequestError(400, 'Session resource and revision are required.');
+				}
+				const result = await this.backend.loadHistory({
+					sessionResource,
+					sessionRevision,
+					before: typeof body.before === 'number' ? body.before : 0,
+					limit: typeof body.limit === 'number' ? body.limit : undefined,
+				});
+				this.sendJson(response, 200, result);
+				return;
+			}
 			if (request.method === 'POST' && url.pathname === '/api/sessions/rename') {
 				const body = await this.readJsonBody(request) as Partial<RenameSessionRequest>;
 				if (!this.backend.renameSession) {throw new MonitorRequestError(501, 'Chat rename is unavailable.');}
@@ -215,7 +229,8 @@ export class MonitorServer {
 				const body = await this.readJsonBody(request) as Partial<CreateSessionRequest>;
 				if (!this.backend.createSession) {throw new MonitorRequestError(501, 'New chat is unavailable.');}
 				const result = await this.backend.createSession({
-					sourceSessionResource: typeof body.sourceSessionResource === 'string' ? body.sourceSessionResource : undefined,
+					...(typeof body.id === 'string' ? { id: body.id } : {}),
+					...(typeof body.sourceSessionResource === 'string' ? { sourceSessionResource: body.sourceSessionResource } : {}),
 				});
 				this.sendJson(response, 201, result);
 				return;
@@ -326,61 +341,6 @@ export class MonitorServer {
 			'X-Content-Type-Options': 'nosniff',
 		});
 		response.end(JSON.stringify(value));
-	}
-
-	private openEventStream(request: http.IncomingMessage, response: http.ServerResponse, countsAsDashboard: boolean): void {
-		response.writeHead(200, {
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'X-Accel-Buffering': 'no',
-		});
-		response.flushHeaders();
-		const client: EventClient = { response, countsAsDashboard, waitingForDrain: false };
-		this.eventClients.add(client);
-		this.updateDashboardClientCount();
-		this.writeState(client, JSON.stringify(this.backend.getState()));
-		request.on('close', () => {
-			this.eventClients.delete(client);
-			this.updateDashboardClientCount();
-		});
-	}
-
-	private updateDashboardClientCount(): void {
-		const count = [...this.eventClients].filter(client => client.countsAsDashboard).length;
-		this.backend.setEventClientCount?.(count);
-	}
-
-	private broadcastState(state: MonitorState): void {
-		const serialized = JSON.stringify(state);
-		for (const client of this.eventClients) {
-			this.writeState(client, serialized);
-		}
-	}
-
-	private writeState(client: EventClient, serializedState: string): void {
-		if (client.waitingForDrain) {
-			client.pendingState = serializedState;
-			return;
-		}
-
-		const writable = client.response.write(`event: state\ndata: ${serializedState}\n\n`);
-		if (writable) {
-			return;
-		}
-
-		client.waitingForDrain = true;
-		client.response.once('drain', () => {
-			if (!this.eventClients.has(client)) {
-				return;
-			}
-			client.waitingForDrain = false;
-			const pendingState = client.pendingState;
-			client.pendingState = undefined;
-			if (pendingState !== undefined) {
-				this.writeState(client, pendingState);
-			}
-		});
 	}
 
 	private async readJsonBody(request: http.IncomingMessage): Promise<unknown> {

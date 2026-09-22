@@ -24,12 +24,30 @@ describe('GatewayLeaseStore', () => {
 				port: 43_121,
 				heartbeatAt: 100,
 			});
-			assert.equal((await store.read(500))?.port, 43_121);
-			assert.equal(await store.read(1_101), undefined);
+			// The lease never ages out on its own: readers validate it against the gateway.
+			assert.equal((await store.read())?.port, 43_121);
+			// While the lock is held, nobody else may run an election...
+			assert.equal(await store.acquire('window-3', 500), undefined);
 			await lock.release();
 			const replacement = await store.acquire('window-3', 1_101);
 			assert.ok(replacement);
 			await replacement.release();
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it('breaks an abandoned election lock once it is stale', async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-lease-'));
+		const store = new GatewayLeaseStore(directory, 50);
+		try {
+			const abandoned = await store.acquire('window-1');
+			assert.ok(abandoned);
+			assert.equal(await store.acquire('window-2'), undefined);
+			const staleLock = await store.acquire('window-2', Date.now() + 1_000);
+			assert.ok(staleLock, 'a lock older than staleAfterMs is broken and re-acquired');
+			await staleLock.release();
+			await abandoned.release();
 		} finally {
 			await fs.rm(directory, { recursive: true, force: true });
 		}

@@ -1,5 +1,9 @@
 import type { TranscriptTurn } from './transcript';
 
+/** Advertised by `/api/health` on both the per-window bridge and the shared gateway. */
+export const apiVersion = 4;
+export const apiCapabilities = ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit', 'sessionSync', 'eventsV2', 'remoteAccess'] as const;
+
 export interface ActiveSessionState {
 	readonly resource: string;
 	readonly sessionId: string;
@@ -8,7 +12,13 @@ export interface ActiveSessionState {
 	readonly revision: string;
 	readonly updatedAt?: number;
 	readonly turns: readonly TranscriptTurn[];
+	/** Exact request count; only known for the selected (tailed) session and for empty chats. */
 	readonly turnCount?: number;
+	/** Whether the chat has no requests, from VS Code's index; undefined while unknown. */
+	readonly isEmpty?: boolean;
+	readonly historyUnavailable?: 'archived' | 'oversized' | 'indexing';
+	readonly historyTruncated?: boolean;
+	readonly historyStart?: number;
 	readonly model?: SessionModelState;
 	readonly permissionLevel: ChatPermissionLevel;
 }
@@ -98,12 +108,38 @@ export interface EditTurnRequest {
 	readonly sessionRevision: string;
 	readonly requestId: string;
 	readonly text: string;
+	readonly sourceText?: string;
+	readonly sourceTimestamp?: number;
 }
 
 export type EditTurnResult = SendMessageResult;
 
 export interface SelectSessionRequest {
 	readonly sessionResource: string;
+}
+
+export interface SyncSessionRequest {
+	readonly sessionResource: string;
+}
+
+export interface GatewaySyncSessionRequest extends SyncSessionRequest {
+	readonly windowId: string;
+}
+
+export interface HistoryPageRequest {
+	readonly sessionResource: string;
+	readonly sessionRevision: string;
+	readonly before: number;
+	readonly limit?: number;
+}
+
+export interface HistoryPageResult {
+	readonly turns: readonly TranscriptTurn[];
+	readonly totalCount: number;
+	readonly start: number;
+	readonly end: number;
+	readonly hasEarlier: boolean;
+	readonly revision: string;
 }
 
 export interface GatewayWindowState extends MonitorState {
@@ -115,9 +151,15 @@ export interface GatewayState {
 	readonly version: 2;
 	readonly gatewayStartedAt: number;
 	readonly windows: readonly GatewayWindowState[];
+	/** Every address this gateway answers on; streamed so connected clients learn new ones without re-pairing. */
+	readonly endpoints?: readonly string[];
 }
 
 export interface GatewaySendMessageRequest extends SendMessageRequest {
+	readonly windowId: string;
+}
+
+export interface GatewayHistoryPageRequest extends HistoryPageRequest {
 	readonly windowId: string;
 }
 
@@ -172,6 +214,7 @@ export interface GatewayRenameSessionRequest extends RenameSessionRequest {
 }
 
 export interface CreateSessionRequest {
+	readonly id?: string;
 	readonly sourceSessionResource?: string;
 }
 
@@ -200,4 +243,62 @@ export class MonitorRequestError extends Error {
 		super(message);
 		this.name = 'MonitorRequestError';
 	}
+}
+
+export type RemoteTunnelStatus =
+	| { readonly status: 'inactive' }
+	| { readonly status: 'unavailable'; readonly reason: string }
+	| { readonly status: 'signin-required' }
+	| { readonly status: 'starting' }
+	| { readonly status: 'active'; readonly url: string }
+	| { readonly status: 'error'; readonly error: string };
+
+export type RemoteTunnelProvider = 'devtunnel' | 'ngrok';
+
+/** Machine-wide remote access state, owned by whichever window runs the shared gateway. */
+export interface RemoteAccessStatus {
+	readonly enabled: boolean;
+	readonly provider: RemoteTunnelProvider;
+	readonly manualUrl?: string;
+	readonly tunnel: RemoteTunnelStatus;
+	/** ngrok settings, minus the authtoken itself. */
+	readonly ngrok: {
+		readonly hasAuthtoken: boolean;
+		readonly domain?: string;
+		/** Whether the ngrok agent was found on the gateway owner's PATH (and where). */
+		readonly agent: { readonly installed: boolean; readonly path?: string; readonly platform: NodeJS.Platform };
+	};
+}
+
+export interface RemoteAccessUpdateRequest {
+	readonly enabled?: boolean;
+	readonly provider?: RemoteTunnelProvider;
+	/** `null` clears the manual address. */
+	readonly manualUrl?: string | null;
+	/**
+	 * `credential` is either an ngrok **API key** (an agent authtoken is minted from it and stored) or an
+	 * agent **authtoken** (stored as is); `null` forgets the stored authtoken. Omitted fields are kept.
+	 */
+	readonly ngrok?: { readonly credential?: string | null; readonly domain?: string | null };
+	/** Re-run the tunnel start (after the user signed in, or to retry an error). */
+	readonly retry?: boolean;
+}
+
+export interface HistoryPageRequest {
+	readonly sessionResource: string;
+	readonly before: number;
+	readonly limit?: number;
+}
+
+export interface HistoryPageResult {
+	readonly turns: readonly TranscriptTurn[];
+	readonly totalCount: number;
+	readonly start: number;
+	readonly end: number;
+	readonly hasEarlier: boolean;
+	readonly revision: string;
+}
+
+export interface GatewayHistoryPageRequest extends HistoryPageRequest {
+	readonly windowId: string;
 }

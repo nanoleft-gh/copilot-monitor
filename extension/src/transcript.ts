@@ -72,7 +72,8 @@ export interface TranscriptTurn {
 	readonly assistantText: string;
 	readonly activities: readonly TranscriptActivity[];
 	readonly blocks: readonly TranscriptBlock[];
-	readonly status: 'working' | 'completed' | 'cancelled';
+	readonly status: 'working' | 'completed' | 'cancelled' | 'failed';
+	readonly error?: string;
 	readonly completedAt?: number;
 }
 
@@ -145,7 +146,7 @@ export function parseMutationLogSnapshot(content: string): MutationLogSnapshot {
 export function normalizeTranscript(state: JsonObject): Transcript {
 	const requests = Array.isArray(state.requests) ? state.requests : [];
 	const turns = requests.flatMap((request, index) => {
-		return isObject(request) ? [normalizeTurn(request, index)] : [];
+		return isObject(request) ? [normalizeRequestTurn(request, index)] : [];
 	});
 	const firstUserText = turns.find(turn => turn.userText.trim())?.userText.trim();
 	const customTitle = stringValue(state.customTitle)?.trim();
@@ -248,7 +249,7 @@ export function mergeTranscriptSupplement(transcript: Transcript, supplement: Tr
 	};
 }
 
-function normalizeTurn(request: JsonObject, index: number): TranscriptTurn {
+export function normalizeRequestTurn(request: JsonObject, index: number): TranscriptTurn {
 	const response = Array.isArray(request.response) ? request.response : [];
 	const markdown: string[] = [];
 	const thinking: string[] = [];
@@ -361,8 +362,17 @@ function normalizeTurn(request: JsonObject, index: number): TranscriptTurn {
 
 	const message = isObject(request.message) ? request.message : undefined;
 	const modelState = isObject(request.modelState) ? request.modelState : undefined;
+	const result = isObject(request.result) ? request.result : undefined;
+	const errorDetails = isObject(result?.errorDetails) ? result.errorDetails : undefined;
+	const errorCode = stringValue(errorDetails?.code);
+	const error = stringValue(errorDetails?.message)?.trim();
 	const stateValue = numberValue(modelState?.value);
-	const status = stateValue === 1 ? 'completed' : stateValue !== undefined && stateValue > 1 ? 'cancelled' : 'working';
+	const status = errorDetails && errorCode !== 'canceled'
+		? 'failed'
+		: stateValue === 3 ? 'failed'
+			: stateValue === 1 ? 'completed'
+				: stateValue === 2 ? 'cancelled'
+					: 'working';
 
 	const requestId = stringValue(request.requestId);
 	return {
@@ -376,6 +386,7 @@ function normalizeTurn(request: JsonObject, index: number): TranscriptTurn {
 		activities,
 		blocks,
 		status,
+		error,
 		completedAt: numberValue(modelState?.completedAt),
 	};
 }

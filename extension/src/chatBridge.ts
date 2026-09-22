@@ -13,6 +13,7 @@ const openSessionInEditorCommand = 'workbench.action.chat.openSessionInEditorGro
 const acceptToolCommand = 'workbench.action.chat.acceptTool';
 const skipToolCommand = 'workbench.action.chat.skipTool';
 const closeActiveEditorCommand = 'workbench.action.closeActiveEditor';
+const moveChatEditorToSidebarCommand = 'workbench.action.chat.openInSidebar';
 const newLocalChatCommand = 'workbench.action.chat.newLocalChat';
 const getCurrentSessionCommand = '_chat.voice.getCurrentSession';
 const agentSessionContextMarshalledId = 25;
@@ -75,20 +76,35 @@ export async function editAndResubmitPrompt(
 	await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: prompt });
 }
 
+/**
+ * Shows the session in the chat panel. The voice bridge switches the panel directly; without
+ * it the session is opened as an editor and moved into the side bar, which is the only public
+ * route into the panel. The panel is the target because `workbench.action.chat.open` (used for
+ * model selection) always acts on the panel's session.
+ */
 export async function focusChatSession(resource: vscode.Uri, availableCommands?: readonly string[]): Promise<void> {
 	const commands = availableCommands ?? await vscode.commands.getCommands(true);
 	if (commands.includes(internalSwitchSessionCommand)) {
+		const expectedResource = resource.toString();
 		const switched = await vscode.commands.executeCommand<boolean>(
 			internalSwitchSessionCommand,
-			resource.toString(),
+			expectedResource,
 		);
 		if (switched) {
-			return;
+			if (!commands.includes(getCurrentSessionCommand)) {return;}
+			for (let attempt = 0; attempt < 40; attempt++) {
+				const activeResource = await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand);
+				if (activeResource === expectedResource) {return;}
+				await new Promise(resolve => setTimeout(resolve, 25));
+			}
 		}
 	}
 
 	if (commands.includes(openSessionInEditorCommand)) {
 		await openChatSessionInEditor(resource);
+		if (commands.includes(moveChatEditorToSidebarCommand)) {
+			await vscode.commands.executeCommand(moveChatEditorToSidebarCommand);
+		}
 		return;
 	}
 
@@ -123,23 +139,30 @@ export async function selectChatModel(resource: vscode.Uri, selector: ChatModelS
 		if (activeResource !== expectedResource) {
 			throw new Error('VS Code activated a different Copilot chat session than requested.');
 		}
-	} else if (commands.includes(openSessionInEditorCommand)) {
-		await openChatSessionInEditor(resource);
 	} else {
 		await focusChatSession(resource, commands);
 	}
 	await vscode.commands.executeCommand(activeChatOpenCommand, { modelSelector: selector });
 }
 
+/**
+ * Makes VS Code drop every live reference to the session so the next focus loads it from its
+ * session log again — the only way to hand VS Code a change written to that log. The session
+ * is first gathered into the panel (closing its editor tab), then the panel is moved on to a
+ * fresh blank chat, which VS Code discards once it is left empty. Disposal makes VS Code
+ * persist the session's own pending state; callers must let that write land before appending.
+ */
 export async function releaseChatSession(resource: vscode.Uri): Promise<void> {
 	const commands = await vscode.commands.getCommands(true);
-	if (!commands.includes(openSessionInEditorCommand)
-		|| !commands.includes(closeActiveEditorCommand)) {
-		throw new Error('VS Code does not expose the commands required to reload a chat configuration.');
+	if (!commands.includes(newLocalChatCommand) || !commands.includes(openSessionInEditorCommand) || !commands.includes(closeActiveEditorCommand)) {
+		throw new Error('VS Code does not expose the commands required to reload a chat.');
 	}
-
+	// An editor tab showing the session would keep it alive; focusing it and closing it drops that holder.
 	await openChatSessionInEditor(resource);
 	await vscode.commands.executeCommand(closeActiveEditorCommand);
+	// Focus decides which widget "New Local Chat" replaces; after this it is the panel showing the session.
+	await focusChatSession(resource, commands);
+	await vscode.commands.executeCommand(newLocalChatCommand);
 }
 
 async function openChatSessionInEditor(resource: vscode.Uri): Promise<void> {
@@ -151,21 +174,90 @@ async function openChatSessionInEditor(resource: vscode.Uri): Promise<void> {
 	});
 }
 
-export async function createNewChat(sourceResource?: vscode.Uri): Promise<vscode.Uri> {
+/** The `_chat.voice.*` bridge exists only while `agents.voice.enabled` is on. */
+export async function hasVoiceSessionBridge(): Promise<boolean> {
+	const commands = await vscode.commands.getCommands(true);
+	return commands.includes(getCurrentSessionCommand) && commands.includes(internalSwitchSessionCommand);
+}
+
+/** The session VS Code's chat view currently shows, via the voice bridge; `undefined` when unavailable. */
+export async function readVoiceCurrentSession(): Promise<string | undefined> {
+	try {
+		const value = await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand);
+		return typeof value === 'string' && value ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Makes VS Code write every live chat to disk right now. `setChatSessionTitle` is the only
+ * chat operation that runs the service's `saveState()` immediately (everything else waits for
+ * the 60 s idle storage flush), and the `/rename` slash command reaches it for the focused
+ * chat. Renaming `anchor` to the title it already shows changes nothing visible; the payoff
+ * is that a chat created moments ago, which has no identity we can query, appears as a
+ * session file. The anchor is opened in an editor so the panel keeps showing the new chat.
+ */
+export async function persistLiveChatsNow(anchor: vscode.Uri | undefined, anchorTitle: string): Promise<void> {
+	const commands = await vscode.commands.getCommands(true);
+	if (!commands.includes(submitChatRequestCommand)) {
+		throw new Error('VS Code does not expose the commands required to persist a new chat.');
+	}
+	const title = anchorTitle.replace(/\s+/g, ' ').trim() || 'Copilot chat';
+	if (!anchor) {
+		// No other chat exists: title the new chat itself. It can be renamed later.
+		await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: `/rename ${title}` });
+		return;
+	}
+	if (!commands.includes(openSessionInEditorCommand) || !commands.includes(closeActiveEditorCommand)) {
+		throw new Error('VS Code does not expose the commands required to persist a new chat.');
+	}
+	await openChatSessionInEditor(anchor);
+	try {
+		await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: `/rename ${title}` });
+	} finally {
+		await vscode.commands.executeCommand(closeActiveEditorCommand);
+	}
+}
+
+/** Runs VS Code's "New Local Chat" and leaves identification to the caller. */
+export async function startNewLocalChat(sourceResource: vscode.Uri | undefined): Promise<void> {
 	const commands = await vscode.commands.getCommands(true);
 	if (!commands.includes(newLocalChatCommand)) {
-		throw new Error('VS Code does not expose the commands required to create and identify a new local chat.');
+		throw new Error('VS Code does not expose the commands required to create a new local chat.');
 	}
 	if (sourceResource) {
 		await focusChatSession(sourceResource, commands);
 	}
 	await vscode.commands.executeCommand(newLocalChatCommand);
-	if (commands.includes(getCurrentSessionCommand)) {
-		for (let attempt = 0; attempt < 20; attempt++) {
-			const value = await vscode.commands.executeCommand<string | undefined>(getCurrentSessionCommand);
-			if (value && value !== sourceResource?.toString()) {return vscode.Uri.parse(value);}
-			await new Promise(resolve => setTimeout(resolve, 25));
+}
+
+/** Creates a chat and identifies it through the voice bridge, which reports the panel's session directly. */
+export async function createNewChat(
+	sourceResource: vscode.Uri | undefined,
+	readActiveSession: () => Promise<string | undefined>,
+): Promise<vscode.Uri> {
+	const previousResource = await readActiveSession();
+	await startNewLocalChat(sourceResource);
+	for (let attempt = 0; attempt < 80; attempt++) {
+		const value = await readActiveSession();
+		if (value && value !== previousResource && value !== sourceResource?.toString()) {
+			return vscode.Uri.parse(value);
 		}
+		await new Promise(resolve => setTimeout(resolve, 25));
 	}
 	throw new Error('VS Code created a chat but did not expose its session identity.');
+}
+
+export type ChatPermissionLevel = 'default' | 'autoApprove' | 'autopilot';
+
+export async function setChatPermissionLevel(resource: vscode.Uri, level: ChatPermissionLevel): Promise<boolean> {
+	const commands = await vscode.commands.getCommands(true);
+	if (!commands.includes(submitChatRequestCommand)) {return false;}
+	await focusChatSession(resource, commands);
+	const slashCommand = level === 'autoApprove'
+		? '/autoApprove'
+		: level === 'autopilot' ? '/autopilot' : '/disableAutoApprove';
+	await vscode.commands.executeCommand(submitChatRequestCommand, { inputValue: slashCommand });
+	return true;
 }

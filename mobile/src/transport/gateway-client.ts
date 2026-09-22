@@ -1,6 +1,7 @@
 import type {
   ChatModelDescriptor,
   GatewaySnapshot,
+  HistoryPage,
   HostProfile,
   ModelConfigurationField,
   ModelConfigurationOption,
@@ -11,42 +12,39 @@ import type {
   TranscriptTurn,
   WindowSnapshot,
 } from './types';
-import { pairGateway } from './pairing';
-import { replaceHost } from './host-store';
-import { discoverHostEndpoint } from './host-discovery';
+import { authHeaders } from './pairing';
+import { locateHost, learnEndpoints, refreshHostEndpoints } from './host-locator';
 
 const requestTimeoutMs = 10_000;
 
+/** The gateway answered, but with an error; retrying elsewhere on the network will not help. */
+export class GatewayHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'GatewayHttpError';
+  }
+}
+
 export async function fetchGatewaySnapshot(host: HostProfile): Promise<GatewaySnapshot> {
-  let currentHost = host;
   let value: unknown;
   try {
-    value = await requestJson(new URL('/api/state', currentHost.endpoint));
+    value = await requestJson(host, '/api/state');
   } catch (error) {
-    const recoveryEndpoint = preferredPortEndpoint(currentHost.endpoint);
-    if (recoveryEndpoint === currentHost.endpoint) throw error;
-    try {
-      const recovered = await pairGateway(recoveryEndpoint);
-      currentHost = { ...recovered, name: host.name };
-      await replaceHost(host.id, currentHost);
-      Object.assign(host, currentHost);
-      value = await requestJson(new URL('/api/state', currentHost.endpoint));
-    } catch {
-      const discoveredEndpoint = await discoverHostEndpoint(host);
-      if (!discoveredEndpoint) {
-        throw new Error(`Cannot find ${host.name} on this local network. Confirm VS Code is running, then try again or scan its current QR code.`);
-      }
-      const discovered = await pairGateway(discoveredEndpoint);
-      currentHost = { ...discovered, name: host.name };
-      await replaceHost(host.id, currentHost);
-      Object.assign(host, currentHost);
-      value = await requestJson(new URL('/api/state', currentHost.endpoint));
-    }
+    if (error instanceof GatewayHttpError) throw error;
+    // Network-level failure: the computer may have moved (new IP, different network, tunnel only).
+    await locateHost(host);
+    value = await requestJson(host, '/api/state');
   }
   if (!isRecord(value) || value.version !== 2 || !Array.isArray(value.windows)) {
     throw new Error('The computer returned an unsupported monitor state.');
   }
-  return parseGatewaySnapshot(value);
+  const snapshot = parseGatewaySnapshot(value);
+  if (snapshot.endpoints) {
+    learnEndpoints(host, snapshot.endpoints);
+  } else {
+    refreshHostEndpoints(host);
+  }
+  return snapshot;
 }
 
 export function parseGatewaySnapshot(value: unknown): GatewaySnapshot {
@@ -57,6 +55,9 @@ export function parseGatewaySnapshot(value: unknown): GatewaySnapshot {
     version: 2,
     gatewayStartedAt: numberValue(value.gatewayStartedAt),
     windows: value.windows.flatMap(parseWindow),
+    ...(Array.isArray(value.endpoints)
+      ? { endpoints: value.endpoints.filter((endpoint): endpoint is string => typeof endpoint === 'string') }
+      : {}),
   };
 }
 
@@ -65,11 +66,7 @@ export async function selectSession(
   windowId: string,
   sessionResource: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/sessions/select', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource }),
-  });
+  await postJson(host, '/api/sessions/select', { windowId, sessionResource });
 }
 
 export async function sendMessage(
@@ -78,11 +75,7 @@ export async function sendMessage(
   sessionResource: string,
   text: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/messages', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, text, id: createRequestId() }),
-  });
+  await postJson(host, '/api/messages', { windowId, sessionResource, text, id: createRequestId() });
 }
 
 export async function editTurn(
@@ -93,17 +86,13 @@ export async function editTurn(
   requestId: string,
   text: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/turns/edit', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      windowId,
-      sessionResource,
-      sessionRevision,
-      requestId,
-      text,
-      id: createRequestId('edit'),
-    }),
+  await postJson(host, '/api/turns/edit', {
+    windowId,
+    sessionResource,
+    sessionRevision,
+    requestId,
+    text,
+    id: createRequestId('edit'),
   });
 }
 
@@ -115,11 +104,7 @@ export async function decideTool(
   toolCallId: string,
   decision: 'allow' | 'skip',
 ): Promise<void> {
-  await requestJson(new URL('/api/tools/decision', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, requestId, toolCallId, decision }),
-  });
+  await postJson(host, '/api/tools/decision', { windowId, sessionResource, requestId, toolCallId, decision });
 }
 
 export async function selectModel(
@@ -128,11 +113,7 @@ export async function selectModel(
   sessionResource: string,
   modelId: string,
 ): Promise<void> {
-  await requestJson(new URL('/api/models/select', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, modelId }),
-  });
+  await postJson(host, '/api/models/select', { windowId, sessionResource, modelId });
 }
 
 export async function configureModel(
@@ -143,11 +124,7 @@ export async function configureModel(
   key: string,
   value: string | number | boolean,
 ): Promise<void> {
-  await requestJson(new URL('/api/models/configure', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, modelId, key, value }),
-  });
+  await postJson(host, '/api/models/configure', { windowId, sessionResource, modelId, key, value });
 }
 
 export async function setPermissionLevel(
@@ -156,25 +133,29 @@ export async function setPermissionLevel(
   sessionResource: string,
   permissionLevel: 'default' | 'autoApprove' | 'autopilot',
 ): Promise<void> {
-  await requestJson(new URL('/api/sessions/permission', host.endpoint), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ windowId, sessionResource, permissionLevel }),
-  });
+  await postJson(host, '/api/sessions/permission', { windowId, sessionResource, permissionLevel });
 }
 
-async function requestJson(url: URL, init?: RequestInit): Promise<unknown> {
+async function postJson(host: HostProfile, path: string, body: unknown): Promise<unknown> {
+  return requestJson(host, path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+async function requestJson(host: HostProfile, path: string, init?: RequestInit): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(new URL(path, host.endpoint), {
+      ...init,
+      headers: { ...authHeaders(host), ...(init?.headers as Record<string, string> | undefined) },
+      signal: controller.signal,
+    });
     if (!response.ok) {
       let detail = `HTTP ${response.status}`;
       try {
         const body = await response.json() as { error?: unknown };
         if (typeof body.error === 'string') detail = body.error;
       } catch {}
-      throw new Error(detail);
+      throw new GatewayHttpError(response.status, detail);
     }
     return response.status === 204 ? undefined : response.json();
   } catch (error) {
@@ -212,6 +193,10 @@ function parseSession(value: unknown): SessionSummary[] {
     status: value.status === 'working' || value.status === 'loading' ? value.status : 'idle',
     updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : undefined,
     turnCount: typeof value.turnCount === 'number' ? value.turnCount : undefined,
+    isEmpty: typeof value.isEmpty === 'boolean' ? value.isEmpty : undefined,
+    historyUnavailable: value.historyUnavailable === 'archived' || value.historyUnavailable === 'oversized' || value.historyUnavailable === 'indexing'
+      ? value.historyUnavailable : undefined,
+    historyTruncated: value.historyTruncated === true,
     turns: Array.isArray(value.turns) ? value.turns.flatMap(parseTurn) : [],
     modelName: model && typeof model.selectedModelName === 'string' ? model.selectedModelName : undefined,
     model: parseModelState(model),
@@ -342,18 +327,31 @@ function createRequestId(kind = 'message'): string {
 
 export function hasVisibleContent(session: SessionSummary): boolean {
   if (session.revision.startsWith('transient:')) return true;
+  // The computer only sends turns for the chat it is tailing; the index flag covers the rest.
+  if (session.isEmpty !== undefined) return !session.isEmpty;
   const count = session.turnCount ?? session.turns.length;
   if (count > 0) return true;
+  if (session.turnCount === undefined && session.turns.length === 0) return true;
   return session.turns.some(turn => turn.userText.trim() || turn.assistantText.trim() || turn.blocks.length > 0);
 }
 
-function preferredPortEndpoint(endpoint: string): string {
-  const url = new URL(endpoint);
-  url.port = '43121';
-  url.pathname = '/';
-  url.search = '';
-  url.hash = '';
-  return url.toString();
+/** Human description of how much of a chat exists, without inventing a count the computer did not send. */
+export function describeSessionSize(session: SessionSummary, now = Date.now()): string {
+  const count = typeof session.turnCount === 'number' ? session.turnCount : session.turns.length > 0 ? session.turns.length : undefined;
+  if (count === 0 || (count === undefined && session.isEmpty === true)) return 'Ready to chat';
+  if (count !== undefined) return `${count} ${count === 1 ? 'message' : 'messages'}`;
+  return session.updatedAt ? formatRelativeTime(session.updatedAt, now) : 'Not loaded';
+}
+
+export function formatRelativeTime(timestamp: number, now = Date.now()): string {
+  const minutes = Math.round(Math.max(0, now - timestamp) / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days} d ago`;
+  return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
 export async function createSession(
@@ -363,11 +361,7 @@ export async function createSession(
   existingSessionResources: readonly string[] = [],
 ): Promise<{ sessionResource: string }> {
   try {
-    return await requestJson(new URL('/api/sessions/new', host.endpoint), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ windowId, sourceSessionResource }),
-    }) as { sessionResource: string };
+    return await postJson(host, '/api/sessions/new', { windowId, sourceSessionResource }) as { sessionResource: string };
   } catch (error) {
     const known = new Set(existingSessionResources);
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -383,4 +377,26 @@ export async function createSession(
     }
     throw error;
   }
+}
+
+export async function loadHistoryPage(
+  host: HostProfile,
+  windowId: string,
+  sessionResource: string,
+  sessionRevision: string,
+  before: number,
+  limit = 40,
+): Promise<HistoryPage> {
+  const value = await postJson(host, '/api/sessions/history', { windowId, sessionResource, sessionRevision, before, limit });
+  if (!isRecord(value) || !Array.isArray(value.turns) || typeof value.revision !== 'string') {
+    throw new Error('The computer returned an invalid history page.');
+  }
+  return {
+    turns: value.turns.flatMap(parseTurn),
+    totalCount: numberValue(value.totalCount),
+    start: numberValue(value.start),
+    end: numberValue(value.end),
+    hasEarlier: value.hasEarlier === true,
+    revision: value.revision,
+  };
 }

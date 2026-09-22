@@ -1,28 +1,40 @@
 # Copilot Monitor
 
-Monitor and control local GitHub Copilot Chat sessions from a responsive browser dashboard. Switch among open VS Code windows and conversations, follow responses and tools in real time, send prompts, manage models and approvals, organize chats, and use the dashboard from another device on your trusted local network.
+Monitor and control local GitHub Copilot Chat sessions from a browser dashboard or the Copilot Monitor phone app. Switch among open VS Code windows and conversations, follow responses and tools in real time, send prompts, manage models and approvals, organize chats — on your Wi-Fi or, with one click, from anywhere through a free tunnel.
 
-Every open VS Code window runs a hidden loopback bridge, while one window owns the shared LAN gateway on a stable port. The browser sees one URL and can route actions to the exact window and chat session.
+Every open VS Code window runs a hidden loopback bridge, while one window owns the shared gateway on a stable port. Clients see one address, protected by a per-computer pairing secret, and can route actions to the exact window and chat session.
+
+<p align="center">
+  <img alt="Pairing sidebar with one code for home and away" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-3-vs-tunnel-dash.png" width="49%">
+  <img alt="Remote access through a VS Code dev tunnel" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-4-vs-tunnel-remote-access.png" width="49%">
+</p>
+<p align="center">
+  <img alt="Phone: conversations list" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-2-conversations-list.jpeg" width="24%">
+  <img alt="Phone: conversation with markdown and controls" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-3-opened-conversation.jpeg" width="24%">
+  <img alt="Phone: approval mode" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-5-approval-edit.jpeg" width="24%">
+  <img alt="Phone: edit and resubmit a request" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-6-edit-message-for-resubmitting.jpeg" width="24%">
+</p>
 
 > [!IMPORTANT]
 > Copilot Monitor is an independent open-source project. It is not affiliated with, endorsed by, or supported by GitHub or Microsoft.
 
 ## Security
 
-The dashboard intentionally has **no authentication**. Anyone who can reach its LAN URL can read local Copilot transcripts and may be able to send prompts, change chat settings, approve individual tool calls, or enable Bypass Approvals/Autopilot for a chat.
+Every API request must present the computer's **pairing secret**. Anyone who holds it can read local Copilot transcripts, send prompts, change chat settings, approve tool calls, or enable Bypass Approvals/Autopilot for a chat, so treat the QR code and pairing link like a password.
 
-- Use it only on a private, trusted network.
-- Do not expose port `43121` to the public internet, guest Wi-Fi, tunnels, or port-forwarding.
+- The secret is created once per computer and shared by all VS Code windows; the QR code / `Copy Pairing Link` carry it in the URL fragment, which browsers never send to servers.
+- Rotate it with `Copilot Monitor: Reset Pairing Secret` if a code or link may have leaked; every phone and browser then re-pairs.
+- On the LAN the dashboard is plain HTTP. For access from outside your network, use an HTTPS tunnel (see [Remote access](#remote-access)); do not port-forward `43121` on your router.
 - Review Windows Firewall prompts and allow private networks only.
 - Stop the dashboard from the Command Palette when it is not needed.
 
 ## Current Features
 
-- Discovers every open VS Code window through per-window heartbeat descriptors.
+- Discovers every open VS Code window through a publish-once descriptor registry; liveness comes from the gateway's connection to each window, not from heartbeats.
 - Shows all persisted local Copilot chats for each live window.
-- Reconstructs the session transcript from VS Code's append-only chat operation log.
+- Reconstructs the session transcript from VS Code's append-only chat operation log by tailing only the bytes that changed.
 - Streams live in-memory transcript and working-state changes with Server-Sent Events.
-- Keeps long chats responsive with bounded transcript rendering, sampled message jumpers, lightweight inactive-chat summaries, and throttled live exports.
+- Keeps long chats responsive with bounded transcript rendering, sampled message jumpers, lightweight inactive-chat summaries, and on-demand (never scheduled) live exports.
 - Shows assistant markdown, code blocks, and summarized tool activity.
 - Renders compact semantic headings, lists, quotes, rules, inline code, and emphasis instead of exposing raw markdown spacing.
 - Renders fenced `mermaid` blocks as self-hosted, theme-aware SVG diagrams without a CDN.
@@ -33,7 +45,7 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Shows the selected model, the model used by the latest request, thinking effort, context tier, and available configuration choices.
 - Changes the model for the exact selected window and chat session.
 - Edits a historical user request through VS Code's native chat editor, replacing that request and the subsequent branch after explicit confirmation.
-- Synchronizes native VS Code model and effort/context changes through debounced SQLite notifications, with lightweight correctness polling when events are missed or unavailable.
+- Synchronizes native VS Code model and effort/context changes through debounced SQLite file notifications; no polling while the watcher is healthy.
 - Changes thinking effort and context size for the exact selected window and chat, then briefly reloads that chat so VS Code restores the new configuration through its native editor-scoped store.
 - Places model, effort, and context controls in a compact Copilot-style composer toolbar.
 - Adds a workspace/conversation navigator, per-turn message rail, conversation search, and top/bottom navigation.
@@ -44,9 +56,13 @@ The dashboard intentionally has **no authentication**. Anyone who can reach its 
 - Exports complete conversations as Markdown by copying to the clipboard or downloading a `.md` file.
 - Keeps persisted session identity separate from live response overlays.
 - Deduplicates submitted message IDs and reports accepted, completed, and failed states.
-- Exposes one tokenless dashboard URL on the trusted local network.
+- Exposes one gateway URL per computer, protected by a per-computer pairing secret (bearer token for apps, `HttpOnly` cookie for the browser dashboard).
+- Advertises every reachable address (all LAN interfaces plus an optional remote URL) so paired phones survive Wi-Fi drops, IP changes, and leaving the house without re-scanning.
 - Elects the gateway owner by binding the shared port and automatically fails over when that window closes.
+- Does nothing while no dashboard or phone is connected: no watchers, no tailers, no timers.
 - Requires no proposed API and no special launch flags.
+
+See [docs/Architecture.md](https://github.com/nanoleft-gh/copilot-monitor/blob/main/docs/Architecture.md) for the event-driven design.
 
 ## Install
 
@@ -83,7 +99,7 @@ Press `F5` to open the Extension Development Host. In that window:
 
 ```sh
 npm run package
-code --install-extension githubcopilot-monitor-1.1.8.vsix --force
+code --install-extension githubcopilot-monitor-2.0.0.vsix --force
 ```
 
 Reload VS Code. The bridge starts automatically, adds a `Copilot Monitor` status bar item, and needs no proposed-API or launch flags.
@@ -92,10 +108,23 @@ Reload VS Code. The bridge starts automatically, adds a `Copilot Monitor` status
 
 1. Connect the phone and computer to the same trusted Wi-Fi network.
 2. Reload each VS Code window after installing the extension.
-3. Run `Copilot Monitor: Copy Dashboard URL` in any window.
-4. Open that URL on the phone.
+3. Open the **Copilot Monitor** view in the Activity Bar and scan its QR code with the Copilot Monitor app (or with the camera, to open the browser dashboard). `Copilot Monitor: Copy Pairing Link` gives the same link as text.
 
-All windows publish through the same port and URL. Windows Firewall may ask whether VS Code can accept private-network traffic. See [Security](#security) before opening the dashboard from another device.
+Pair once. The phone keeps every address the computer advertises and finds it again after Wi-Fi drops, router-assigned IP changes, or a switch to another network. All windows publish through the same port. Windows Firewall may ask whether VS Code can accept private-network traffic. See [Security](#security) before pairing another device.
+
+## Remote access
+
+To reach the computer when the phone is not on your Wi-Fi, without any paid service, open the **Copilot Monitor** view and press **Turn on remote access**. The extension forwards the gateway port through a Microsoft dev tunnel using the `code-tunnel` CLI that ships inside VS Code (the same mechanism as the **Ports** view), shows the resulting `https://…devtunnels.ms/` address, and advertises it to paired phones, which switch to it automatically whenever the local network is unreachable. If you are not signed in to GitHub, the view offers the sign-in first. The tunnel is public because the phone cannot complete the GitHub browser login that private tunnels require; the pairing secret still guards every request, and traffic through the tunnel is HTTPS. Dev tunnels have bandwidth and active-tunnel limits; the delta stream keeps usage small.
+
+Prefer your own route? *Use my own address instead* in the same view accepts a Tailscale (free personal plan; nothing public), Cloudflare Tunnel, or reverse-proxy URL. Remote access is a machine-wide choice stored next to the pairing secret, not a VS Code setting; any window can change it and the window that owns the gateway runs the tunnel.
+
+**ngrok instead of dev tunnels:** choose *ngrok* under Tunnel service. If the ngrok agent is not on PATH the view shows the install command for your OS. Paste **either** an ngrok API key — create one at [dashboard.ngrok.com/api-keys](https://dashboard.ngrok.com/api-keys) (Settings → Credentials → API Keys) — **or** your agent authtoken from [Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken). They look alike; the extension tells them apart and mints a dedicated agent authtoken from an API key, storing only the authtoken. The agent is started with `--url https://`, which uses your account's stable auto-assigned dev domain, so the address is permanent on the free plan too; a reserved domain can be entered to pin a chosen name. Browsers opening an ngrok free-tier address see ngrok's interstitial page once; the app skips it automatically.
+
+<p align="center">
+  <img alt="ngrok tunnel configured in the sidebar" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-2-remote-access-ngrok.png" width="60%">
+</p>
+
+Paired phones learn every address change live: the gateway streams its address list, so a remote address added later reaches a phone that is connected at home, and a changed home IP reaches a phone connected through the tunnel.
 
 ## Settings
 
@@ -107,7 +136,8 @@ All windows publish through the same port and URL. Windows Firewall may ask whet
 - `Copilot Monitor: Start Dashboard`
 - `Copilot Monitor: Stop Dashboard`
 - `Copilot Monitor: Open Dashboard`
-- `Copilot Monitor: Copy Dashboard URL`
+- `Copilot Monitor: Copy Pairing Link`
+- `Copilot Monitor: Reset Pairing Secret`
 
 ## Known Limitations for Future Scope
 
@@ -122,4 +152,4 @@ All windows publish through the same port and URL. Windows Firewall may ask whet
 
 ## Validation
 
-`npm test` runs TypeScript compilation, ESLint, model inventory/configuration tests, transcript/cache tests, terminal parsing and approval guards, window registry tests, exact cross-window routing tests, single-port gateway tests, and leader failover tests. `npm run test:integration` launches VS Code and fetches the tokenless gateway dashboard and aggregate state.
+`npm test` runs TypeScript compilation, ESLint, model inventory/configuration tests, transcript/cache tests, terminal parsing and approval guards, window registry tests, exact cross-window routing tests, single-port gateway and pairing-secret tests, and leader failover tests. `npm run test:integration` launches VS Code and fetches the gateway dashboard and aggregate state.

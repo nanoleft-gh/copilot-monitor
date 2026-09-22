@@ -8,9 +8,17 @@ export interface GatewayLease {
 	readonly nonce: string;
 	readonly ownerId: string;
 	readonly port: number;
+	/** Publish time. Kept for on-disk compatibility; a lease is validated by probing the gateway, never by age. */
 	readonly heartbeatAt: number;
 }
 
+/**
+ * Records which window runs the shared gateway on this host.
+ *
+ * `staleAfterMs` applies only to the election lock (a crashed elector must not block elections
+ * forever). The lease itself carries no expiry: readers verify it by asking the advertised
+ * port for its health nonce, so nobody has to keep rewriting the file.
+ */
 export class GatewayLeaseStore {
 	private readonly leasePath: string;
 	private readonly lockPath: string;
@@ -23,13 +31,10 @@ export class GatewayLeaseStore {
 		this.lockPath = path.join(directory, 'gateway.lock');
 	}
 
-	async read(now = Date.now()): Promise<GatewayLease | undefined> {
+	async read(): Promise<GatewayLease | undefined> {
 		try {
 			const value = JSON.parse(await fs.readFile(this.leasePath, 'utf8')) as unknown;
-			if (!isGatewayLease(value) || now - value.heartbeatAt > this.staleAfterMs) {
-				return undefined;
-			}
-			return value;
+			return isGatewayLease(value) ? value : undefined;
 		} catch {
 			return undefined;
 		}

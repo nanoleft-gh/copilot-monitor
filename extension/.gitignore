@@ -6,6 +6,8 @@
 /.playwright-mcp/
 /.vscode/
 /coverage/
+/release/
+/release-check/
 *.vsix
 *.log
 *.tsbuildinfo

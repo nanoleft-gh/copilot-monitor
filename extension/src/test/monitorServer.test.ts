@@ -2,6 +2,7 @@ import * as assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { MonitorBackend, MonitorServer } from '../monitorServer';
 import { CreateSessionRequest, EditTurnRequest, ModelConfigurationRequest, ModelSelectionRequest, MonitorRequestError, MonitorState, PermissionLevelRequest, RenameSessionRequest, SendMessageRequest, ToolDecisionRequest } from '../protocol';
+import { applyPatch } from '../stateDelta';
 
 const initialState: MonitorState = {
 	version: 1,
@@ -170,9 +171,10 @@ describe('MonitorServer', () => {
 
 			assert.equal((await fetch(`${baseUrl}/api/sessions/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionResource: 'session-2', title: 'Renamed' }) })).status, 204);
 			assert.deepEqual(backend.renames, [{ sessionResource: 'session-2', title: 'Renamed' }]);
-			const newResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceSessionResource: 'session-2' }) });
+			const newResponse = await fetch(`${baseUrl}/api/sessions/new`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'new-1', sourceSessionResource: 'session-2' }) });
 			assert.equal(newResponse.status, 201);
 			assert.deepEqual(await newResponse.json(), { sessionResource: 'new-session' });
+			assert.deepEqual(backend.created, [{ id: 'new-1', sourceSessionResource: 'session-2' }]);
 			assert.equal((await fetch(`${baseUrl}/api/sessions/permission`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionResource: 'session-2', permissionLevel: 'autopilot' }) })).status, 204);
 			assert.deepEqual(backend.permissions, [{ sessionResource: 'session-2', permissionLevel: 'autopilot' }]);
 
@@ -187,4 +189,92 @@ describe('MonitorServer', () => {
 			await server.stop();
 		}
 	});
+
+	it('streams a snapshot followed by patches on /api/events?v=2 and skips no-op emits', async () => {
+		const backend = new TestBackend();
+		const server = new MonitorServer(backend, { host: '127.0.0.1', port: 0 });
+		const address = await server.start();
+		const baseUrl = `http://127.0.0.1:${address.port}`;
+		const abortController = new AbortController();
+		try {
+			const health = await fetch(`${baseUrl}/api/health`).then(response => response.json()) as { capabilities: string[] };
+			assert.ok(health.capabilities.includes('eventsV2'));
+
+			const events = await fetch(`${baseUrl}/api/events?v=2`, { signal: abortController.signal });
+			const frames = sseFrames(events.body!.getReader());
+			const snapshot = await frames.next();
+			assert.equal(snapshot.event, 'snapshot');
+			assert.equal(snapshot.id, '1');
+			assert.deepEqual(JSON.parse(snapshot.data), initialState);
+			assert.equal(backend.eventClientCounts.at(-1), 1);
+
+			// Same content, different object: nothing is sent.
+			backend.emit({ ...initialState });
+			const session = {
+				resource: 's1', sessionId: 's1', title: 'Chat', status: 'working' as const, revision: 'r1', permissionLevel: 'default' as const,
+				turns: [{ id: 't1', editable: false, timestamp: 1, userText: 'Hi', thinking: '', thinkingTitle: '', assistantText: 'Hel', activities: [], blocks: [], status: 'working' as const }],
+			};
+			backend.emit({ ...initialState, sessions: [session], activeSessionResource: 's1' });
+			const first = await frames.next();
+			assert.equal(first.event, 'patch');
+			assert.equal(first.id, '2');
+			let mirrored = applyPatch(initialState, JSON.parse(first.data));
+			assert.deepEqual(mirrored, backend.state);
+
+			// Streaming text arrives as an append, not a resend.
+			backend.emit({ ...backend.state, sessions: [{ ...session, turns: [{ ...session.turns[0], assistantText: 'Hello, world' }] }] });
+			const second = await frames.next();
+			assert.equal(second.event, 'patch');
+			assert.match(second.data, /\["\+","lo, world"\]/);
+			assert.doesNotMatch(second.data, /"userText"/);
+			mirrored = applyPatch(mirrored, JSON.parse(second.data));
+			assert.deepEqual(mirrored, backend.state);
+
+			// A v1 client on the same server still gets full states.
+			const legacy = await fetch(`${baseUrl}/api/events`, { signal: abortController.signal });
+			const legacyFrames = sseFrames(legacy.body!.getReader());
+			const legacyFirst = await legacyFrames.next();
+			assert.equal(legacyFirst.event, 'state');
+			assert.deepEqual(JSON.parse(legacyFirst.data), backend.state);
+			assert.equal(backend.eventClientCounts.at(-1), 2);
+		} finally {
+			abortController.abort();
+			await server.stop();
+		}
+	});
 });
+
+interface SseFrame { event: string; id?: string; data: string }
+
+/** Minimal SSE parser over a fetch body reader. */
+function sseFrames(reader: ReadableStreamDefaultReader<Uint8Array>): { next(): Promise<SseFrame> } {
+	const decoder = new TextDecoder();
+	let buffer = '';
+	const queue: SseFrame[] = [];
+	return {
+		async next() {
+			while (queue.length === 0) {
+				const { value, done } = await reader.read();
+				if (done) {
+					throw new Error('stream ended');
+				}
+				buffer += decoder.decode(value, { stream: true });
+				let boundary: number;
+				while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+					const raw = buffer.slice(0, boundary);
+					buffer = buffer.slice(boundary + 2);
+					if (raw.startsWith(':')) {
+						continue;
+					}
+					const lines = raw.split('\n');
+					queue.push({
+						event: lines.find(line => line.startsWith('event: '))?.slice(7) ?? 'message',
+						id: lines.find(line => line.startsWith('id: '))?.slice(4),
+						data: lines.filter(line => line.startsWith('data: ')).map(line => line.slice(6)).join('\n'),
+					});
+				}
+			}
+			return queue.shift()!;
+		},
+	};
+}

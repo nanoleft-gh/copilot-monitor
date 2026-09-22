@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -66,6 +66,65 @@ async function readHostIdentity(filePath: string): Promise<HostIdentity | undefi
 			return value;
 		}
 		return undefined;
+	} catch (error) {
+		if (isFileNotFound(error)) {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+const pairingSecretFile = 'pairing-secret';
+const pairingSecretPattern = /^[A-Za-z0-9_-]{32,}$/;
+
+/**
+ * The bearer token every client (phone, browser) must present to the shared gateway. One per
+ * host so it survives gateway failover between windows; created exclusively so concurrent
+ * windows converge on the same value.
+ */
+export async function getOrCreatePairingSecret(directory: string): Promise<string> {
+	await fs.mkdir(directory, { recursive: true });
+	const filePath = path.join(directory, pairingSecretFile);
+	const existing = await readPairingSecret(filePath);
+	if (existing) {
+		return existing;
+	}
+	const secret = randomBytes(32).toString('base64url');
+	try {
+		const handle = await fs.open(filePath, 'wx', 0o600);
+		try {
+			await handle.writeFile(secret, 'utf8');
+		} finally {
+			await handle.close();
+		}
+		return secret;
+	} catch (error) {
+		if (!isFileExists(error)) {
+			throw error;
+		}
+		const winner = await readPairingSecret(filePath);
+		if (winner) {
+			return winner;
+		}
+		throw new Error('The shared Copilot Monitor pairing secret is invalid.');
+	}
+}
+
+/** Forgets the current secret; the next `getOrCreatePairingSecret` mints a new one and all paired devices must re-pair. */
+export async function resetPairingSecret(directory: string): Promise<void> {
+	try {
+		await fs.rm(path.join(directory, pairingSecretFile));
+	} catch (error) {
+		if (!isFileNotFound(error)) {
+			throw error;
+		}
+	}
+}
+
+async function readPairingSecret(filePath: string): Promise<string | undefined> {
+	try {
+		const value = (await fs.readFile(filePath, 'utf8')).trim();
+		return pairingSecretPattern.test(value) ? value : undefined;
 	} catch (error) {
 		if (isFileNotFound(error)) {
 			return undefined;

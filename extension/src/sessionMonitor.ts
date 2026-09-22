@@ -1,18 +1,17 @@
-import { FSWatcher, watch } from 'node:fs';
+import { watch } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import * as vscode from 'vscode';
-import { buildLocalSessionResource, createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, releaseChatSession, selectChatModel, sendPrompt } from './chatBridge';
+import { createNewChat, decideTool, editAndResubmitPrompt, focusChatSession, hasVoiceSessionBridge, persistLiveChatsNow, readVoiceCurrentSession, releaseChatSession, selectChatModel, sendPrompt, setChatPermissionLevel, startNewLocalChat } from './chatBridge';
 import { LiveExportFileSystem, liveExportScheme } from './liveExportFileSystem';
 import { LiveExportTracker } from './liveExportTracker';
-import { mergeConfigurationFields, mergeSessionModelState, parseSessionModelState, readLatestModelCatalog, withNativeModelState, withSelectedModel } from './modelCatalog';
+import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFields, mergeSessionModelState, ModelCatalog, parseCachedLanguageModels, parseSessionModelState, selectedModelValue, withNativeModelState } from './modelCatalog';
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
-import { findMatchingSession } from './sessionMatcher';
-import { SessionStateCache } from './sessionStateCache';
-import { isActivePendingTool } from './toolDecision';
+import { indexPagedMutationHistoryInWorker, loadPagedMutationHistoryInWorker } from './pagedMutationHistoryWorkerClient';
+import { deserializePagedMutationHistoryIndex, PagedMutationHistoryIndex, serializePagedMutationHistoryIndex, SerializedPagedMutationHistoryIndex } from './pagedMutationHistory';
 import {
 	ActiveSessionState,
 	ChatModelDescriptor,
@@ -20,6 +19,8 @@ import {
 	CreateSessionResult,
 	EditTurnRequest,
 	EditTurnResult,
+	HistoryPageRequest,
+	HistoryPageResult,
 	ModelConfigurationRequest,
 	ModelSelectionRequest,
 	MonitorRequestError,
@@ -29,134 +30,281 @@ import {
 	RenameSessionRequest,
 	SendMessageRequest,
 	SendMessageResult,
+	SessionModelState,
 	ToolDecisionRequest,
 } from './protocol';
-import {
-	mergeTranscriptSupplement,
-	normalizeTranscript,
-	parseCopilotTranscriptLog,
-	parseMutationLogSnapshot,
-	Transcript,
-} from './transcript';
+import { SessionCore } from './sessionCore';
+import { findMatchingSession } from './sessionMatcher';
+import { localSessionResource as localSessionResourceOf, sessionIdFromResource } from './sessionResource';
+import { isActivePendingTool } from './toolDecision';
+import { normalizeTranscript, TranscriptTurn } from './transcript';
 
-const fallbackPollIntervalMs = 1_000;
-const liveExportIntervalMs = 500;
-const fileEventDebounceMs = 20;
-const partialWriteRetryMs = 50;
+/**
+ * The extension-host face of the monitor. Owns the {@link SessionCore} (all file-driven
+ * state), the VS Code command bridge, the on-demand export ("sync now"), and the
+ * native-input-state watcher. It has no periodic timers.
+ */
+
 const maximumMessageLength = 32_000;
 const maximumOutboundHistory = 20;
-const modelCatalogRefreshIntervalMs = 10_000;
-const connectedIdleLiveExportIntervalMs = 1_000;
 const nativeStateDatabaseFiles = new Set(['state.vscdb', 'state.vscdb-wal', 'state.vscdb-shm']);
+const persistWaitAttempts = 20;
+const persistWaitDelayMs = 50;
+const maximumProgressiveIndexCacheFiles = 64;
+const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
+/** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
+const stallProbeDelayMs = 3_000;
+const maximumProbedToolCalls = 256;
+/** How long a model selection made from the dashboard outranks storage reads that still show the old model. */
+const modelIntentGraceMs = 15_000;
+
+interface ExportSnapshot {
+	readonly resource: string;
+	readonly turns: readonly TranscriptTurn[];
+	readonly model: SessionModelState | undefined;
+	readonly capturedAt: number;
+	readonly coreRevision: string;
+}
 
 export class SessionMonitor implements vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<MonitorState>();
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly outboundMessages = new Map<string, OutboundMessageState>();
 	private readonly startedAt = Date.now();
+	private readonly core: SessionCore;
 	private readonly sessionDirectories: string[];
 	private readonly copilotTranscriptDirectories: string[];
-	private readonly copilotModelDirectories: string[];
+	private readonly copilotDebugLogDirectories: string[];
 	private readonly languageModelsConfigurationPath: string;
-	private readonly stateDatabasePath: string;
+	/** PROFILE-scoped storage: the panel's selected model. */
+	private readonly profileStateDatabasePath: string;
+	/** APPLICATION-scoped storage: cached model list and per-model configuration. */
+	private readonly applicationStateDatabasePath: string;
+	private readonly progressiveIndexDirectory: string;
+	private readonly progressiveAbortController = new AbortController();
+	private readonly progressiveMutationIndexes = new Map<string, PagedMutationHistoryIndex>();
+	private readonly progressiveMutationIndexing = new Map<string, Promise<PagedMutationHistoryIndex>>();
+	private readonly liveExportTracker = new LiveExportTracker();
+	private readonly liveExportUri: vscode.Uri;
+	private readonly liveExportFileSystem = new LiveExportFileSystem();
+	private readonly nativeInputStateSync: NativeInputStateSync;
+	private readonly createSessionOperations = new Map<string, Promise<CreateSessionResult>>();
 	private nativeStateDatabase: DatabaseSync | undefined;
+	private applicationStateDatabase: DatabaseSync | undefined;
 	private nativeStateDatabaseNeedsReconnect = false;
 	private nativeStateRetryAttempted = false;
 	private lastNativeInputFingerprint: string | undefined;
-	private readonly watchedDirectories: string[];
-	private readonly directoryWatchers = new Map<string, FSWatcher>();
-	private readonly sessionStateCache = new SessionStateCache();
-	private readonly fileFingerprints = new Map<string, string>();
-	private activeSession: ActiveSessionState | undefined;
+	private nativeModelOverride: { resource: string; model: NonNullable<ActiveSessionState['model']> } | undefined;
+	/** The chat VS Code itself has focused, as last observed. */
+	private nativeCurrentSessionResource: string | undefined;
+	/** Whether `_chat.voice.*` exists in this window; re-checked whenever viewing starts. */
+	private voiceBridgeAvailable: boolean | undefined;
+	/** A model the dashboard asked VS Code to select, until storage confirms or the grace period ends. */
+	private modelIntent: { resource: string; modelId: string; at: number } | undefined;
+	/** VS Code's stored per-model effort/context choices (`chat.modelConfiguration.panel`). */
+	private storedModelConfigurations: Readonly<Record<string, Readonly<Record<string, string | number | boolean>>>> = {};
+	private catalog: ModelCatalog = emptyModelCatalog;
+	private catalogRaw: string | undefined;
+	/** Sessions this window created on behalf of a viewer; shown even while still empty. */
+	private readonly createdSessionResources = new Set<string>();
+	private exportSnapshot: ExportSnapshot | undefined;
+	private exportRunning: Promise<void> | undefined;
+	private readonly probedToolCalls = new Set<string>();
+	private stallProbeTimer: NodeJS.Timeout | undefined;
 	private error: string | undefined;
-	private liveExportRunning = false;
-	private readonly liveExportTracker = new LiveExportTracker();
-	private liveExportTargetResource: string | undefined;
-	private scheduledPoll: NodeJS.Timeout | undefined;
-	private pollQueue = Promise.resolve();
-	private readonly fallbackPollTimer: NodeJS.Timeout;
-	private readonly liveExportTimer: NodeJS.Timeout;
-	private readonly nativeInputStateSync: NativeInputStateSync;
-	private readonly liveExportUri: vscode.Uri;
-	private readonly liveExportFileSystem = new LiveExportFileSystem();
-	private models: readonly ChatModelDescriptor[] = [];
-	private modelCatalogRevision: string | undefined;
-	private nextModelCatalogScanAt = 0;
-	private nextConnectedIdleLiveExportAt = 0;
+	private lastEmittedSignature: string | undefined;
 	private eventClientCount = 0;
+	private disposed = false;
 
 	readonly onDidChange = this.changeEmitter.event;
 
 	constructor(
 		context: vscode.ExtensionContext,
 		private readonly windowId: string,
+		private readonly log: (message: string) => void = () => undefined,
 	) {
 		this.disposables.push(this.changeEmitter);
 		this.sessionDirectories = resolveSessionDirectories(context);
 		this.copilotTranscriptDirectories = resolveCopilotTranscriptDirectories(context);
-		this.copilotModelDirectories = resolveCopilotModelDirectories(context);
+		this.copilotDebugLogDirectories = resolveCopilotDebugLogDirectories(context);
+		this.progressiveIndexDirectory = path.join(context.globalStorageUri.fsPath, 'progressive-history');
 		this.languageModelsConfigurationPath = path.join(
 			path.dirname(path.dirname(context.globalStorageUri.fsPath)),
 			'chatLanguageModels.json',
 		);
-		this.stateDatabasePath = path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
+		this.profileStateDatabasePath = resolveProfileStateDatabasePath(context);
+		this.applicationStateDatabasePath = resolveApplicationStateDatabasePath(context);
+		this.core = new SessionCore({
+			paths: {
+				sessionDirectories: this.sessionDirectories,
+				transcriptDirectories: this.copilotTranscriptDirectories,
+				debugLogDirectories: this.copilotDebugLogDirectories,
+				indexDatabasePath: resolveSessionIndexDatabasePath(context),
+			},
+			log: message => this.log(`[core] ${message}`),
+		});
+		this.disposables.push(this.core.onDidChange(() => this.onCoreChanged()));
 		this.nativeInputStateSync = new NativeInputStateSync({
 			refresh: () => this.refreshNativeInputState(),
 			createWatcher: (onChange, onError) => this.createNativeInputStateWatcher(onChange, onError),
 		});
-		this.watchedDirectories = [...new Set([
-			...this.sessionDirectories,
-			...this.copilotTranscriptDirectories,
-			...this.copilotModelDirectories,
-		])];
-		this.liveExportUri = vscode.Uri.from({
-			scheme: liveExportScheme,
-			authority: this.windowId,
-			path: '/chat.json',
-		});
+		this.liveExportUri = vscode.Uri.from({ scheme: liveExportScheme, authority: this.windowId, path: '/chat.json' });
 		this.disposables.push(this.liveExportFileSystem);
-		this.disposables.push(vscode.workspace.registerFileSystemProvider(
-			liveExportScheme,
-			this.liveExportFileSystem,
-			{ isCaseSensitive: true },
-		));
-
-		this.ensureDirectoryWatchers();
-		this.fallbackPollTimer = setInterval(() => this.schedulePoll(), fallbackPollIntervalMs);
-		this.fallbackPollTimer.unref();
-		this.liveExportTimer = setInterval(() => void this.refreshLiveExport(), liveExportIntervalMs);
-		this.liveExportTimer.unref();
-		this.nativeInputStateSync.start();
-		this.schedulePoll();
+		this.disposables.push(vscode.workspace.registerFileSystemProvider(liveExportScheme, this.liveExportFileSystem, { isCaseSensitive: true }));
 	}
 
 	getState(): MonitorState {
-		const sessions = this.getSessions();
-		const activeResource = this.activeSession?.resource;
-		const serializedSessions = sessions.map(session => activeResource === session.resource
-			? { ...session, turnCount: session.turns.length }
-			: { ...session, turnCount: session.turns.length, turns: [] });
+		const coreState = this.core.getState();
+		const sessions = coreState.sessions
+			.filter(session => this.isSessionVisible(session, coreState.activeSessionResource))
+			.map(session => this.decorateSession(session));
+		const active = sessions.find(session => session.resource === coreState.activeSessionResource);
 		return {
 			version: 1,
 			windowId: this.windowId,
 			workspaceName: vscode.workspace.name ?? 'Untitled workspace',
 			workspaceFolders: vscode.workspace.workspaceFolders?.map(folder => folder.uri.fsPath) ?? [],
 			startedAt: this.startedAt,
-			models: this.models,
-			sessions: serializedSessions,
-			activeSession: this.activeSession ? { ...this.activeSession, turnCount: this.activeSession.turns.length, turns: [] } : undefined,
-			activeSessionResource: activeResource,
+			models: this.catalog.models,
+			sessions,
+			activeSession: active ? { ...active, turns: [] } : undefined,
+			activeSessionResource: coreState.activeSessionResource,
 			outboundMessages: [...this.outboundMessages.values()],
-			error: this.error,
+			error: this.error ?? coreState.error,
 		};
 	}
 
+	/**
+	 * Blank chats VS Code left behind are noise, except the one somebody is actually looking at:
+	 * the viewer's selection, the chat focused in VS Code, or a chat a viewer just created.
+	 */
+	private isSessionVisible(session: ActiveSessionState, activeSessionResource: string | undefined): boolean {
+		if (session.isEmpty !== true || session.status === 'working') {
+			return true;
+		}
+		return session.resource === activeSessionResource
+			|| session.resource === this.nativeCurrentSessionResource
+			|| this.createdSessionResources.has(session.resource);
+	}
+
+	/** Viewers gate all work in the core, the native-state watcher, and the model catalog. */
 	setEventClientCount(count: number): void {
 		const hadClients = this.eventClientCount > 0;
 		this.eventClientCount = count;
 		if (count > 0 && !hadClients) {
-			void this.refreshLiveExport(true);
+			void this.startViewing(count);
+		} else if (count === 0 && hadClients) {
+			this.nativeInputStateSync.stop();
+			this.exportSnapshot = undefined;
+			this.clearStallProbe();
+			void this.core.setViewerCount(0);
+		} else if (count > 0) {
+			void this.core.setViewerCount(count);
 		}
+	}
+
+	/** First viewer: open on the chat VS Code has focused, then let the core attach. */
+	private async startViewing(count: number): Promise<void> {
+		this.voiceBridgeAvailable = await hasVoiceSessionBridge();
+		if (!this.core.activeSession) {
+			const focused = await this.readNativeCurrentSession();
+			const sessionId = focused ? sessionIdFromResource(focused) : undefined;
+			if (sessionId) {
+				await this.core.selectSession(sessionId);
+			}
+		}
+		await this.core.setViewerCount(count);
+		this.nativeInputStateSync.start();
+	}
+
+	/**
+	 * The chat VS Code's panel is showing. With the voice bridge this is exact; without it the
+	 * monitor's own last focus action is the best available answer (every command the monitor
+	 * runs focuses its target first, and the session log corrects any drift on its next flush).
+	 */
+	private async readNativeCurrentSession(): Promise<string | undefined> {
+		if (this.voiceBridgeAvailable !== false) {
+			const resource = await readVoiceCurrentSession();
+			if (resource) {
+				this.nativeCurrentSessionResource = resource;
+				return resource;
+			}
+			if (this.voiceBridgeAvailable) {
+				return undefined;
+			}
+		}
+		return this.nativeCurrentSessionResource ?? (this.core.activeSession ? localSessionResourceOf(this.core.activeSession) : undefined);
+	}
+
+	/**
+	 * Creates a local chat and returns its resource. With the voice bridge the panel reports
+	 * the new session directly. Without it, VS Code offers no query for a chat's identity, so the
+	 * monitor makes VS Code persist its live chats and picks up the session file that appears.
+	 */
+	private async createIdentifiedChat(source: ActiveSessionState | undefined): Promise<vscode.Uri> {
+		this.voiceBridgeAvailable ??= await hasVoiceSessionBridge();
+		const sourceResource = source ? vscode.Uri.parse(source.resource) : undefined;
+		this.log(`new chat: voice bridge ${this.voiceBridgeAvailable ? 'available' : 'unavailable'}`);
+		if (this.voiceBridgeAvailable) {
+			return createNewChat(sourceResource, readVoiceCurrentSession);
+		}
+		const before = await this.listSessionIds();
+		await startNewLocalChat(sourceResource);
+		// The anchor receives a no-op rename; a chat mid-response would queue it instead.
+		const anchor = source?.status !== 'working' ? source : undefined;
+		const fallbackAnchor = anchor ?? this.getSessions().find(session => session.isEmpty !== true && session.status !== 'working');
+		await persistLiveChatsNow(fallbackAnchor ? vscode.Uri.parse(fallbackAnchor.resource) : undefined, fallbackAnchor?.title ?? 'Copilot chat');
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			const created = [...await this.listSessionIds()].filter(id => !before.has(id));
+			if (created.length === 1) {
+				return vscode.Uri.parse(localSessionResourceOf(created[0]));
+			}
+			if (created.length > 1) {
+				// Several files appeared at once (a flush of other live chats); take the newest.
+				const newest = await this.newestSessionId(created);
+				return vscode.Uri.parse(localSessionResourceOf(newest));
+			}
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+		throw new MonitorRequestError(504, 'VS Code created a chat but has not persisted it yet. Try again in a moment.');
+	}
+
+	private async listSessionIds(): Promise<Set<string>> {
+		const ids = new Set<string>();
+		for (const directory of this.sessionDirectories) {
+			let names: string[];
+			try {
+				names = await fs.readdir(directory);
+			} catch {
+				continue;
+			}
+			for (const name of names) {
+				if (name.endsWith('.jsonl')) {
+					ids.add(name.slice(0, -'.jsonl'.length));
+				}
+			}
+		}
+		return ids;
+	}
+
+	private async newestSessionId(ids: readonly string[]): Promise<string> {
+		let newest = ids[0];
+		let newestBirth = -1;
+		for (const id of ids) {
+			for (const directory of this.sessionDirectories) {
+				try {
+					const stat = await fs.stat(path.join(directory, `${id}.jsonl`));
+					if (stat.birthtimeMs > newestBirth) {
+						newestBirth = stat.birthtimeMs;
+						newest = id;
+					}
+				} catch {
+					// Removed between listing and stat.
+				}
+			}
+		}
+		return newest;
 	}
 
 	async sendMessage(request: SendMessageRequest): Promise<SendMessageResult> {
@@ -171,29 +319,18 @@ export class SessionMonitor implements vscode.Disposable {
 		if (!targetSession) {
 			throw new MonitorRequestError(409, 'The selected Copilot session is no longer available. Refresh before sending.');
 		}
-
 		if (this.outboundMessages.has(request.id)) {
 			return { id: request.id, accepted: true };
 		}
-
-		this.setOutboundMessage({
-			id: request.id,
-			preview: summarize(text, 120),
-			status: 'accepted',
-			createdAt: Date.now(),
-		});
+		this.setOutboundMessage({ id: request.id, preview: summarize(text, 120), status: 'accepted', createdAt: Date.now() });
 		this.liveExportTracker.begin(text, request.id, Date.now(), request.sessionResource);
-		this.liveExportTargetResource = request.sessionResource;
-		void this.refreshLiveExport(true);
-
-		void sendPrompt(vscode.Uri.parse(request.sessionResource), text).catch(error => {
-			this.liveExportTracker.cancel(request.id);
-			this.updateOutboundMessage(request.id, {
-				status: 'failed',
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-
+		void sendPrompt(vscode.Uri.parse(request.sessionResource), text).then(
+			() => this.pokeAfterCommand(request.sessionResource),
+			error => {
+				this.liveExportTracker.cancel(request.id);
+				this.updateOutboundMessage(request.id, { status: 'failed', error: error instanceof Error ? error.message : String(error) });
+			},
+		);
 		return { id: request.id, accepted: true };
 	}
 
@@ -209,33 +346,30 @@ export class SessionMonitor implements vscode.Disposable {
 		if (targetSession.revision !== request.sessionRevision) {
 			throw new MonitorRequestError(409, 'The conversation changed before the edited request could be submitted.');
 		}
-		const requestIndex = targetSession.turns.findIndex(turn => turn.id === request.requestId && turn.editable);
+		const sessionId = requireSessionId(request.sessionResource);
+		let requestIndex = this.core.requestIndexOf(sessionId, request.requestId) ?? -1;
+		if (requestIndex < 0 && this.core.isOversized(sessionId)) {
+			const index = await this.getProgressiveMutationIndex(sessionId);
+			requestIndex = request.sourceText
+				? findProgressiveRequestIndex(index.requests, request.sourceText, request.sourceTimestamp)
+				: index.requests.findIndex(value => value.requestId === request.requestId);
+		}
 		if (requestIndex < 0) {
 			throw new MonitorRequestError(409, 'The selected request is no longer editable.');
 		}
 		if (this.outboundMessages.has(request.id)) {
 			return { id: request.id, accepted: true };
 		}
-
-		this.setOutboundMessage({
-			id: request.id,
-			preview: `Edit: ${summarize(text, 114)}`,
-			status: 'accepted',
-			createdAt: Date.now(),
-		});
+		this.setOutboundMessage({ id: request.id, preview: `Edit: ${summarize(text, 114)}`, status: 'accepted', createdAt: Date.now() });
 		this.liveExportTracker.begin(text, request.id, Date.now(), request.sessionResource);
-		this.liveExportTargetResource = request.sessionResource;
 		void editAndResubmitPrompt(
 			vscode.Uri.parse(request.sessionResource),
 			requestIndex,
-			targetSession.turns.length,
+			targetSession.turnCount ?? targetSession.turns.length,
 			text,
-		).then(() => this.refreshLiveExportWhenIdle()).catch(error => {
+		).then(() => this.pokeAfterCommand(request.sessionResource)).catch(error => {
 			this.liveExportTracker.cancel(request.id);
-			this.updateOutboundMessage(request.id, {
-				status: 'failed',
-				error: error instanceof Error ? error.message : String(error),
-			});
+			this.updateOutboundMessage(request.id, { status: 'failed', error: error instanceof Error ? error.message : String(error) });
 		});
 		return { id: request.id, accepted: true };
 	}
@@ -245,47 +379,63 @@ export class SessionMonitor implements vscode.Disposable {
 		if (!targetSession) {
 			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
 		}
-		await focusChatSession(vscode.Uri.parse(targetSession.resource));
-		this.activeSession = targetSession;
-		this.liveExportTargetResource = targetSession.resource;
+		this.exportSnapshot = undefined;
+		await this.core.selectSession(targetSession.sessionId);
+		await focusChatSession(vscode.Uri.parse(sessionResource));
+		this.nativeCurrentSessionResource = sessionResource;
 		this.emit();
-		void this.refreshLiveExport(true);
+		this.nativeInputStateSync.requestRefresh(0);
+	}
+
+	async loadHistory(request: HistoryPageRequest): Promise<HistoryPageResult> {
+		const session = this.getSessions().find(candidate => candidate.resource === request.sessionResource);
+		if (!session) {
+			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
+		}
+		if (session.revision !== request.sessionRevision) {
+			throw new MonitorRequestError(409, 'The conversation changed before history could be loaded. Refresh and try again.');
+		}
+		const sessionId = session.sessionId;
+		const limit = Math.max(1, Math.min(Math.floor(request.limit ?? 40), 40));
+		const page = this.core.historyPage(sessionId, request.before, limit);
+		if (page) {
+			return { ...page, revision: session.revision };
+		}
+		if (!this.core.isOversized(sessionId)) {
+			throw new MonitorRequestError(409, 'Earlier history remains available only in VS Code.');
+		}
+		const index = await this.getProgressiveMutationIndex(sessionId);
+		const total = index.requests.length;
+		const end = Math.max(0, Math.min(Math.floor(request.before), total));
+		const start = Math.max(0, end - limit);
+		const result = await loadPagedMutationHistoryInWorker(index, start, end - start, session.revision, this.progressiveAbortController.signal);
+		return { ...result, revision: session.revision };
 	}
 
 	async selectModel(request: ModelSelectionRequest): Promise<void> {
-		const targetSession = this.getSessions().find(session => session.resource === request.sessionResource);
-		if (!targetSession) {
-			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
-		}
-		if (targetSession.status === 'working') {
-			throw new MonitorRequestError(409, 'Wait for the active response to finish before changing models.');
-		}
-		const model = this.models.find(candidate => candidate.identifier === request.modelId || candidate.id === request.modelId);
+		const targetSession = this.requireIdleSession(request.sessionResource, 'Wait for the active response to finish before changing models.');
+		const model = this.catalog.models.find(candidate => candidate.identifier === request.modelId || candidate.id === request.modelId);
 		if (!model) {
 			throw new MonitorRequestError(409, 'The requested model is no longer available in this VS Code window.');
 		}
-
-		this.liveExportTargetResource = targetSession.resource;
 		await selectChatModel(vscode.Uri.parse(targetSession.resource), { id: model.id, vendor: model.vendor });
-		if (this.sessionStateCache.updateModel(targetSession.resource, withSelectedModel(targetSession.model, model))) {
-			this.activeSession = this.getSessions().find(session => session.resource === this.activeSession?.resource);
-			this.emit();
-		}
-		void this.refreshLiveExportWhenIdle();
+		this.nativeCurrentSessionResource = targetSession.resource;
+		this.modelIntent = { resource: targetSession.resource, modelId: model.identifier, at: Date.now() };
+		// VS Code applies its remembered per-model configuration when switching; mirror that now.
+		this.nativeModelOverride = {
+			resource: targetSession.resource,
+			model: withNativeModelState(targetSession.model, model, this.storedModelConfigurations[model.identifier] ?? {}),
+		};
+		this.emit();
+		this.nativeInputStateSync.requestRefresh(0);
 	}
 
 	async configureModel(request: ModelConfigurationRequest): Promise<void> {
-		const targetSession = this.getSessions().find(session => session.resource === request.sessionResource);
-		if (!targetSession) {
-			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
-		}
-		if (targetSession.status === 'working') {
-			throw new MonitorRequestError(409, 'Wait for the active response to finish before changing model configuration.');
-		}
+		const targetSession = this.requireIdleSession(request.sessionResource, 'Wait for the active response to finish before changing model configuration.');
 		if (targetSession.model?.selectedModelId !== request.modelId) {
 			throw new MonitorRequestError(409, 'The selected model changed before its configuration could be updated.');
 		}
-		const model = this.models.find(candidate => candidate.identifier === request.modelId);
+		const model = this.catalog.models.find(candidate => candidate.identifier === request.modelId);
 		const fields = mergeConfigurationFields(
 			model?.configurationFields ?? [],
 			targetSession.model.configurationFields,
@@ -296,39 +446,55 @@ export class SessionMonitor implements vscode.Disposable {
 		if (!model || !field || !option) {
 			throw new MonitorRequestError(400, 'The requested model configuration value is unavailable.');
 		}
-
-		const sessionFile = (await findSessionFiles(this.sessionDirectories))
-			.find(file => buildLocalSessionResource(file.sessionId).toString() === request.sessionResource);
-		if (!sessionFile) {
-			throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
-		}
-
+		const sessionId = targetSession.sessionId;
+		const file = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		this.liveExportTargetResource = request.sessionResource;
+		await this.rewriteSessionLog(resource, file.filePath, async () => {
+			const selectedModel = await this.waitForPersistedModel(sessionId, request.modelId)
+				?? this.selectedModelFromCatalog(request.modelId, targetSession.model?.configuration ?? {});
+			if (!selectedModel) {
+				throw new MonitorRequestError(409, 'VS Code has not persisted the selected model for this chat yet. Try again in a moment.');
+			}
+			const mutation = createSessionModelConfigurationMutation({ inputState: { selectedModel } }, request.modelId, request.key, request.value);
+			await this.appendMutation(file.filePath, mutation);
+		});
+		await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
+		await this.core.pokeSession(sessionId);
+		if (this.nativeModelOverride?.resource === request.sessionResource) {
+			const current = this.nativeModelOverride.model;
+			const configuration = { ...current.configuration, [request.key]: request.value };
+			this.nativeModelOverride = {
+				resource: request.sessionResource,
+				model: { ...current, configuration, configurationFields: current.configurationFields.map(item => ({ ...item, value: configuration[item.key] ?? item.value })) },
+			};
+		}
+		this.emit();
+	}
+
+	/**
+	 * VS Code only reads a session log when it loads the session, so a change written to the log
+	 * reaches VS Code by releasing every live reference, letting VS Code persist its own pending
+	 * state, appending ours, and showing the session again so it is loaded from disk.
+	 */
+	private async rewriteSessionLog(resource: vscode.Uri, filePath: string, append: () => Promise<void>): Promise<void> {
 		await releaseChatSession(resource);
 		try {
-			const content = await fs.readFile(sessionFile.filePath, 'utf8');
-			const snapshot = parseMutationLogSnapshot(content);
-			if (!snapshot.complete) {
-				throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try the configuration change again.');
-			}
-			const mutation = createSessionModelConfigurationMutation(
-				snapshot.state,
-				request.modelId,
-				request.key,
-				request.value,
-			);
-			const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
-			await fs.appendFile(sessionFile.filePath, `${separator}${JSON.stringify(mutation)}\n`, 'utf8');
-			await this.updateProfileModelConfiguration(model, field.key, request.value, field.defaultValue);
-			this.fileFingerprints.delete(sessionFile.filePath);
-			await this.refreshSession(sessionFile);
-			this.activeSession = this.getSessions().find(session => session.resource === request.sessionResource);
-			this.emit();
+			await waitForFileToSettle(filePath);
+			await append();
 		} finally {
 			await focusChatSession(resource);
+			this.nativeCurrentSessionResource = resource.toString();
 		}
-		void this.refreshLiveExportWhenIdle();
+	}
+
+	/**
+	 * VS Code persists `inputState.selectedModel` as the cached catalog entry plus the model
+	 * configuration, so the same value can be produced from the catalog when the session log
+	 * has not caught up with a selection VS Code already made.
+	 */
+	private selectedModelFromCatalog(modelId: string, configuration: Readonly<Record<string, string | number | boolean>>): Record<string, unknown> | undefined {
+		const entry = this.catalog.entries.get(modelId);
+		return entry ? selectedModelValue(entry, configuration) : undefined;
 	}
 
 	async renameSession(request: RenameSessionRequest): Promise<void> {
@@ -337,301 +503,194 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(400, 'A chat title between 1 and 160 characters is required.');
 		}
 		const target = this.requireIdleSession(request.sessionResource);
-		const sessionFile = await this.requireSessionFile(request.sessionResource);
+		const file = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		await releaseChatSession(resource);
-		try {
-			await this.appendSessionMutation(sessionFile, createSessionValueMutation(['customTitle'], title));
-		} finally {
-			await focusChatSession(resource);
-		}
-		this.activeSession = this.getSessions().find(session => session.resource === target.resource);
+		await this.rewriteSessionLog(resource, file.filePath, () => this.appendMutation(file.filePath, createSessionValueMutation(['customTitle'], title)));
+		await this.core.pokeSession(target.sessionId);
 		this.emit();
 	}
 
 	async createSession(request: CreateSessionRequest): Promise<CreateSessionResult> {
-		const source = request.sourceSessionResource
-			? this.getSessions().find(session => session.resource === request.sourceSessionResource)
-			: undefined;
-		if (request.sourceSessionResource && !source) {
-			throw new MonitorRequestError(404, 'The source Copilot session is no longer available.');
+		if (!request.id) {
+			return this.createSessionOnce(request);
 		}
-		const previousResources = new Set(this.getSessions().map(session => session.resource));
-		let resource: vscode.Uri;
-		try {
-			resource = await createNewChat(source ? vscode.Uri.parse(source.resource) : undefined);
-		} catch (error) {
-			let created: ActiveSessionState | undefined;
-			for (let attempt = 0; attempt < 40 && !created; attempt++) {
-				await this.poll();
-				created = this.getSessions()
-					.filter(session => !previousResources.has(session.resource))
-					.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0];
-				if (!created) {
-					await new Promise(resolve => setTimeout(resolve, 50));
-				}
+		const existing = this.createSessionOperations.get(request.id);
+		if (existing) {
+			return existing;
+		}
+		const operation = this.createSessionOnce(request).catch(error => {
+			this.createSessionOperations.delete(request.id!);
+			throw error;
+		});
+		this.createSessionOperations.set(request.id, operation);
+		while (this.createSessionOperations.size > 32) {
+			const oldest = this.createSessionOperations.keys().next().value as string | undefined;
+			if (!oldest || oldest === request.id) {
+				break;
 			}
-			if (!created) {
-				throw error;
-			}
-			resource = vscode.Uri.parse(created.resource);
+			this.createSessionOperations.delete(oldest);
 		}
-		const persisted = this.getSessions().find(session => session.resource === resource.toString());
-		if (persisted) {
-			this.activeSession = persisted;
-			this.liveExportTargetResource = persisted.resource;
-			this.emit();
-			return { sessionResource: persisted.resource };
-		}
-		const sessionId = decodeLocalSessionId(resource);
-		const session: ActiveSessionState = {
-			resource: resource.toString(),
-			sessionId,
-			title: 'New chat',
-			status: 'idle',
-			revision: `transient:${Date.now()}`,
-			updatedAt: Date.now(),
-			turns: [],
-			model: source?.model,
-			permissionLevel: source?.permissionLevel ?? 'default',
-		};
-		this.sessionStateCache.upsertTransient(session);
-		this.activeSession = session;
-		this.liveExportTargetResource = session.resource;
-		this.emit();
-		return { sessionResource: session.resource };
+		return operation;
 	}
 
 	async setPermissionLevel(request: PermissionLevelRequest): Promise<void> {
 		const target = this.requireIdleSession(request.sessionResource);
-		const sessionFile = await this.requireSessionFile(request.sessionResource);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		await releaseChatSession(resource);
-		try {
-			await this.appendSessionMutation(
-				sessionFile,
-				createSessionValueMutation(['inputState', 'permissionLevel'], request.permissionLevel),
-			);
-			this.activeSession = this.getSessions().find(session => session.resource === target.resource);
-			this.emit();
-		} finally {
-			await focusChatSession(resource);
+		if (await setChatPermissionLevel(resource, request.permissionLevel)) {
+			void this.pokeAfterCommand(request.sessionResource);
+			return;
 		}
+		const file = await this.requireSessionFile(request.sessionResource);
+		await this.rewriteSessionLog(resource, file.filePath, () => this.appendMutation(file.filePath, createSessionValueMutation(['inputState', 'permissionLevel'], request.permissionLevel)));
+		await this.core.pokeSession(target.sessionId);
+		this.emit();
 	}
 
 	async decideTool(request: ToolDecisionRequest): Promise<void> {
 		this.requirePendingTool(request);
 		const resource = vscode.Uri.parse(request.sessionResource);
-		this.liveExportTargetResource = request.sessionResource;
 		await focusChatSession(resource);
-
-		let confirmedPending = false;
-		for (let attempt = 0; attempt < 12; attempt++) {
-			await this.refreshLiveExportWhenIdle();
-			try {
-				this.requirePendingTool(request);
-				confirmedPending = true;
-				break;
-			} catch {
-				await new Promise(resolve => setTimeout(resolve, 50));
-			}
-		}
-		if (!confirmedPending) {
-			throw new MonitorRequestError(409, 'The pending tool changed before the decision could be applied.');
-		}
-
 		await decideTool(resource, request.decision);
 		await new Promise(resolve => setTimeout(resolve, 25));
-		await this.refreshLiveExportWhenIdle();
+		await this.syncNow(request.sessionResource);
+	}
+
+	/**
+	 * Runs VS Code's chat export for the selected session once, on demand. This is the only
+	 * path that touches the renderer's chat model, so it is never scheduled automatically.
+	 */
+	async syncNow(sessionResource?: string): Promise<void> {
+		const target = sessionResource ?? this.core.getState().activeSessionResource;
+		if (!target) {
+			return;
+		}
+		if (this.exportRunning) {
+			await this.exportRunning;
+			return;
+		}
+		this.exportRunning = this.runExport(target).finally(() => {
+			this.exportRunning = undefined;
+		});
+		await this.exportRunning;
 	}
 
 	dispose(): void {
-		clearInterval(this.fallbackPollTimer);
-		clearInterval(this.liveExportTimer);
+		this.disposed = true;
+		this.clearStallProbe();
+		this.progressiveAbortController.abort();
 		this.nativeInputStateSync.dispose();
-		if (this.scheduledPoll) {
-			clearTimeout(this.scheduledPoll);
-		}
-		for (const watcher of this.directoryWatchers.values()) {
-			watcher.close();
-		}
-		this.directoryWatchers.clear();
-		this.nativeStateDatabase?.close();
-		this.nativeStateDatabase = undefined;
+		this.core.dispose();
+		this.closeNativeStateDatabases();
 		for (const disposable of this.disposables) {
 			disposable.dispose();
 		}
 	}
 
-	private schedulePoll(delayMs = 0): void {
-		if (this.scheduledPoll) {
+	// #region state assembly
+
+	private onCoreChanged(): void {
+		const coreState = this.core.getState();
+		for (const session of coreState.sessions) {
+			if (session.turns.length > 0) {
+				this.completePendingTurn(session.resource, session.turns);
+			}
+		}
+		this.error = undefined;
+		this.scheduleStallProbe(coreState.sessions.find(session => session.resource === coreState.activeSessionResource));
+		this.emit();
+	}
+
+	/**
+	 * Live sources cannot distinguish a tool waiting for confirmation from one that is simply
+	 * slow. When the newest turn has an approvable tool nobody has probed yet, run one export
+	 * after a grace period so the dashboard learns the renderer's real confirmation state.
+	 */
+	private scheduleStallProbe(active: ActiveSessionState | undefined): void {
+		if (!active || this.eventClientCount === 0 || this.stallProbeTimer) {
 			return;
 		}
-		this.scheduledPoll = setTimeout(() => {
-			this.scheduledPoll = undefined;
-			this.pollQueue = this.pollQueue.then(() => this.poll()).catch(error => {
-				this.error = error instanceof Error ? error.message : String(error);
-				this.emit();
-			});
-		}, delayMs);
-		this.scheduledPoll.unref();
-	}
-
-	private ensureDirectoryWatchers(): void {
-		for (const directory of this.watchedDirectories) {
-			if (this.directoryWatchers.has(directory)) {
-				continue;
-			}
-			try {
-				const watcher = watch(directory, { persistent: false }, (_eventType, fileName) => {
-					const name = fileName ? String(fileName) : undefined;
-					if (!name || name.endsWith('.jsonl') || name.endsWith('models.json')) {
-						if (!name || name.endsWith('models.json')) {
-							this.nextModelCatalogScanAt = 0;
-						}
-						this.schedulePoll(fileEventDebounceMs);
-					}
-				});
-				watcher.on('error', () => {
-					watcher.close();
-					this.directoryWatchers.delete(directory);
-				});
-				this.directoryWatchers.set(directory, watcher);
-			} catch {
-				// The fallback poll retries if VS Code has not created the directory yet.
-			}
+		const lastTurn = active.turns.at(-1);
+		const candidate = lastTurn?.status === 'working'
+			? lastTurn.activities.find(activity => activity.canApprove && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
+			: undefined;
+		if (!candidate) {
+			return;
 		}
-	}
-
-	private createNativeInputStateWatcher(onChange: () => void, onError: () => void): NativeInputStateWatcher {
-		const watcher = watch(path.dirname(this.stateDatabasePath), { persistent: false }, (eventType, fileName) => {
-			const name = fileName ? path.basename(String(fileName)) : undefined;
-			if (name && !nativeStateDatabaseFiles.has(name)) {
+		const key = `${active.resource}:${candidate.id}`;
+		this.stallProbeTimer = setTimeout(() => {
+			this.stallProbeTimer = undefined;
+			if (this.disposed || this.eventClientCount === 0) {
 				return;
 			}
-			if (!name || (eventType === 'rename' && name === path.basename(this.stateDatabasePath))) {
-				this.nativeStateDatabaseNeedsReconnect = true;
+			const current = this.getSessions().find(session => session.resource === active.resource);
+			const stillPending = current?.turns.at(-1)?.activities.some(activity => activity.id === candidate.id && activity.status !== 'completed');
+			if (!stillPending) {
+				return;
 			}
-			onChange();
-		});
-		watcher.on('error', onError);
-		return { dispose: () => watcher.close() };
+			this.rememberProbe(key);
+			void this.syncNow(active.resource);
+		}, stallProbeDelayMs);
+		this.stallProbeTimer.unref();
 	}
 
-	private async poll(): Promise<void> {
-		this.ensureDirectoryWatchers();
-		let changed = await this.refreshModelCatalog();
-		if (changed) {
-			this.nativeInputStateSync.requestRefresh(0);
-		}
-		const files = await findSessionFiles(this.sessionDirectories);
-		const currentPaths = new Set(files.map(file => file.filePath));
-		changed = this.sessionStateCache.removeMissingPaths(currentPaths) || changed;
-		for (const filePath of this.fileFingerprints.keys()) {
-			if (!currentPaths.has(filePath)) {
-				this.fileFingerprints.delete(filePath);
+	private rememberProbe(key: string): void {
+		this.probedToolCalls.add(key);
+		while (this.probedToolCalls.size > maximumProbedToolCalls) {
+			const oldest = this.probedToolCalls.values().next().value as string | undefined;
+			if (!oldest) {
+				break;
 			}
-		}
-
-		for (const file of files) {
-			changed = await this.refreshSession(file) || changed;
-		}
-
-		const sessions = this.getSessions();
-		const active = sessions.find(session => session.resource === this.activeSession?.resource) ?? sessions[0];
-		if (this.activeSession !== active) {
-			this.activeSession = active;
-			changed = true;
-		}
-		if (changed) {
-			this.error = undefined;
-			this.emit();
+			this.probedToolCalls.delete(oldest);
 		}
 	}
 
-	private async refreshSession(file: SessionFile): Promise<boolean> {
-		try {
-			const statBefore = await fs.stat(file.filePath);
-			const supplementPath = await findExistingFile(
-				this.copilotTranscriptDirectories,
-				`${file.sessionId}.jsonl`,
-			);
-			const supplementStatBefore = supplementPath ? await fs.stat(supplementPath) : undefined;
-			const fingerprint = createFingerprint(statBefore, supplementStatBefore);
-			if (fingerprint === this.fileFingerprints.get(file.filePath)) {
-				return false;
-			}
-
-			const content = await fs.readFile(file.filePath, 'utf8');
-			const statAfter = await fs.stat(file.filePath);
-			const stableRead = statBefore.size === statAfter.size
-				&& statBefore.mtimeMs === statAfter.mtimeMs
-				&& Buffer.byteLength(content) === statAfter.size;
-			const snapshot = parseMutationLogSnapshot(content);
-			let transcript = normalizeTranscript(snapshot.state);
-			let supplementComplete = true;
-			let supplementStable = true;
-			let supplementStatAfter = supplementStatBefore;
-
-			if (supplementPath && supplementStatBefore) {
-				const supplementContent = await fs.readFile(supplementPath, 'utf8');
-				supplementStatAfter = await fs.stat(supplementPath);
-				supplementStable = supplementStatBefore.size === supplementStatAfter.size
-					&& supplementStatBefore.mtimeMs === supplementStatAfter.mtimeMs
-					&& Buffer.byteLength(supplementContent) === supplementStatAfter.size;
-				const supplement = parseCopilotTranscriptLog(supplementContent);
-				supplementComplete = supplement.complete;
-				transcript = mergeTranscriptSupplement(transcript, supplement);
-			}
-
-			const revision = createFingerprint(statAfter, supplementStatAfter);
-			if (!snapshot.complete || !stableRead || !supplementComplete || !supplementStable) {
-				this.schedulePoll(partialWriteRetryMs);
-			} else {
-				this.fileFingerprints.set(file.filePath, revision);
-			}
-			const state: ActiveSessionState = {
-				resource: buildLocalSessionResource(file.sessionId).toString(),
-				sessionId: transcript.sessionId || file.sessionId,
-				title: transcript.title,
-				status: transcript.status,
-				revision,
-				updatedAt: Math.max(statAfter.mtimeMs, supplementStatAfter?.mtimeMs ?? 0),
-				turns: transcript.turns,
-				model: parseSessionModelState(snapshot.state),
-				permissionLevel: parsePermissionLevel(snapshot.state),
-			};
-			this.sessionStateCache.upsertPersisted(file.filePath, state);
-			this.completePendingTurn(state.resource, transcript.turns);
-			return true;
-		} catch (error) {
-			if (isFileNotFound(error)) {
-				return false;
-			}
-			this.error = error instanceof Error ? error.message : String(error);
-			return false;
+	private clearStallProbe(): void {
+		if (this.stallProbeTimer) {
+			clearTimeout(this.stallProbeTimer);
+			this.stallProbeTimer = undefined;
 		}
 	}
 
-	private async refreshLiveExport(force = false): Promise<void> {
-		const targetSession = this.liveExportTargetResource
-			? this.getSessions().find(session => session.resource === this.liveExportTargetResource)
-			: this.activeSession;
-		const now = Date.now();
-		const sampleForConnectedClient = this.eventClientCount > 0 && now >= this.nextConnectedIdleLiveExportAt;
-		if (this.liveExportRunning
-			|| !targetSession
-			|| !(force
-				|| sampleForConnectedClient
-				|| this.liveExportTracker.shouldSample(force, targetSession.status, now))) {
+	private decorateSession(session: ActiveSessionState): ActiveSessionState {
+		let decorated = session;
+		if (this.exportSnapshot && this.exportSnapshot.resource === session.resource) {
+			decorated = applyExportSnapshot(decorated, this.exportSnapshot);
+		}
+		if (this.nativeModelOverride && this.nativeModelOverride.resource === session.resource) {
+			decorated = { ...decorated, model: this.nativeModelOverride.model };
+		}
+		return decorated;
+	}
+
+	private emit(): void {
+		if (this.disposed) {
 			return;
 		}
-		if (sampleForConnectedClient) {
-			this.nextConnectedIdleLiveExportAt = now + connectedIdleLiveExportIntervalMs;
+		const state = this.getState();
+		const signature = stateSignature(state);
+		if (signature === this.lastEmittedSignature) {
+			return;
 		}
+		this.lastEmittedSignature = signature;
+		this.changeEmitter.fire(state);
+	}
 
-		this.liveExportRunning = true;
+	private getSessions(): readonly ActiveSessionState[] {
+		return this.getState().sessions;
+	}
+
+	// #endregion
+
+	// #region export (on demand)
+
+	private async runExport(sessionResource: string): Promise<void> {
 		try {
+			const sessions = this.getSessions();
+			const target = sessions.find(session => session.resource === sessionResource);
+			if (!target || target.status === 'loading') {
+				return;
+			}
+			await focusChatSession(vscode.Uri.parse(sessionResource));
 			this.liveExportFileSystem.reset();
 			await vscode.commands.executeCommand('workbench.action.chat.export', this.liveExportUri);
 			const bytes = this.liveExportFileSystem.readFile();
@@ -642,107 +701,105 @@ export class SessionMonitor implements vscode.Disposable {
 			if (!isRecord(exported)) {
 				return;
 			}
-
-			const rawTranscript = normalizeTranscript(exported);
-			if (rawTranscript.turns.length === 0) {
+			const transcript = normalizeTranscript(exported);
+			if (transcript.turns.length === 0) {
 				return;
 			}
-			const matchedSession = findMatchingSession(this.getSessions(), rawTranscript);
-			if (!matchedSession) {
-				return;
-			}
-			const transcript = this.liveExportTracker.stabilize(matchedSession.resource, rawTranscript);
-			this.completePendingTurn(matchedSession.resource, transcript.turns);
-			const serialized = JSON.stringify(exported);
-			const revision = `live:${serialized.length}:${hashString(serialized)}`;
-			if (revision === matchedSession.revision) {
-				return;
-			}
-
-			const liveSession: ActiveSessionState = {
-				...matchedSession,
-				status: transcript.status,
-				revision,
-				updatedAt: Date.now(),
-				turns: transcript.turns,
-				model: mergeSessionModelState(matchedSession.model, parseSessionModelState(exported)),
+			const matched = findMatchingSession(sessions, transcript) ?? target;
+			const stabilized = this.liveExportTracker.stabilize(matched.resource, transcript);
+			this.completePendingTurn(matched.resource, stabilized.turns);
+			this.exportSnapshot = {
+				resource: matched.resource,
+				turns: stabilized.turns,
+				model: parseSessionModelState(exported),
+				capturedAt: Date.now(),
+				coreRevision: matched.revision,
 			};
-			if (!this.sessionStateCache.applyLive(liveSession)) {
-				return;
-			}
-			if (this.activeSession?.resource === liveSession.resource) {
-				this.activeSession = this.getSessions().find(session => session.resource === liveSession.resource);
-			}
 			this.emit();
-		} catch {
-			// Internal export is opportunistic; persisted transcript watching remains the fallback.
-		} finally {
-			this.liveExportRunning = false;
+		} catch (error) {
+			this.log(`export failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
-	private async refreshLiveExportWhenIdle(): Promise<void> {
-		const deadline = Date.now() + 2_000;
-		while (this.liveExportRunning && Date.now() < deadline) {
-			await new Promise(resolve => setTimeout(resolve, 10));
+	private async pokeAfterCommand(sessionResource: string): Promise<void> {
+		const sessionId = sessionIdFromResource(sessionResource);
+		if (sessionId) {
+			await this.core.pokeSession(sessionId);
 		}
-		await this.refreshLiveExport(true);
 	}
 
-	private async refreshModelCatalog(): Promise<boolean> {
-		const now = Date.now();
-		if (now < this.nextModelCatalogScanAt) {
-			return false;
-		}
-		this.nextModelCatalogScanAt = now + modelCatalogRefreshIntervalMs;
-		const snapshot = await readLatestModelCatalog(this.copilotModelDirectories);
-		if (!snapshot || snapshot.revision === this.modelCatalogRevision) {
-			return false;
-		}
-		this.modelCatalogRevision = snapshot.revision;
-		this.models = snapshot.models;
-		return true;
+	// #endregion
+
+	// #region model catalog & native input state
+
+	private createNativeInputStateWatcher(onChange: () => void, onError: () => void): NativeInputStateWatcher {
+		const directories = new Set([path.dirname(this.profileStateDatabasePath), path.dirname(this.applicationStateDatabasePath)]);
+		const watchers = [...directories].map(directory => {
+			const watcher = watch(directory, { persistent: false }, (eventType, fileName) => {
+				const name = fileName ? path.basename(String(fileName)) : undefined;
+				if (name && !nativeStateDatabaseFiles.has(name)) {
+					return;
+				}
+				if (!name || (eventType === 'rename' && name === 'state.vscdb')) {
+					this.nativeStateDatabaseNeedsReconnect = true;
+				}
+				onChange();
+			});
+			watcher.on('error', onError);
+			return watcher;
+		});
+		return { dispose: () => watchers.forEach(watcher => watcher.close()) };
 	}
 
+	private closeNativeStateDatabases(): void {
+		this.nativeStateDatabase?.close();
+		this.nativeStateDatabase = undefined;
+		if (this.applicationStateDatabase !== undefined) {
+			this.applicationStateDatabase.close();
+			this.applicationStateDatabase = undefined;
+		}
+	}
+
+	private openNativeStateDatabases(): { profile: DatabaseSync; application: DatabaseSync } {
+		if (this.nativeStateDatabaseNeedsReconnect) {
+			this.closeNativeStateDatabases();
+			this.nativeStateDatabaseNeedsReconnect = false;
+		}
+		const profile = this.nativeStateDatabase ??= new DatabaseSync(this.profileStateDatabasePath, { readOnly: true });
+		const application = this.applicationStateDatabasePath === this.profileStateDatabasePath
+			? profile
+			: this.applicationStateDatabase ??= new DatabaseSync(this.applicationStateDatabasePath, { readOnly: true });
+		return { profile, application };
+	}
+
+	/**
+	 * One read of VS Code's storage answers three questions: which models exist (the picker's
+	 * cached list), which model the panel currently has selected, and how it is configured.
+	 * Runs only on storage file events, so it must never leave stale derived state behind.
+	 */
 	private async refreshNativeInputState(): Promise<void> {
 		try {
-			const resource = await vscode.commands.executeCommand<string | undefined>('_chat.voice.getCurrentSession');
-			if (!resource) {return;}
-			const session = this.getSessions().find(candidate => candidate.resource === resource);
-			if (!session) {return;}
-
-			if (this.nativeStateDatabaseNeedsReconnect) {
-				this.nativeStateDatabase?.close();
-				this.nativeStateDatabase = undefined;
-				this.nativeStateDatabaseNeedsReconnect = false;
-			}
-			const database = this.nativeStateDatabase ??= new DatabaseSync(this.stateDatabasePath, { readOnly: true });
+			const resource = await this.readNativeCurrentSession();
+			const { profile, application } = this.openNativeStateDatabases();
 			try {
-				const rows = database.prepare("SELECT key, value FROM ItemTable WHERE key IN ('chat.currentLanguageModel.panel', 'chat.modelConfiguration.panel')").all() as Array<{ key: string; value: string }>;
+				const rows = [
+					...profile.prepare("SELECT key, value FROM ItemTable WHERE key = 'chat.currentLanguageModel.panel'").all() as Array<{ key: string; value: string }>,
+					...application.prepare(`SELECT key, value FROM ItemTable WHERE key IN ('chat.modelConfiguration.panel', '${cachedLanguageModelsStorageKey}')`).all() as Array<{ key: string; value: string }>,
+				];
 				this.nativeStateRetryAttempted = false;
+				let changed = this.updateCatalog(rows.find(row => row.key === cachedLanguageModelsStorageKey)?.value);
 				const snapshot = createNativeChatInputStateSnapshot(rows);
-				const fingerprint = JSON.stringify([
-					resource,
-					this.modelCatalogRevision,
-					snapshot.rawModelId,
-					snapshot.rawConfiguration,
-				]);
-				if (fingerprint === this.lastNativeInputFingerprint) {return;}
-				this.lastNativeInputFingerprint = fingerprint;
-				const nativeState = snapshot.state;
-				const modelId = nativeState.modelId;
-				const model = this.models.find(candidate => candidate.identifier === modelId);
-				if (!model) {return;}
-				const next = withNativeModelState(session.model, model, nativeState.configuration);
-				const selectedModelChanged = session.model?.selectedModelId !== next.selectedModelId;
-				const configurationChanged = !configurationEquals(session.model?.configuration ?? {}, next.configuration);
-				if ((selectedModelChanged || configurationChanged) && this.sessionStateCache.updateModel(resource, next)) {
-					this.activeSession = this.getSessions().find(candidate => candidate.resource === resource);
+				this.storedModelConfigurations = snapshot.configurations;
+				const fingerprint = JSON.stringify([resource, this.catalogRaw?.length, snapshot.rawModelId, snapshot.rawConfiguration, this.modelIntent?.modelId]);
+				if (fingerprint !== this.lastNativeInputFingerprint) {
+					this.lastNativeInputFingerprint = fingerprint;
+					changed = this.updateNativeModelOverride(resource, snapshot.state.modelId, snapshot.state.configuration) || changed;
+				}
+				if (changed) {
 					this.emit();
 				}
 			} catch (error) {
-				this.nativeStateDatabase?.close();
-				this.nativeStateDatabase = undefined;
+				this.closeNativeStateDatabases();
 				this.nativeStateDatabaseNeedsReconnect = false;
 				this.lastNativeInputFingerprint = undefined;
 				if (!this.nativeStateRetryAttempted) {
@@ -751,9 +808,61 @@ export class SessionMonitor implements vscode.Disposable {
 				}
 				throw error;
 			}
-		} catch {
-			// Native storage polling is opportunistic; persisted session watching remains the fallback.
+		} catch (error) {
+			// Storage reads are opportunistic; the persisted session log remains the fallback.
+			this.log(`native state read failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private updateCatalog(raw: string | undefined): boolean {
+		if (raw === this.catalogRaw) {
+			return false;
+		}
+		const parsed = raw === undefined ? emptyModelCatalog : parseCachedLanguageModels(raw);
+		if (!parsed) {
+			return false;
+		}
+		this.catalogRaw = raw;
+		this.catalog = parsed;
+		return true;
+	}
+
+	/**
+	 * The panel's stored selection describes the chat VS Code has focused. When it cannot be
+	 * resolved (no focused chat, model unknown) the override is dropped rather than kept, so
+	 * the session log's own value shows instead of a selection that is no longer current.
+	 *
+	 * VS Code flushes storage lazily, so right after the dashboard picks a model the stored value
+	 * still names the previous one; a fresh intent outranks such reads until storage agrees.
+	 */
+	private updateNativeModelOverride(resource: string | undefined, storedModelId: string | undefined, configuration: Readonly<Record<string, string | number | boolean>>): boolean {
+		let modelId = storedModelId;
+		const intent = this.modelIntent;
+		if (intent) {
+			if (intent.resource !== resource || Date.now() - intent.at > modelIntentGraceMs) {
+				this.modelIntent = undefined;
+			} else if (storedModelId === intent.modelId) {
+				this.modelIntent = undefined;
+			} else {
+				modelId = intent.modelId;
+				configuration = this.storedModelConfigurations[intent.modelId] ?? {};
+			}
+		}
+		const session = resource ? this.core.getState().sessions.find(candidate => candidate.resource === resource) : undefined;
+		const model = modelId ? this.catalog.models.find(candidate => candidate.identifier === modelId) : undefined;
+		if (!session || !model) {
+			const had = this.nativeModelOverride !== undefined;
+			this.nativeModelOverride = undefined;
+			return had;
+		}
+		const next = withNativeModelState(session.model, model, configuration);
+		const current = this.nativeModelOverride;
+		if (current && current.resource === resource && current.model.selectedModelId === next.selectedModelId
+			&& configurationEquals(current.model.configuration, next.configuration)) {
+			return false;
+		}
+		this.nativeModelOverride = { resource: session.resource, model: next };
+		return true;
 	}
 
 	private async updateProfileModelConfiguration(
@@ -785,34 +894,148 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 	}
 
+	// #endregion
+
+	// #region session file helpers
+
+	private async waitForPersistedModel(sessionId: string, modelId: string): Promise<Record<string, unknown> | undefined> {
+		for (let attempt = 0; attempt < persistWaitAttempts; attempt++) {
+			await this.core.pokeSession(sessionId);
+			const session = this.core.getState().sessions.find(candidate => candidate.sessionId === sessionId);
+			const selected = session?.model?.selectedModelId;
+			if (selected && (selected === modelId || selected.split('/').at(-1) === modelId.split('/').at(-1))) {
+				return {
+					identifier: selected,
+					...(session?.model?.selectedModelName ? { metadata: { name: session.model.selectedModelName } } : {}),
+					modelConfiguration: session?.model?.configuration ?? {},
+				};
+			}
+			await new Promise(resolve => setTimeout(resolve, persistWaitDelayMs));
+		}
+		return undefined;
+	}
+
+	/** Appends one mutation line, refusing to write into a log whose last line is still being written. */
+	private async appendMutation(filePath: string, mutation: unknown): Promise<void> {
+		const handle = await fs.open(filePath, 'r');
+		let endsWithNewline: boolean;
+		try {
+			const stat = await handle.stat();
+			if (stat.size === 0) {
+				throw new MonitorRequestError(409, 'VS Code has not persisted this chat yet. Try again in a moment.');
+			}
+			const last = Buffer.alloc(1);
+			await handle.read(last, 0, 1, stat.size - 1);
+			endsWithNewline = last[0] === 0x0a;
+		} finally {
+			await handle.close();
+		}
+		if (!endsWithNewline) {
+			throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try again.');
+		}
+		await fs.appendFile(filePath, `${JSON.stringify(mutation)}\n`, 'utf8');
+	}
+
+	private async requireSessionFile(resource: string): Promise<{ filePath: string }> {
+		const sessionId = requireSessionId(resource);
+		const known = this.core.sessionFile(sessionId);
+		if (known) {
+			return known;
+		}
+		for (const directory of this.sessionDirectories) {
+			const filePath = path.join(directory, `${sessionId}.jsonl`);
+			try {
+				await fs.access(filePath);
+				return { filePath };
+			} catch {
+				continue;
+			}
+		}
+		throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
+	}
+
+	private async getProgressiveMutationIndex(sessionId: string): Promise<PagedMutationHistoryIndex> {
+		const cached = this.progressiveMutationIndexes.get(sessionId);
+		const file = this.core.sessionFile(sessionId);
+		if (!file) {
+			throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
+		}
+		if (cached && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
+			return cached;
+		}
+		const existing = this.progressiveMutationIndexing.get(sessionId);
+		if (existing) {
+			return existing;
+		}
+		const indexing = this.loadOrBuildProgressiveMutationIndex(sessionId, file);
+		this.progressiveMutationIndexing.set(sessionId, indexing);
+		try {
+			const index = await indexing;
+			this.progressiveMutationIndexes.set(sessionId, index);
+			return index;
+		} finally {
+			this.progressiveMutationIndexing.delete(sessionId);
+		}
+	}
+
+	private async loadOrBuildProgressiveMutationIndex(sessionId: string, file: { filePath: string; size: number; mtimeMs: number }): Promise<PagedMutationHistoryIndex> {
+		const cachePath = path.join(this.progressiveIndexDirectory, `${sessionId}.json`);
+		try {
+			const cached = JSON.parse(await fs.readFile(cachePath, 'utf8')) as SerializedPagedMutationHistoryIndex;
+			if (cached.filePath === file.filePath && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
+				return deserializePagedMutationHistoryIndex(cached);
+			}
+		} catch {
+			// Missing or stale cache is rebuilt below.
+		}
+		const index = await indexPagedMutationHistoryInWorker(file.filePath, this.progressiveAbortController.signal);
+		await fs.mkdir(this.progressiveIndexDirectory, { recursive: true });
+		const temporaryPath = `${cachePath}.${process.pid}.tmp`;
+		await fs.writeFile(temporaryPath, JSON.stringify(serializePagedMutationHistoryIndex(index)), 'utf8');
+		await fs.rename(temporaryPath, cachePath).catch(async () => {
+			await fs.rm(cachePath, { force: true });
+			await fs.rename(temporaryPath, cachePath);
+		});
+		await pruneProgressiveIndexCache(this.progressiveIndexDirectory, cachePath);
+		return index;
+	}
+
+	// #endregion
+
+	// #region commands helpers
+
+	private async createSessionOnce(request: CreateSessionRequest): Promise<CreateSessionResult> {
+		const source = request.sourceSessionResource
+			? this.getSessions().find(session => session.resource === request.sourceSessionResource)
+			: undefined;
+		if (request.sourceSessionResource && !source) {
+			throw new MonitorRequestError(404, 'The source Copilot session is no longer available.');
+		}
+		const resource = await this.createIdentifiedChat(source);
+		const sessionId = decodeLocalSessionId(resource);
+		this.createdSessionResources.add(resource.toString());
+		this.nativeCurrentSessionResource = resource.toString();
+		await this.core.selectSession(sessionId);
+		await this.core.pokeSession(sessionId);
+		this.emit();
+		return { sessionResource: resource.toString() };
+	}
+
 	private requirePendingTool(request: ToolDecisionRequest): void {
 		if (!isActivePendingTool(this.getSessions(), request)) {
 			throw new MonitorRequestError(409, 'The requested tool is no longer the active pending confirmation.');
 		}
 	}
 
-	private requireIdleSession(resource: string): ActiveSessionState {
+	private requireIdleSession(resource: string, busyMessage = 'Wait for the active response to finish.'): ActiveSessionState {
 		const session = this.getSessions().find(candidate => candidate.resource === resource);
-		if (!session) {throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');}
-		if (session.status === 'working') {throw new MonitorRequestError(409, 'Wait for the active response to finish.');}
+		if (!session) {
+			throw new MonitorRequestError(404, 'The selected Copilot session is no longer available.');
+		}
+		if (session.status === 'working') {
+			throw new MonitorRequestError(409, busyMessage);
+		}
 		return session;
-	}
-
-	private async requireSessionFile(resource: string): Promise<SessionFile> {
-		const file = (await findSessionFiles(this.sessionDirectories))
-			.find(candidate => buildLocalSessionResource(candidate.sessionId).toString() === resource);
-		if (!file) {throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');}
-		return file;
-	}
-
-	private async appendSessionMutation(file: SessionFile, mutation: unknown): Promise<void> {
-		const content = await fs.readFile(file.filePath, 'utf8');
-		const snapshot = parseMutationLogSnapshot(content);
-		if (!snapshot.complete) {throw new MonitorRequestError(409, 'VS Code is still persisting this chat. Try again.');}
-		const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
-		await fs.appendFile(file.filePath, `${separator}${JSON.stringify(mutation)}\n`, 'utf8');
-		this.fileFingerprints.delete(file.filePath);
-		await this.refreshSession(file);
 	}
 
 	private setOutboundMessage(message: OutboundMessageState): void {
@@ -836,20 +1059,14 @@ export class SessionMonitor implements vscode.Disposable {
 		this.emit();
 	}
 
-	private completePendingTurn(sessionResource: string, turns: readonly Transcript['turns'][number][]): void {
+	private completePendingTurn(sessionResource: string, turns: readonly TranscriptTurn[]): void {
 		const completedTurn = this.liveExportTracker.observe(sessionResource, turns);
 		if (completedTurn) {
 			this.updateOutboundMessage(completedTurn.outboundMessageId, { status: 'completed' });
 		}
 	}
 
-	private emit(): void {
-		this.changeEmitter.fire(this.getState());
-	}
-
-	private getSessions(): ActiveSessionState[] {
-		return this.sessionStateCache.getVisibleSessions();
-	}
+	// #endregion
 }
 
 export function resolveSessionDirectories(context: vscode.ExtensionContext): string[] {
@@ -860,115 +1077,195 @@ export function resolveSessionDirectories(context: vscode.ExtensionContext): str
 	return [path.join(globalStorageHome, 'emptyWindowChatSessions')];
 }
 
-interface SessionFile {
-	readonly filePath: string;
-	readonly sessionId: string;
-	readonly mtimeMs: number;
+export function resolveCopilotTranscriptDirectories(context: vscode.ExtensionContext): string[] {
+	if (!context.storageUri) {
+		return [];
+	}
+	return [path.join(path.dirname(context.storageUri.fsPath), 'GitHub.copilot-chat', 'transcripts')];
 }
 
-async function findSessionFiles(directories: readonly string[]): Promise<SessionFile[]> {
-	const files: SessionFile[] = [];
+export function resolveCopilotDebugLogDirectories(context: vscode.ExtensionContext): string[] {
+	if (!context.storageUri) {
+		return [];
+	}
+	return [path.join(path.dirname(context.storageUri.fsPath), 'GitHub.copilot-chat', 'debug-logs')];
+}
 
-	for (const directory of directories) {
-		let entries: string[];
+/** PROFILE-scoped storage lives next to the extension's global storage folder. */
+export function resolveProfileStateDatabasePath(context: vscode.ExtensionContext): string {
+	return path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
+}
+
+/**
+ * APPLICATION-scoped storage is always `User/globalStorage/state.vscdb`. For the default
+ * profile that is the profile database; for a custom profile the extension's global storage
+ * sits under `User/profiles/<id>/globalStorage`, so walk back to `User`.
+ */
+export function resolveApplicationStateDatabasePath(context: vscode.ExtensionContext): string {
+	const globalStorage = path.dirname(context.globalStorageUri.fsPath);
+	const profileDirectory = path.dirname(globalStorage);
+	if (path.basename(path.dirname(profileDirectory)) === 'profiles') {
+		return path.join(path.dirname(path.dirname(profileDirectory)), 'globalStorage', 'state.vscdb');
+	}
+	return path.join(globalStorage, 'state.vscdb');
+}
+
+/** Workspace windows keep the chat index in workspace storage; empty windows in application storage. */
+export function resolveSessionIndexDatabasePath(context: vscode.ExtensionContext): string {
+	if (context.storageUri) {
+		return path.join(path.dirname(context.storageUri.fsPath), 'state.vscdb');
+	}
+	return path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
+}
+
+/**
+ * Overlays the renderer's exported view of the session onto the file-derived one. The
+ * export is the only source that knows about pending tool confirmations immediately, so
+ * its activities and status win for the newest, still-working turn.
+ */
+export function applyExportSnapshot(session: ActiveSessionState, snapshot: ExportSnapshot): ActiveSessionState {
+	if (session.turns.length === 0 || snapshot.turns.length === 0) {
+		return session;
+	}
+	const last = session.turns[session.turns.length - 1];
+	const exported = snapshot.turns.find(turn => turn.id === last.id)
+		?? snapshot.turns.find(turn => turn.userText.trim() === last.userText.trim() && Math.abs(turn.timestamp - last.timestamp) < 5 * 60_000);
+	if (!exported) {
+		return session;
+	}
+	if (last.status !== 'working' && exported.status !== 'working') {
+		return session;
+	}
+	const turns = [...session.turns.slice(0, -1), {
+		...last,
+		id: last.id,
+		editable: last.editable,
+		status: exported.status,
+		assistantText: exported.assistantText.length >= last.assistantText.length ? exported.assistantText : last.assistantText,
+		thinking: exported.thinking.length >= last.thinking.length ? exported.thinking : last.thinking,
+		activities: exported.activities,
+		blocks: exported.blocks,
+		completedAt: exported.completedAt ?? last.completedAt,
+	}];
+	return {
+		...session,
+		turns,
+		status: turns.some(turn => turn.status === 'working') ? 'working' : 'idle',
+		model: snapshot.model ? mergeSessionModelState(session.model, snapshot.model) : session.model,
+		revision: `${session.revision}+x${snapshot.capturedAt}`,
+	};
+}
+
+/** Resolves once the file's size has stopped changing (VS Code's dispose-time write has landed). */
+async function waitForFileToSettle(filePath: string, quietMs = 150, maximumMs = 2_000): Promise<void> {
+	const deadline = Date.now() + maximumMs;
+	let lastSize = -1;
+	let quietSince = Date.now();
+	while (Date.now() < deadline) {
+		let size: number;
 		try {
-			entries = await fs.readdir(directory);
+			size = (await fs.stat(filePath)).size;
 		} catch {
+			size = -1;
+		}
+		if (size !== lastSize) {
+			lastSize = size;
+			quietSince = Date.now();
+		} else if (Date.now() - quietSince >= quietMs) {
+			return;
+		}
+		await new Promise(resolve => setTimeout(resolve, 50));
+	}
+}
+
+function stateSignature(state: MonitorState): string {
+	const parts: string[] = [state.activeSessionResource ?? '', state.error ?? '', state.models.map(model => model.identifier).join(',')];
+	for (const session of state.sessions) {
+		parts.push(session.resource, session.revision, session.status, session.title, String(session.updatedAt ?? 0), String(session.isEmpty), session.model?.selectedModelId ?? '', JSON.stringify(session.model?.configuration ?? {}));
+	}
+	for (const message of state.outboundMessages) {
+		parts.push(message.id, message.status);
+	}
+	return parts.join('\u0000');
+}
+
+function requireSessionId(resource: string): string {
+	const sessionId = sessionIdFromResource(resource);
+	if (!sessionId) {
+		throw new MonitorRequestError(400, 'The session resource is not a local Copilot chat session.');
+	}
+	return sessionId;
+}
+
+function decodeLocalSessionId(resource: vscode.Uri): string {
+	const sessionId = sessionIdFromResource(resource.toString());
+	if (!sessionId) {
+		throw new MonitorRequestError(409, 'VS Code created an unsupported chat session resource.');
+	}
+	return sessionId;
+}
+
+function findProgressiveRequestIndex(
+	requests: readonly Record<string, unknown>[],
+	sourceText: string,
+	sourceTimestamp: number | undefined,
+): number {
+	const expected = normalizeComparablePrompt(sourceText);
+	let bestIndex = -1;
+	let bestDistance = Number.POSITIVE_INFINITY;
+	for (let index = 0; index < requests.length; index++) {
+		const request = requests[index];
+		const message = isRecord(request.message) ? request.message : undefined;
+		if (normalizeComparablePrompt(typeof message?.text === 'string' ? message.text : '') !== expected) {
 			continue;
 		}
-
-		for (const entry of entries) {
-			if (!entry.endsWith('.jsonl')) {
-				continue;
-			}
-			const filePath = path.join(directory, entry);
-			try {
-				const stat = await fs.stat(filePath);
-				files.push({
-					filePath,
-					sessionId: entry.slice(0, -'.jsonl'.length),
-					mtimeMs: stat.mtimeMs,
-				});
-			} catch {
-				continue;
-			}
+		const timestamp = typeof request.timestamp === 'number' ? request.timestamp : undefined;
+		const distance = sourceTimestamp !== undefined && timestamp !== undefined ? Math.abs(timestamp - sourceTimestamp) : index;
+		if (distance < bestDistance) {
+			bestDistance = distance;
+			bestIndex = index;
 		}
 	}
-
-	return files.sort((left, right) => right.mtimeMs - left.mtimeMs);
+	return bestIndex;
 }
 
-function isFileNotFound(error: unknown): boolean {
-	return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
+function normalizeComparablePrompt(value: string): string {
+	return value.replace(/^User:\s*/i, '').replace(/\s+/g, ' ').trim();
+}
+
+async function pruneProgressiveIndexCache(directory: string, retainedPath: string): Promise<void> {
+	let entries: Array<{ path: string; size: number; mtimeMs: number }> = [];
+	try {
+		entries = await Promise.all((await fs.readdir(directory))
+			.filter(name => name.endsWith('.json'))
+			.map(async name => {
+				const filePath = path.join(directory, name);
+				const stat = await fs.stat(filePath);
+				return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs };
+			}));
+	} catch {
+		return;
+	}
+	entries.sort((left, right) => right.mtimeMs - left.mtimeMs);
+	let retainedBytes = 0;
+	let retainedFiles = 0;
+	for (const entry of entries) {
+		const keep = entry.path === retainedPath || (
+			retainedFiles < maximumProgressiveIndexCacheFiles
+			&& retainedBytes + entry.size <= maximumProgressiveIndexCacheBytes
+		);
+		if (keep) {
+			retainedFiles++;
+			retainedBytes += entry.size;
+		} else {
+			await fs.rm(entry.path, { force: true }).catch(() => undefined);
+		}
+	}
 }
 
 function summarize(value: string, length: number): string {
 	const singleLine = value.replace(/\s+/g, ' ').trim();
 	return singleLine.length > length ? `${singleLine.slice(0, length - 1)}…` : singleLine;
-}
-
-function decodeLocalSessionId(resource: vscode.Uri): string {
-	if (resource.scheme !== 'vscode-chat-session' || resource.authority !== 'local' || !resource.path.startsWith('/')) {
-		throw new MonitorRequestError(409, 'VS Code created an unsupported chat session resource.');
-	}
-	const sessionId = Buffer.from(resource.path.slice(1), 'base64url').toString('utf8');
-	if (!sessionId) {throw new MonitorRequestError(409, 'VS Code created an invalid chat session resource.');}
-	return sessionId;
-}
-
-export function resolveCopilotTranscriptDirectories(context: vscode.ExtensionContext): string[] {
-	if (!context.storageUri) {
-		return [];
-	}
-	const workspaceStorageDirectory = path.dirname(context.storageUri.fsPath);
-	return [path.join(workspaceStorageDirectory, 'GitHub.copilot-chat', 'transcripts')];
-}
-
-export function resolveCopilotModelDirectories(context: vscode.ExtensionContext): string[] {
-	if (!context.storageUri) {
-		return [];
-	}
-	const workspaceStorageDirectory = path.dirname(context.storageUri.fsPath);
-	return [path.join(workspaceStorageDirectory, 'GitHub.copilot-chat', 'debug-logs')];
-}
-
-async function findExistingFile(directories: readonly string[], fileName: string): Promise<string | undefined> {
-	for (const directory of directories) {
-		const filePath = path.join(directory, fileName);
-		try {
-			await fs.access(filePath);
-			return filePath;
-		} catch {
-			continue;
-		}
-	}
-	return undefined;
-}
-
-function createFingerprint(
-	primary: { size: number; mtimeMs: number },
-	supplement?: { size: number; mtimeMs: number },
-): string {
-	return `${primary.size}:${primary.mtimeMs}|${supplement?.size ?? 0}:${supplement?.mtimeMs ?? 0}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parsePermissionLevel(state: Record<string, unknown>): 'default' | 'autoApprove' | 'autopilot' {
-	const inputState = isRecord(state.inputState) ? state.inputState : undefined;
-	const level = inputState?.permissionLevel;
-	return level === 'autoApprove' || level === 'autopilot' ? level : 'default';
-}
-
-function hashString(value: string): number {
-	let hash = 2166136261;
-	for (let index = 0; index < value.length; index++) {
-		hash ^= value.charCodeAt(index);
-		hash = Math.imul(hash, 16777619);
-	}
-	return hash >>> 0;
 }
 
 function configurationEquals(
@@ -981,4 +1278,10 @@ function configurationEquals(
 		&& leftKeys.every(key => Object.hasOwn(right, key) && left[key] === right[key]);
 }
 
+function isFileNotFound(error: unknown): boolean {
+	return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
+}
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}

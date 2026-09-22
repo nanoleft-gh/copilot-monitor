@@ -1,14 +1,15 @@
 import { router, useLocalSearchParams } from 'expo-router';
 import { Check, ChevronLeft, Pencil, Send, X } from 'lucide-react-native';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Keyboard, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { MarkdownText } from '@/components/ui/markdown-text';
 import { PickerField, type PickerOption } from '@/components/ui/picker-field';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
-import { configureModel, decideTool, editTurn, fetchGatewaySnapshot, selectModel, selectSession, sendMessage, setPermissionLevel } from '@/transport/gateway-client';
+import { configureModel, decideTool, editTurn, fetchGatewaySnapshot, loadHistoryPage, selectModel, selectSession, sendMessage, setPermissionLevel } from '@/transport/gateway-client';
 import { getHost } from '@/transport/host-store';
-import { subscribeToGateway } from '@/transport/gateway-stream';
-import type { ChatModelDescriptor, HostProfile, ModelConfigurationField, SessionSummary, TranscriptActivity, WindowSnapshot } from '@/transport/types';
+import { subscribeToGateway, type StreamStatus } from '@/transport/gateway-stream';
+import type { ChatModelDescriptor, HistoryPage, HostProfile, ModelConfigurationField, SessionSummary, TranscriptActivity, WindowSnapshot } from '@/transport/types';
 
 const permissionOptions: PickerOption[] = [
   { value: 'default', label: 'Default Approvals', hint: 'Ask before running tools' },
@@ -18,6 +19,9 @@ const permissionOptions: PickerOption[] = [
 
 type OptimisticValue<T> = { sequence: number; value: T };
 type PermissionLevel = 'default' | 'autoApprove' | 'autopilot';
+
+/** How long a confirmed-by-the-computer model change may take to show up in a snapshot before the UI stops waiting. */
+const optimisticModelTimeoutMs = 15_000;
 
 function mergeConfigurationFields(
   catalogFields: readonly ModelConfigurationField[],
@@ -57,9 +61,12 @@ export default function ChatScreen() {
   const [sending, setSending] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyPage, setHistoryPage] = useState<HistoryPage>();
   const [editTarget, setEditTarget] = useState<{ requestId: string; text: string }>();
   const [editText, setEditText] = useState('');
   const [error, setError] = useState<string>();
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting');
   const [optimisticModel, setOptimisticModel] = useState<OptimisticValue<string>>();
   const [optimisticConfigurations, setOptimisticConfigurations] = useState<Record<string, OptimisticValue<string | number | boolean>>>({});
   const [optimisticPermission, setOptimisticPermission] = useState<OptimisticValue<PermissionLevel>>();
@@ -69,9 +76,23 @@ export default function ChatScreen() {
   const configurationSequence = useRef(0);
   const permissionSequence = useRef(0);
   const optimisticModelRef = useRef<OptimisticValue<string> | undefined>(undefined);
+  const optimisticModelTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const lastAuthoritativeModelRef = useRef<string | undefined>(undefined);
   const optimisticConfigurationsRef = useRef<Record<string, OptimisticValue<string | number | boolean>>>({});
   const optimisticPermissionRef = useRef<OptimisticValue<PermissionLevel> | undefined>(undefined);
   const keyboardHeight = useKeyboardHeight();
+
+  const clearOptimisticModel = useCallback((sequence?: number) => {
+    if (sequence !== undefined && optimisticModelRef.current?.sequence !== sequence) return;
+    optimisticModelRef.current = undefined;
+    if (optimisticModelTimer.current) {
+      clearTimeout(optimisticModelTimer.current);
+      optimisticModelTimer.current = undefined;
+    }
+    setOptimisticModel(current => sequence === undefined || current?.sequence === sequence ? undefined : current);
+  }, []);
+
+  useEffect(() => () => { if (optimisticModelTimer.current) clearTimeout(optimisticModelTimer.current); }, []);
 
   const applySnapshot = useCallback((windows: WindowSnapshot[]) => {
     const nextWindow = windows.find(candidate => candidate.windowId === params.windowId);
@@ -84,10 +105,17 @@ export default function ChatScreen() {
         const intended = nextWindow?.models.find(model => model.identifier === pendingModel.value || model.id === pendingModel.value);
         const authoritative = nextWindow?.models.find(model => model.identifier === authoritativeModelId || model.id === authoritativeModelId);
         if (authoritativeModelId === pendingModel.value || (intended && authoritative?.identifier === intended.identifier)) {
-          optimisticModelRef.current = undefined;
-          setOptimisticModel(current => current?.sequence === pendingModel.sequence ? undefined : current);
+          clearOptimisticModel(pendingModel.sequence);
         }
       }
+
+      // A model change (from here or from VS Code) invalidates effort/context choices made for the old model.
+      if (lastAuthoritativeModelRef.current !== undefined && authoritativeModelId !== lastAuthoritativeModelRef.current
+        && Object.keys(optimisticConfigurationsRef.current).length > 0) {
+        optimisticConfigurationsRef.current = {};
+        setOptimisticConfigurations({});
+      }
+      lastAuthoritativeModelRef.current = authoritativeModelId;
 
       const pendingConfigurations = optimisticConfigurationsRef.current;
       if (Object.keys(pendingConfigurations).length > 0) {
@@ -112,6 +140,7 @@ export default function ChatScreen() {
         optimisticPermissionRef.current = undefined;
         setOptimisticPermission(current => current?.sequence === pendingPermission.sequence ? undefined : current);
       }
+      setHistoryPage(current => current?.revision === nextSession.revision ? current : undefined);
       setSession(nextSession);
       setError(undefined);
     } else if (loadedRef.current) {
@@ -119,7 +148,7 @@ export default function ChatScreen() {
     }
     loadedRef.current = true;
     setLoading(false);
-  }, [params.sessionResource, params.windowId]);
+  }, [clearOptimisticModel, params.sessionResource, params.windowId]);
 
   useEffect(() => {
     if (!params.hostId || !params.windowId || !params.sessionResource) return;
@@ -137,6 +166,11 @@ export default function ChatScreen() {
         applySnapshot(snapshot.windows);
         unsubscribe = subscribeToGateway(nextHost, {
           onSnapshot: value => { if (active) applySnapshot(value.windows); },
+          onStatus: status => {
+            if (!active) return;
+            setStreamStatus(status);
+            if (status === 'unpaired') setError('This computer no longer accepts the phone\'s pairing. Scan its code in VS Code again.');
+          },
         });
       } catch (initError) {
         if (active) {
@@ -147,6 +181,42 @@ export default function ChatScreen() {
     })();
     return () => { active = false; unsubscribe?.(); };
   }, [applySnapshot, params.hostId, params.sessionResource, params.windowId]);
+
+  const displayedSession = useMemo(() => session && historyPage?.revision === session.revision
+    ? {
+        ...session,
+        turns: historyPage.turns,
+        historyStart: historyPage.start,
+        historyTruncated: historyPage.start > 0,
+      }
+    : session, [historyPage, session]);
+
+  const loadHistory = useCallback(async (direction: 'earlier' | 'newer') => {
+    if (!host || !displayedSession || historyLoading || !params.windowId || !params.sessionResource) return;
+    const currentStart = historyPage?.start
+      ?? displayedSession.historyStart
+      ?? Math.max(0, (displayedSession.turnCount ?? 0) - displayedSession.turns.length);
+    const currentEnd = historyPage?.end ?? (currentStart + displayedSession.turns.length);
+    const totalCount = displayedSession.turnCount ?? displayedSession.turns.length;
+    if ((direction === 'earlier' && currentStart <= 0) || (direction === 'newer' && currentEnd >= totalCount)) return;
+    const before = direction === 'earlier' ? currentStart : Math.min(totalCount, currentEnd + 40);
+    setHistoryLoading(true);
+    setError(undefined);
+    try {
+      setHistoryPage(await loadHistoryPage(
+        host,
+        params.windowId,
+        params.sessionResource,
+        displayedSession.revision,
+        before,
+        40,
+      ));
+    } catch (historyError) {
+      setError(historyError instanceof Error ? historyError.message : String(historyError));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [displayedSession, historyLoading, historyPage, host, params.sessionResource, params.windowId]);
 
   const submit = useCallback(async () => {
     const text = draft.trim();
@@ -204,29 +274,33 @@ export default function ChatScreen() {
     }
   }, [editTarget, editText, editing, host, params.sessionResource, params.windowId, session]);
 
-  const working = session?.status === 'working';
+  const working = displayedSession?.status === 'working';
 
   const changeModel = useCallback(async (modelId: string) => {
     if (!host || !params.windowId || !params.sessionResource) return;
     const sequence = ++modelSequence.current;
     const optimistic = { sequence, value: modelId };
     optimisticModelRef.current = optimistic;
+    if (optimisticModelTimer.current) clearTimeout(optimisticModelTimer.current);
     setOptimisticModel(optimistic);
+    // Effort/context chosen for the previous model do not carry over.
+    optimisticConfigurationsRef.current = {};
+    setOptimisticConfigurations({});
     setError(undefined);
     try {
       await selectModel(host, params.windowId, params.sessionResource, modelId);
+      // The computer accepted the change; keep showing it until a snapshot confirms, so a
+      // snapshot that is still in flight with the old model cannot flash it back.
       if (optimisticModelRef.current?.sequence === sequence) {
-        optimisticModelRef.current = undefined;
-        setOptimisticModel(current => current?.sequence === sequence ? undefined : current);
+        optimisticModelTimer.current = setTimeout(() => clearOptimisticModel(sequence), optimisticModelTimeoutMs);
       }
     } catch (modelError) {
       if (modelSequence.current === sequence) {
-        if (optimisticModelRef.current?.sequence === sequence) optimisticModelRef.current = undefined;
-        setOptimisticModel(current => current?.sequence === sequence ? undefined : current);
+        clearOptimisticModel(sequence);
         setError(modelError instanceof Error ? modelError.message : String(modelError));
       }
     }
-  }, [host, params.sessionResource, params.windowId]);
+  }, [clearOptimisticModel, host, params.sessionResource, params.windowId]);
 
   const changeConfiguration = useCallback(async (modelId: string, key: string, value: string | number | boolean) => {
     if (!host || !params.windowId || !params.sessionResource) return;
@@ -286,17 +360,20 @@ export default function ChatScreen() {
   const authoritativeModelId = session?.model?.selectedModelId;
   const selectedModelId = optimisticModel?.value ?? authoritativeModelId;
   const selectedModel = models.find(model => model.identifier === selectedModelId || model.id === selectedModelId);
+  const authoritativeModel = models.find(model => model.identifier === authoritativeModelId || model.id === authoritativeModelId);
+  // While a different model is pending, the old chat's effort/context values belong to the old model.
+  const modelPending = !!optimisticModel && selectedModel?.identifier !== authoritativeModel?.identifier;
   const modelOptions: PickerOption[] = models.map((model: ChatModelDescriptor) => ({
     value: model.identifier,
     label: model.name,
     hint: model.preview ? 'Preview' : model.family,
   }));
-  const sessionFields = session?.model?.configurationFields ?? [];
+  const sessionFields = modelPending ? [] : session?.model?.configurationFields ?? [];
   const catalogFields = selectedModel?.configurationFields ?? [];
   const configFields = mergeConfigurationFields(catalogFields, sessionFields).map(field => ({
     ...field,
     value: optimisticConfigurations[field.key]?.value
-      ?? session?.model?.configuration[field.key]
+      ?? (modelPending ? undefined : session?.model?.configuration[field.key])
       ?? sessionFields.find(candidate => candidate.key === field.key)?.value
       ?? field.defaultValue,
   }));
@@ -304,7 +381,9 @@ export default function ChatScreen() {
 
   const lastTurn = session?.turns.at(-1);
   const pendingToolId = lastTurn?.activities.find(activity => activity.canApprove)?.id;
-  const headerMeta = working
+  const headerMeta = streamStatus === 'connecting' && session
+    ? 'Reconnecting…'
+    : working
     ? 'Copilot is working'
     : selectedModel?.name ?? session?.modelName ?? 'GitHub Copilot';
 
@@ -360,8 +439,25 @@ export default function ChatScreen() {
             onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: false })}
             ref={scrollRef}
           >
-            {session?.turns.length === 0 && <Text style={styles.empty}>No persisted messages are available yet.</Text>}
-            {session?.turns.map((turn, turnIndex) => (
+			{displayedSession?.historyTruncated && (
+			  <Pressable disabled={historyLoading} onPress={() => void loadHistory('earlier')} style={styles.historyButton}>
+				{historyLoading ? <ActivityIndicator color={colors.accentBlue} size="small" /> : <Text style={styles.historyButtonText}>Load earlier messages ({displayedSession.historyStart ?? 0})</Text>}
+			  </Pressable>
+			)}
+            {displayedSession?.turns.length === 0 && (
+              <Text style={styles.empty}>
+                {displayedSession.historyUnavailable === 'indexing'
+                  ? 'Building a compact history index in the background. This can take a few seconds for very large chats.'
+                  : displayedSession.historyUnavailable
+                  ? 'This conversation history remains in VS Code to protect memory. Open it in its VS Code window.'
+                  : displayedSession.isEmpty === true || displayedSession.turnCount === 0
+                  ? 'Ready to chat. Send a message to start this conversation.'
+                  : displayedSession.status === 'loading' || displayedSession.turnCount === undefined
+                  ? 'Loading this conversation from VS Code…'
+                  : 'No persisted messages are available yet.'}
+              </Text>
+            )}
+            {displayedSession?.turns.map((turn, turnIndex) => (
               <View key={`${turn.id}:${turnIndex}`} style={styles.turn}>
                 {!!turn.userText && (
                   <View style={styles.userRow}>
@@ -387,7 +483,7 @@ export default function ChatScreen() {
                       if (block.kind === 'text') {
                         return (
                           <View key={key} style={styles.assistant}>
-                            <Text selectable style={styles.assistantText}>{block.text}</Text>
+                            <MarkdownText text={block.text} />
                           </View>
                         );
                       }
@@ -396,12 +492,17 @@ export default function ChatScreen() {
                   : (
                     <>
                       {!!turn.thinking && <View style={styles.thinking}><Text style={styles.thinkingTitle}>{turn.thinkingTitle || 'Thinking'}</Text><Text selectable style={styles.thinkingText}>{turn.thinking}</Text></View>}
-                      {!!turn.assistantText && <View style={styles.assistant}><Text selectable style={styles.assistantText}>{turn.assistantText}</Text></View>}
+                      {!!turn.assistantText && <View style={styles.assistant}><MarkdownText text={turn.assistantText} /></View>}
                       {turn.activities.map((activity, activityIndex) => renderActivity(turn.id, activity, `${turn.id}:${activity.id}:${activityIndex}`))}
                     </>
                   )}
               </View>
             ))}
+      {historyPage && historyPage.end < historyPage.totalCount && (
+        <Pressable disabled={historyLoading} onPress={() => void loadHistory('newer')} style={styles.historyButton}>
+        {historyLoading ? <ActivityIndicator color={colors.accentBlue} size="small" /> : <Text style={styles.historyButtonText}>Load newer messages ({historyPage.totalCount - historyPage.end})</Text>}
+        </Pressable>
+      )}
           </ScrollView>
         )}
         {error && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
@@ -424,7 +525,7 @@ export default function ChatScreen() {
             )}
             {configFields.map(field => (
               <PickerField
-                disabled={working || !authoritativeModelId || !!optimisticModel || session?.model?.configurationWritable !== true}
+                disabled={working || !authoritativeModelId || modelPending || session?.model?.configurationWritable !== true}
                 key={field.key}
                 label={field.title}
                 onSelect={value => authoritativeModelId && void changeConfiguration(authoritativeModelId, field.key, value)}
@@ -492,13 +593,14 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   transcript: { padding: spacing.lg, paddingBottom: spacing.xl, gap: spacing.xl },
   empty: { color: colors.textMuted, textAlign: 'center', marginTop: 80 },
+  historyButton: { alignItems: 'center', alignSelf: 'center', borderColor: colors.borderSubtle, borderRadius: radii.button, borderWidth: 1, minWidth: 200, paddingHorizontal: spacing.lg, paddingVertical: spacing.sm },
+  historyButtonText: { color: colors.accentBlue, fontSize: typography.metaSize, fontWeight: '600' },
   turn: { gap: spacing.md },
   userRow: { alignSelf: 'flex-end', maxWidth: '92%', flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   userBubble: { alignSelf: 'flex-end', maxWidth: '88%', paddingHorizontal: spacing.md, paddingVertical: 10, borderRadius: radii.card, backgroundColor: colors.bgRaised },
   userText: { color: colors.textPrimary, fontSize: typography.bodySize, lineHeight: 21 },
   editButton: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: radii.button, borderWidth: 1, borderColor: colors.borderSubtle, backgroundColor: colors.bgBase },
   assistant: { alignSelf: 'stretch' },
-  assistantText: { color: colors.textPrimary, fontSize: typography.bodySize, lineHeight: 22 },
   thinking: { borderLeftWidth: 2, borderLeftColor: colors.borderSubtle, paddingLeft: spacing.md },
   thinkingTitle: { color: colors.textSecondary, fontSize: typography.metaSize, fontWeight: '700', marginBottom: 4 },
   thinkingText: { color: colors.textSecondary, fontSize: typography.metaSize, lineHeight: 18 },

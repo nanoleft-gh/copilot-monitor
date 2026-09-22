@@ -24,7 +24,7 @@ export function createSessionModelConfigurationMutation(
 ): SessionModelConfigurationMutation {
 	const inputState = asObject(state.inputState);
 	const selectedModel = asObject(inputState?.selectedModel);
-	if (!selectedModel || selectedModel.identifier !== modelIdentifier) {
+	if (!selectedModel || !modelIdentifiersMatch(selectedModel.identifier, modelIdentifier)) {
 		throw new Error('The persisted session model no longer matches the requested model.');
 	}
 	const configuration = readConfiguration(selectedModel.modelConfiguration);
@@ -123,4 +123,11 @@ export function createSessionValueMutation(path: readonly (string | number)[], v
 		throw new Error('A non-empty session mutation path is required.');
 	}
 	return { kind: 1, k: [...path], v: value };
+}
+
+function modelIdentifiersMatch(persisted: unknown, requested: string): boolean {
+	if (typeof persisted !== 'string') {
+		return false;
+	}
+	return persisted === requested || persisted.split('/').at(-1) === requested.split('/').at(-1);
 }

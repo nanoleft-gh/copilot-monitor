@@ -6,6 +6,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-nati
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { colors, radii, spacing, typography } from '@/theme/mobile-theme';
 import { loadHosts, removeHost } from '@/transport/host-store';
+import { isLocalEndpoint } from '@/transport/pairing';
 import type { HostProfile } from '@/transport/types';
 
 export default function HomeScreen() {
@@ -91,7 +92,13 @@ export default function HomeScreen() {
                       <Text numberOfLines={1} style={styles.hostTitle}>{host.name}</Text>
                     </View>
                     <Text numberOfLines={1} style={styles.hostEndpoint}>{host.endpoint}</Text>
-                    <Text style={styles.hostStatus}>Saved local pairing</Text>
+                    <Text style={styles.hostStatus}>
+                      {!host.secret
+                        ? 'Needs re-pairing'
+                        : host.endpoints?.some(endpoint => !isLocalEndpoint(endpoint))
+                        ? 'Paired · reachable from anywhere'
+                        : 'Paired · home network'}
+                    </Text>
                   </View>
                   <ChevronRight color={colors.textMuted} size={20} />
                 </Pressable>
@@ -113,7 +120,7 @@ export default function HomeScreen() {
 
         <View style={styles.privacyNote}>
           <View style={styles.onlineDot} />
-          <Text style={styles.privacyText}>Connections stay on your local network.</Text>
+          <Text style={styles.privacyText}>Every connection presents this phone&apos;s pairing secret. Traffic stays on your Wi-Fi unless you add a remote address in VS Code.</Text>
         </View>
       </ScrollView>
     </SafeAreaView>

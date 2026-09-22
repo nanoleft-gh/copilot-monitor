@@ -1,28 +1,35 @@
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
 import {
+	apiCapabilities,
+	apiVersion,
 	CreateSessionResult,
 	GatewayCreateSessionRequest,
 	GatewayEditTurnRequest,
+	GatewayHistoryPageRequest,
 	GatewayPermissionLevelRequest,
 	GatewayRenameSessionRequest,
 	GatewayModelSelectionRequest,
 	GatewayModelConfigurationRequest,
 	GatewaySelectSessionRequest,
+	GatewaySyncSessionRequest,
 	GatewaySendMessageRequest,
 	GatewayState,
 	GatewayToolDecisionRequest,
+	HistoryPageResult,
 	MonitorRequestError,
+	RemoteAccessStatus,
+	RemoteAccessUpdateRequest,
 	SendMessageResult,
 } from './protocol';
+import { StateStreamHub } from './stateStream';
+import { authCookie, clearedAuthCookie, presentedToken, requestIsHttps, tokensMatch } from './gatewayAuth';
 
 const maximumRequestBytes = 64 * 1024;
-
-interface EventClient {
-	readonly response: http.ServerResponse;
-	waitingForDrain: boolean;
-	pendingState?: string;
-}
+/** Minimum spacing between re-reads of the secret file triggered by rejected tokens. */
+const secretRefreshIntervalMs = 2_000;
+/** Interface enumeration is cheap but runs on every broadcast; reuse the answer briefly. */
+const endpointsCacheMs = 5_000;
 
 export interface GatewayBackend {
 	getState(): GatewayState;
@@ -30,6 +37,8 @@ export interface GatewayBackend {
 	sendMessage(request: GatewaySendMessageRequest): Promise<SendMessageResult>;
 	editTurn(request: GatewayEditTurnRequest): Promise<SendMessageResult>;
 	selectSession(request: GatewaySelectSessionRequest): Promise<void>;
+	syncSession(request: GatewaySyncSessionRequest): Promise<void>;
+	loadHistory(request: GatewayHistoryPageRequest): Promise<HistoryPageResult>;
 	selectModel(request: GatewayModelSelectionRequest): Promise<void>;
 	configureModel(request: GatewayModelConfigurationRequest): Promise<void>;
 	renameSession(request: GatewayRenameSessionRequest): Promise<void>;
@@ -46,9 +55,22 @@ export interface GatewayServerOptions {
 	readonly registryId: string;
 	readonly hostId?: string;
 	readonly leaseNonce?: string;
+	readonly ownerId?: string;
 	readonly html: string;
 	readonly mermaidScript?: string;
 	readonly iconSvg?: string;
+	/** Bearer token required on every `/api/*` route except health and auth; re-read after a mismatch so a reset converges. */
+	readonly readPairingSecret: () => Promise<string>;
+	readonly secretRefreshIntervalMs?: number;
+	/** Every URL a client may reach this gateway through (LAN addresses, tunnels); re-read per health request. */
+	readonly getEndpoints?: (port: number) => readonly string[];
+	/** Remote access (dev tunnel) control; absent when the owner cannot run tunnels. */
+	readonly remoteAccess?: RemoteAccessController;
+}
+
+export interface RemoteAccessController {
+	get(): Promise<RemoteAccessStatus>;
+	update(request: RemoteAccessUpdateRequest): Promise<RemoteAccessStatus>;
 }
 
 export interface GatewayAddress {
@@ -59,23 +81,52 @@ export interface GatewayAddress {
 
 export class GatewayServer {
 	private readonly server: http.Server;
-	private readonly eventClients = new Set<EventClient>();
+	private readonly streams: StateStreamHub<GatewayState>;
 	private readonly backendSubscription: { dispose(): void };
-	private heartbeatTimer: NodeJS.Timeout | undefined;
 	private address: GatewayAddress | undefined;
+	private pairingSecret = '';
+	private secretRefreshedAt = 0;
+	private endpointsCache: { at: number; value: readonly string[] } | undefined;
 
 	constructor(
 		private readonly backend: GatewayBackend,
 		private readonly options: GatewayServerOptions,
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
-		this.backendSubscription = backend.onDidChange(state => this.broadcastState(state));
+		this.streams = new StateStreamHub<GatewayState>(() => this.decorate(backend.getState()), {
+			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+		});
+		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(this.decorate(state)));
+	}
+
+	/** Call when a tunnel comes up or goes away so connected clients learn the address at once. */
+	notifyEndpointsChanged(): void {
+		this.endpointsCache = undefined;
+		if (this.address) {
+			this.streams.broadcast(this.decorate(this.backend.getState()));
+		}
+	}
+
+	private currentEndpoints(): readonly string[] {
+		const now = Date.now();
+		if (this.endpointsCache && now - this.endpointsCache.at < endpointsCacheMs) {
+			return this.endpointsCache.value;
+		}
+		const value = this.options.getEndpoints?.(this.address?.port ?? this.options.port) ?? [];
+		this.endpointsCache = { at: now, value };
+		return value;
+	}
+
+	private decorate(state: GatewayState): GatewayState {
+		return { ...state, endpoints: this.currentEndpoints() };
 	}
 
 	async start(): Promise<GatewayAddress> {
 		if (this.address) {
 			return this.address;
 		}
+		this.pairingSecret = await this.options.readPairingSecret();
+		this.secretRefreshedAt = Date.now();
 		await new Promise<void>((resolve, reject) => {
 			const onError = (error: Error) => {
 				this.server.off('listening', onListening);
@@ -96,27 +147,12 @@ export class GatewayServer {
 			port: info.port,
 			url: `http://${this.options.advertisedHost}:${info.port}/`,
 		};
-		this.heartbeatTimer = setInterval(() => {
-			for (const client of this.eventClients) {
-				if (!client.waitingForDrain) {
-					client.response.write(': heartbeat\n\n');
-				}
-			}
-		}, 15_000);
-		this.heartbeatTimer.unref();
 		return this.address;
 	}
 
 	async stop(): Promise<void> {
 		this.backendSubscription.dispose();
-		if (this.heartbeatTimer) {
-			clearInterval(this.heartbeatTimer);
-			this.heartbeatTimer = undefined;
-		}
-		for (const client of this.eventClients) {
-			client.response.end();
-		}
-		this.eventClients.clear();
+		this.streams.closeAll();
 		this.backend.setEventClientCount?.(0);
 		if (this.server.listening) {
 			await new Promise<void>((resolve, reject) => {
@@ -147,22 +183,82 @@ export class GatewayServer {
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/health') {
+				const port = this.address?.port ?? this.options.port;
 				this.sendJson(response, 200, {
 					service: 'githubcopilot-monitor-gateway',
 					registryId: this.options.registryId,
 					...(this.options.hostId ? { hostId: this.options.hostId } : {}),
 					...(this.options.leaseNonce ? { leaseNonce: this.options.leaseNonce } : {}),
-					apiVersion: 3,
-					capabilities: ['sessionRename', 'sessionCreate', 'sessionPermission', 'turnEdit'],
+					...(this.options.ownerId ? { ownerId: this.options.ownerId } : {}),
+					apiVersion,
+					capabilities: apiCapabilities,
+					authRequired: true,
+					authorized: await this.isAuthorized(request),
+					endpoints: this.options.getEndpoints?.(port) ?? [],
 				});
 				return;
 			}
+			if (request.method === 'POST' && url.pathname === '/api/auth') {
+				// Browsers cannot attach headers to EventSource, so the dashboard trades the secret for a cookie once.
+				const body = await this.readJsonBody(request) as { token?: unknown };
+				const token = typeof body.token === 'string' ? body.token : undefined;
+				if (!await this.isAuthorized({ headers: { authorization: token ? `Bearer ${token}` : undefined } })) {
+					response.setHeader('Set-Cookie', clearedAuthCookie());
+					throw new MonitorRequestError(401, 'This pairing code is not valid for this computer.');
+				}
+				response.setHeader('Set-Cookie', authCookie(this.pairingSecret, requestIsHttps(request)));
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (url.pathname.startsWith('/api/') && !await this.isAuthorized(request)) {
+				throw new MonitorRequestError(401, 'Not paired with this computer. Scan its pairing code again.');
+			}
 			if (request.method === 'GET' && url.pathname === '/api/state') {
-				this.sendJson(response, 200, this.backend.getState());
+				this.sendJson(response, 200, this.decorate(this.backend.getState()));
+				return;
+			}
+			if (url.pathname === '/api/remote-access' && (request.method === 'GET' || request.method === 'POST')) {
+				if (!this.options.remoteAccess) {
+					throw new MonitorRequestError(501, 'Remote access is not available on this computer.');
+				}
+				if (request.method === 'GET') {
+					this.sendJson(response, 200, await this.options.remoteAccess.get());
+					return;
+				}
+				const body = await this.readJsonBody(request) as Partial<RemoteAccessUpdateRequest>;
+				if (body.manualUrl !== undefined && body.manualUrl !== null && typeof body.manualUrl !== 'string') {
+					throw new MonitorRequestError(400, 'manualUrl must be a string or null.');
+				}
+				if (body.provider !== undefined && body.provider !== 'devtunnel' && body.provider !== 'ngrok') {
+					throw new MonitorRequestError(400, 'provider must be "devtunnel" or "ngrok".');
+				}
+				const ngrok = body.ngrok && typeof body.ngrok === 'object'
+					? {
+						...(body.ngrok.credential !== undefined ? { credential: body.ngrok.credential === null ? null : String(body.ngrok.credential) } : {}),
+						...(body.ngrok.domain !== undefined ? { domain: body.ngrok.domain === null ? null : String(body.ngrok.domain) } : {}),
+					}
+					: undefined;
+				this.sendJson(response, 200, await this.options.remoteAccess.update({
+					...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+					...(body.provider ? { provider: body.provider } : {}),
+					...(body.manualUrl !== undefined ? { manualUrl: body.manualUrl } : {}),
+					...(ngrok && Object.keys(ngrok).length > 0 ? { ngrok } : {}),
+					...(body.retry === true ? { retry: true } : {}),
+				}));
 				return;
 			}
 			if (request.method === 'GET' && url.pathname === '/api/events') {
-				this.openEventStream(request, response);
+				this.streams.open(request, response, {
+					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
+					countsAsViewer: true,
+				});
+				return;
+			}
+			if (request.method === 'GET' && url.pathname === '/api/presence') {
+				// Follower windows hold this stream open; its closure tells them the gateway is gone.
+				// It carries no state and is not a viewer.
+				const client = this.streams.open(request, response, { protocol: 'none', countsAsViewer: false });
+				client.write(`event: gateway\ndata: ${JSON.stringify({ registryId: this.options.registryId, leaseNonce: this.options.leaseNonce ?? null })}\n\n`);
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/messages') {
@@ -185,6 +281,8 @@ export class GatewayServer {
 					sessionRevision: typeof body.sessionRevision === 'string' ? body.sessionRevision : '',
 					requestId: typeof body.requestId === 'string' ? body.requestId : '',
 					text: typeof body.text === 'string' ? body.text : '',
+					...(typeof body.sourceText === 'string' ? { sourceText: body.sourceText } : {}),
+					...(typeof body.sourceTimestamp === 'number' ? { sourceTimestamp: body.sourceTimestamp } : {}),
 				});
 				this.sendJson(response, 202, result);
 				return;
@@ -198,6 +296,35 @@ export class GatewayServer {
 				}
 				await this.backend.selectSession({ windowId, sessionResource });
 				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/sync') {
+				const body = await this.readJsonBody(request) as Partial<GatewaySyncSessionRequest>;
+				const windowId = typeof body.windowId === 'string' ? body.windowId : '';
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				if (!windowId || !sessionResource) {
+					throw new MonitorRequestError(400, 'Window id and session resource are required.');
+				}
+				await this.backend.syncSession({ windowId, sessionResource });
+				this.sendJson(response, 204, undefined);
+				return;
+			}
+			if (request.method === 'POST' && url.pathname === '/api/sessions/history') {
+				const body = await this.readJsonBody(request) as Partial<GatewayHistoryPageRequest>;
+				const windowId = typeof body.windowId === 'string' ? body.windowId : '';
+				const sessionResource = typeof body.sessionResource === 'string' ? body.sessionResource : '';
+				const sessionRevision = typeof body.sessionRevision === 'string' ? body.sessionRevision : '';
+				if (!windowId || !sessionResource || !sessionRevision) {
+					throw new MonitorRequestError(400, 'Window id, session resource, and revision are required.');
+				}
+				const result = await this.backend.loadHistory({
+					windowId,
+					sessionResource,
+					sessionRevision,
+					before: typeof body.before === 'number' ? body.before : 0,
+					limit: typeof body.limit === 'number' ? body.limit : undefined,
+				});
+				this.sendJson(response, 200, result);
 				return;
 			}
 			if (request.method === 'POST' && url.pathname === '/api/sessions/rename') {
@@ -216,7 +343,8 @@ export class GatewayServer {
 				if (!windowId) {throw new MonitorRequestError(400, 'Window id is required.');}
 				const result = await this.backend.createSession({
 					windowId,
-					sourceSessionResource: typeof body.sourceSessionResource === 'string' ? body.sourceSessionResource : undefined,
+					...(typeof body.id === 'string' ? { id: body.id } : {}),
+					...(typeof body.sourceSessionResource === 'string' ? { sourceSessionResource: body.sourceSessionResource } : {}),
 				});
 				this.sendJson(response, 201, result);
 				return;
@@ -285,6 +413,23 @@ export class GatewayServer {
 		}
 	}
 
+	private async isAuthorized(request: Pick<http.IncomingMessage, 'headers'>): Promise<boolean> {
+		const token = presentedToken(request);
+		if (tokensMatch(this.pairingSecret, token)) {
+			return true;
+		}
+		if (!token || Date.now() - this.secretRefreshedAt < (this.options.secretRefreshIntervalMs ?? secretRefreshIntervalMs)) {
+			return false;
+		}
+		this.secretRefreshedAt = Date.now();
+		try {
+			this.pairingSecret = await this.options.readPairingSecret();
+		} catch {
+			return false;
+		}
+		return tokensMatch(this.pairingSecret, token);
+	}
+
 	private sendHtml(response: http.ServerResponse): void {
 		response.writeHead(200, {
 			'Cache-Control': 'no-store',
@@ -321,53 +466,6 @@ export class GatewayServer {
 			'X-Content-Type-Options': 'nosniff',
 		});
 		response.end(JSON.stringify(value));
-	}
-
-	private openEventStream(request: http.IncomingMessage, response: http.ServerResponse): void {
-		response.writeHead(200, {
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'X-Accel-Buffering': 'no',
-		});
-		response.flushHeaders();
-		const client: EventClient = { response, waitingForDrain: false };
-		this.eventClients.add(client);
-		this.backend.setEventClientCount?.(this.eventClients.size);
-		this.writeState(client, JSON.stringify(this.backend.getState()));
-		request.on('close', () => {
-			this.eventClients.delete(client);
-			this.backend.setEventClientCount?.(this.eventClients.size);
-		});
-	}
-
-	private broadcastState(state: GatewayState): void {
-		const serialized = JSON.stringify(state);
-		for (const client of this.eventClients) {
-			this.writeState(client, serialized);
-		}
-	}
-
-	private writeState(client: EventClient, serializedState: string): void {
-		if (client.waitingForDrain) {
-			client.pendingState = serializedState;
-			return;
-		}
-		if (client.response.write(`event: state\ndata: ${serializedState}\n\n`)) {
-			return;
-		}
-		client.waitingForDrain = true;
-		client.response.once('drain', () => {
-			if (!this.eventClients.has(client)) {
-				return;
-			}
-			client.waitingForDrain = false;
-			const pendingState = client.pendingState;
-			client.pendingState = undefined;
-			if (pendingState !== undefined) {
-				this.writeState(client, pendingState);
-			}
-		});
 	}
 
 	private async readJsonBody(request: http.IncomingMessage): Promise<unknown> {

@@ -4,15 +4,25 @@ import * as vscode from 'vscode';
 interface MonitorAddress {
 	readonly port: number;
 	readonly url: string;
+	/** `url` with the pairing secret in its fragment. */
+	readonly pairingUrl: string;
+}
+
+function authHeaders(address: MonitorAddress): Record<string, string> {
+	const secret = new URLSearchParams(new URL(address.pairingUrl).hash.replace(/^#/, '')).get('k') ?? '';
+	return { Authorization: `Bearer ${secret}` };
 }
 
 suite('Copilot Monitor extension', () => {
 	teardown(async () => {
-		await vscode.commands.executeCommand('githubCopilotMonitor.stop', false);
+		const commands = await vscode.commands.getCommands(true);
+		if (commands.includes('githubCopilotMonitor.stop')) {
+			await vscode.commands.executeCommand('githubCopilotMonitor.stop', false);
+		}
 	});
 
-	test('activates and serves its tokenless aggregate dashboard', async () => {
-		const extension = vscode.extensions.getExtension('maheshdoiphode.githubcopilot-monitor');
+	test('activates and serves its aggregate dashboard behind the pairing secret', async () => {
+		const extension = vscode.extensions.getExtension('nanoleft.githubcopilot-monitor');
 		assert.ok(extension, 'Extension is installed in the development host.');
 		await extension.activate();
 
@@ -26,6 +36,7 @@ suite('Copilot Monitor extension', () => {
 		);
 		assert.ok(address);
 		assert.ok(address.port > 0);
+		assert.match(address.pairingUrl, /#k=/);
 
 		const pageResponse = await fetch(address.url);
 		assert.equal(pageResponse.status, 200);
@@ -33,10 +44,70 @@ suite('Copilot Monitor extension', () => {
 
 		const stateUrl = new URL(address.url);
 		stateUrl.pathname = '/api/state';
-		const stateResponse = await fetch(stateUrl);
+		assert.equal((await fetch(stateUrl)).status, 401, 'state is not readable without the secret');
+		const stateResponse = await fetch(stateUrl, { headers: authHeaders(address) });
 		assert.equal(stateResponse.status, 200);
 		const state = await stateResponse.json() as { version: number; windows: unknown[] };
 		assert.equal(state.version, 2);
 		assert.ok(Array.isArray(state.windows));
+	});
+
+	test('creates new local chats from the gateway and identifies each one', async function () {
+		this.timeout(60_000);
+		const commands = await vscode.commands.getCommands(true);
+		if (!commands.includes('workbench.action.chat.newLocalChat')) {
+			return; // Chat is not available in this test host.
+		}
+		console.log(`[probe] voice bridge available: ${commands.includes('_chat.voice.getCurrentSession')}`);
+		const address = await vscode.commands.executeCommand<MonitorAddress>('githubCopilotMonitor.start', { silent: true });
+		assert.ok(address);
+		const base = new URL(address.url);
+		const headers = authHeaders(address);
+		// The gateway is machine-wide and may be owned by another VS Code; wait until it lists this window.
+		const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+		let windowId: string | undefined;
+		for (let attempt = 0; attempt < 100 && !windowId; attempt++) {
+			const state = await (await fetch(new URL('/api/state', base), { headers })).json() as { windows: Array<{ windowId: string; workspaceFolders: string[]; connected: boolean }> };
+			windowId = state.windows.find(window => window.connected && window.workspaceFolders.some(candidate => candidate.toLowerCase() === folder.toLowerCase()))?.windowId;
+			if (!windowId) {
+				await new Promise(resolve => setTimeout(resolve, 100));
+			}
+		}
+		assert.ok(windowId, `this window (${folder}) is registered with the gateway`);
+
+		// Hold an event stream open so the window counts a viewer and attaches its watchers.
+		const abort = new AbortController();
+		const events = await fetch(new URL('/api/events?v=2', base), { signal: abort.signal, headers });
+		assert.equal(events.status, 200);
+		try {
+			const create = async (id: string) => {
+				const response = await fetch(new URL('/api/sessions/new', base), {
+					method: 'POST',
+					headers: { ...headers, 'Content-Type': 'application/json' },
+					body: JSON.stringify({ id, windowId }),
+				});
+				return { status: response.status, body: await response.json() as { sessionResource?: string; error?: string } };
+			};
+			const first = await create('it-new-1');
+			// Without Copilot Chat there is no agent to run the persisting slash command, so VS Code
+			// keeps the new chat in memory only; the API must then fail cleanly instead of hanging.
+			const hasAgent = vscode.extensions.getExtension('GitHub.copilot-chat')?.packageJSON?.version !== '0.0.0';
+			if (!hasAgent && first.status === 504) {
+				console.log(`[probe] no chat agent in this host; creation reported: ${first.body.error}`);
+				return;
+			}
+			assert.equal(first.status, 201, first.body.error);
+			assert.ok(first.body.sessionResource?.startsWith('vscode-chat-session://local/'), `got ${first.body.sessionResource}`);
+			const second = await create('it-new-2');
+			assert.equal(second.status, 201, second.body.error);
+			assert.notEqual(first.body.sessionResource, second.body.sessionResource, 'each new chat gets its own identity');
+
+			const after = await (await fetch(new URL('/api/state', base), { headers })).json() as { windows: Array<{ windowId: string; activeSessionResource?: string; sessions: Array<{ resource: string; isEmpty?: boolean }> }> };
+			const thisWindow = after.windows.find(window => window.windowId === windowId)!;
+			assert.ok(thisWindow.sessions.some(session => session.resource === second.body.sessionResource), 'the created chat is listed for the viewer');
+			assert.equal(thisWindow.activeSessionResource, second.body.sessionResource, 'the created chat is the selected one');
+		} finally {
+			abort.abort();
+		}
 	});
 });

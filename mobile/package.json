@@ -1,7 +1,7 @@
 {
   "name": "copilot-monitor-mobile",
   "main": "expo-router/entry",
-  "version": "0.1.1",
+  "version": "2.0.0",
   "packageManager": "pnpm@10.26.2",
   "dependencies": {
     "@expo/ui": "~57.0.7",
@@ -25,20 +25,21 @@
     "lucide-react-native": "^1.24.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "react-native": "0.86.0",
+    "react-native": "0.86.3",
     "react-native-gesture-handler": "~2.32.0",
-    "react-native-reanimated": "4.5.0",
+    "react-native-markdown-display": "7.0.2",
+    "react-native-reanimated": "4.5.1",
     "react-native-safe-area-context": "~5.7.0",
-    "react-native-screens": "4.25.2",
+    "react-native-screens": "4.26.2",
     "react-native-svg": "15.15.4",
     "react-native-web": "~0.21.0",
-    "react-native-worklets": "0.10.0"
+    "react-native-worklets": "0.10.1"
   },
   "devDependencies": {
     "@expo/config-plugins": "~57.0.2",
     "@types/react": "~19.2.2",
     "eslint": "^9.39.5",
-    "eslint-config-expo": "57.0.0",
+    "eslint-config-expo": "57.0.2",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -49,8 +50,9 @@
     "web": "expo start --web",
     "go": "expo start --port 18086",
     "lint": "expo lint",
+    "test": "node --experimental-strip-types --test scripts/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "validate": "pnpm typecheck && pnpm lint"
+    "validate": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "private": true
 }

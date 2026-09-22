@@ -1,8 +1,13 @@
 export type HostProfile = {
   id: string;
   name: string;
+  /** The address that worked most recently; tried first on every connection. */
   endpoint: string;
+  /** Every address the computer advertised (LAN interfaces, tunnel URLs); probed when `endpoint` fails. */
+  endpoints?: string[];
   lastConnected: number;
+  /** Pairing secret, held in memory only; persisted separately in the device keystore. */
+  secret?: string;
 };
 
 export type GatewayHealth = {
@@ -10,6 +15,9 @@ export type GatewayHealth = {
   hostId: string;
   registryId: string;
   apiVersion: number;
+  authRequired: boolean;
+  authorized: boolean;
+  endpoints: string[];
 };
 
 export type TranscriptActivity = {
@@ -79,7 +87,13 @@ export type SessionSummary = {
   title: string;
   status: 'idle' | 'working' | 'loading';
   updatedAt?: number;
+  /** Exact request count; only known for the chat the computer is currently tailing and for empty chats. */
   turnCount?: number;
+  /** Whether the chat has no requests, from VS Code's index; undefined while unknown. */
+  isEmpty?: boolean;
+  historyUnavailable?: 'archived' | 'oversized' | 'indexing';
+  historyTruncated?: boolean;
+  historyStart?: number;
   turns: TranscriptTurn[];
   modelName?: string;
   model?: SessionModelState;
@@ -100,4 +114,15 @@ export type GatewaySnapshot = {
   version: 2;
   gatewayStartedAt: number;
   windows: WindowSnapshot[];
+  /** Every address the gateway answers on right now; learned live so no re-pairing is needed. */
+  endpoints?: string[];
+};
+
+export type HistoryPage = {
+  turns: TranscriptTurn[];
+  totalCount: number;
+  start: number;
+  end: number;
+  hasEarlier: boolean;
+  revision: string;
 };

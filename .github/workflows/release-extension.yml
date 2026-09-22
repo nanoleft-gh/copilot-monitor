@@ -78,7 +78,7 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           mkdir -p release
-          npx --yes @vscode/vsce@3.9.2 package --no-dependencies --out "release/copilot-monitor-extension-$VERSION.vsix"
+          npx --yes @vscode/vsce@3.9.2 package --out "release/copilot-monitor-extension-$VERSION.vsix"
           sha256sum "release/copilot-monitor-extension-$VERSION.vsix" > "release/copilot-monitor-extension-$VERSION.vsix.sha256"
 
       - name: Publish to VS Code Marketplace

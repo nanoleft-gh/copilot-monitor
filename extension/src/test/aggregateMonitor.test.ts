@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { AggregateMonitor } from '../aggregateMonitor';
 import { MonitorBackend, MonitorServer } from '../monitorServer';
-import { CreateSessionRequest, EditTurnRequest, ModelConfigurationRequest, ModelSelectionRequest, MonitorState, PermissionLevelRequest, RenameSessionRequest, SendMessageRequest, ToolDecisionRequest } from '../protocol';
+import { CreateSessionRequest, EditTurnRequest, HistoryPageRequest, ModelConfigurationRequest, ModelSelectionRequest, MonitorState, PermissionLevelRequest, RenameSessionRequest, SendMessageRequest, ToolDecisionRequest } from '../protocol';
 import { WindowRegistry } from '../windowRegistry';
 
 class TestWindowBackend implements MonitorBackend {
@@ -18,6 +18,7 @@ class TestWindowBackend implements MonitorBackend {
 	renames: RenameSessionRequest[] = [];
 	created: CreateSessionRequest[] = [];
 	permissions: PermissionLevelRequest[] = [];
+	historyRequests: HistoryPageRequest[] = [];
 	eventClientCounts: number[] = [];
 	private readonly listeners = new Set<(state: MonitorState) => void>();
 
@@ -40,6 +41,11 @@ class TestWindowBackend implements MonitorBackend {
 
 	async selectSession(resource: string): Promise<void> {
 		this.selected.push(resource);
+	}
+
+	async loadHistory(request: HistoryPageRequest) {
+		this.historyRequests.push(request);
+		return { turns: [], totalCount: 100, start: 20, end: 40, hasEarlier: true, revision: request.sessionRevision };
 	}
 
 	setEventClientCount(count: number): void {
@@ -71,7 +77,7 @@ describe('AggregateMonitor', () => {
 		const secondServer = new MonitorServer(secondBackend, { host: '127.0.0.1', port: 0 });
 		const firstRegistry = new WindowRegistry(root, 'window-1');
 		const secondRegistry = new WindowRegistry(root, 'window-2');
-		const aggregate = new AggregateMonitor(root, 25);
+		const aggregate = new AggregateMonitor(root, { scanDebounceMs: 25 });
 
 		try {
 			const firstAddress = await firstServer.start();
@@ -81,8 +87,8 @@ describe('AggregateMonitor', () => {
 			await aggregate.start();
 
 			await waitFor(() => aggregate.getState().windows.every(window => window.connected), 2_000);
-			assert.equal(firstBackend.eventClientCounts.at(-1), 0);
-			assert.equal(secondBackend.eventClientCounts.at(-1), 0);
+			// The relay link is not a viewer; the gateway forwards its own viewer count (currently 0).
+			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 0 && secondBackend.eventClientCounts.at(-1) === 0, 2_000);
 			aggregate.setEventClientCount(2);
 			await waitFor(() => firstBackend.eventClientCounts.at(-1) === 2 && secondBackend.eventClientCounts.at(-1) === 2, 2_000);
 			assert.deepEqual(
@@ -101,6 +107,13 @@ describe('AggregateMonitor', () => {
 			await aggregate.selectSession({ windowId: 'window-1', sessionResource: 'session-1' });
 			assert.deepEqual(firstBackend.selected, ['session-1']);
 			assert.equal(secondBackend.selected.length, 0);
+
+			const history = await aggregate.loadHistory({
+				windowId: 'window-2', sessionResource: 'session-2', sessionRevision: 'rev-2', before: 40, limit: 20,
+			});
+			assert.deepEqual(history, { turns: [], totalCount: 100, start: 20, end: 40, hasEarlier: true, revision: 'rev-2' });
+			assert.equal(firstBackend.historyRequests.length, 0);
+			assert.deepEqual(secondBackend.historyRequests, [{ sessionResource: 'session-2', sessionRevision: 'rev-2', before: 40, limit: 20 }]);
 
 			await aggregate.decideTool({
 				windowId: 'window-2',
@@ -128,8 +141,8 @@ describe('AggregateMonitor', () => {
 
 			await aggregate.renameSession({ windowId: 'window-1', sessionResource: 'session-1', title: 'Renamed' });
 			assert.deepEqual(firstBackend.renames, [{ sessionResource: 'session-1', title: 'Renamed' }]);
-			assert.deepEqual(await aggregate.createSession({ windowId: 'window-2', sourceSessionResource: 'session-2' }), { sessionResource: 'new-session' });
-			assert.deepEqual(secondBackend.created, [{ sourceSessionResource: 'session-2' }]);
+			assert.deepEqual(await aggregate.createSession({ id: 'new-1', windowId: 'window-2', sourceSessionResource: 'session-2' }), { sessionResource: 'new-session' });
+			assert.deepEqual(secondBackend.created, [{ id: 'new-1', sourceSessionResource: 'session-2' }]);
 			await aggregate.setPermissionLevel({ windowId: 'window-1', sessionResource: 'session-1', permissionLevel: 'autoApprove' });
 			assert.deepEqual(firstBackend.permissions, [{ sessionResource: 'session-1', permissionLevel: 'autoApprove' }]);
 
@@ -142,6 +155,43 @@ describe('AggregateMonitor', () => {
 			await secondRegistry.stop();
 			await firstServer.stop();
 			await secondServer.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it('drops a crashed window after bounded reconnects and purges its descriptor', async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), 'copilot-monitor-aggregate-'));
+		const backend = new TestWindowBackend(createState('window-crash', 'Crashing'));
+		const server = new MonitorServer(backend, { host: '127.0.0.1', port: 0 });
+		const registry = new WindowRegistry(root, 'window-crash');
+		const aggregate = new AggregateMonitor(root, { scanDebounceMs: 25, reconnectDelaysMs: [20, 40] });
+		const states: number[] = [];
+		const subscription = aggregate.onDidChange(state => states.push(state.windows.filter(window => window.connected).length));
+
+		try {
+			const address = await server.start();
+			await registry.start(descriptor(address.port, 'Crashing', 1));
+			await aggregate.start();
+			await waitFor(() => aggregate.getState().windows.some(window => window.connected), 2_000);
+
+			// Simulate a crash: the bridge disappears, the descriptor file stays behind.
+			const descriptorPath = path.join(root, 'window-crash.json');
+			await fs.stat(descriptorPath);
+			(registry as unknown as { watcher?: { dispose(): void } }).watcher?.dispose();
+			await server.stop();
+
+			await waitFor(() => aggregate.getState().windows.length === 0, 3_000);
+			const deadline = Date.now() + 1_000;
+			while (await fs.stat(descriptorPath).then(() => true, () => false)) {
+				assert.ok(Date.now() < deadline, 'the stale descriptor is purged');
+				await new Promise(resolve => setTimeout(resolve, 20));
+			}
+			assert.ok(states.includes(0), 'listeners observe the window going offline');
+		} finally {
+			subscription.dispose();
+			aggregate.dispose();
+			await registry.stop();
+			await server.stop().catch(() => undefined);
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

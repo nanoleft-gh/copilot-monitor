@@ -42,9 +42,10 @@ export class NativeInputStateSync implements Disposable {
 	constructor(private readonly options: NativeInputStateSyncOptions) {
 		this.scheduler = options.scheduler ?? defaultScheduler;
 		this.debounceMs = options.debounceMs ?? 75;
-		this.watchedPollIntervalMs = options.watchedPollIntervalMs ?? 1_000;
-		this.fallbackPollIntervalMs = options.fallbackPollIntervalMs ?? 250;
-		this.watcherRetryIntervalMs = options.watcherRetryIntervalMs ?? 1_000;
+		// 0 disables the safety poll while a file watcher is alive: watcher events are the only trigger.
+		this.watchedPollIntervalMs = options.watchedPollIntervalMs ?? 0;
+		this.fallbackPollIntervalMs = options.fallbackPollIntervalMs ?? 30_000;
+		this.watcherRetryIntervalMs = options.watcherRetryIntervalMs ?? 5_000;
 	}
 
 	start(): void {
@@ -54,6 +55,16 @@ export class NativeInputStateSync implements Disposable {
 		this.tryCreateWatcher();
 		this.schedulePoll();
 		this.requestRefresh(0);
+	}
+
+	/** Releases the watcher and timers but leaves the instance ready for a later `start()`. */
+	stop(): void {
+		this.readPending = false;
+		this.clearTimer('debounceTimer');
+		this.clearTimer('pollTimer');
+		this.clearTimer('watcherRetryTimer');
+		this.watcher?.dispose();
+		this.watcher = undefined;
 	}
 
 	requestRefresh(delayMs = this.debounceMs): void {
@@ -75,12 +86,7 @@ export class NativeInputStateSync implements Disposable {
 
 	dispose(): void {
 		this.disposed = true;
-		this.readPending = false;
-		this.clearTimer('debounceTimer');
-		this.clearTimer('pollTimer');
-		this.clearTimer('watcherRetryTimer');
-		this.watcher?.dispose();
-		this.watcher = undefined;
+		this.stop();
 	}
 
 	private tryCreateWatcher(): void {
@@ -121,6 +127,9 @@ export class NativeInputStateSync implements Disposable {
 		}
 		this.clearTimer('pollTimer');
 		const delayMs = this.watcher ? this.watchedPollIntervalMs : this.fallbackPollIntervalMs;
+		if (delayMs <= 0) {
+			return;
+		}
 		this.pollTimer = this.scheduler.setTimeout(() => {
 			this.pollTimer = undefined;
 			this.requestRefresh(0);

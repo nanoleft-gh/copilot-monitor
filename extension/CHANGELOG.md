@@ -1,5 +1,103 @@
 # Changelog
 
+## [2.0.0]
+
+Pair once, reach your computer from anywhere. This release adds a pairing secret, one-click remote access over free tunnels, self-healing connections on the phone, and markdown on mobile.
+
+![Remote access with a VS Code dev tunnel](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-4-vs-tunnel-remote-access.png)
+
+### Security: pairing secret
+
+- Every `/api/*` route except `/api/health` now requires the computer's pairing secret (`Authorization: Bearer …`). The secret is minted once per computer in the shared state directory, shared by every VS Code window so gateway failover keeps it, and compared in constant time.
+- The QR code and *Copy pairing link* carry it in the URL fragment (`#k=…`), which never reaches any server or log. The browser dashboard trades it for an `HttpOnly; SameSite=Strict` cookie via `POST /api/auth` and drops it from the address bar.
+- `Copilot Monitor: Reset Pairing Secret` rotates it; other windows converge because the gateway re-reads the secret file when it sees a token it does not know.
+
+### Remote access without a paid server
+
+- **One click.** *Turn on remote access* in the sidebar forwards the gateway port through a Microsoft dev tunnel by running the `code-tunnel` CLI that ships inside VS Code, with the same stdin/stderr protocol the Ports view uses (`tunnel forward-internal`). No proposed API, no manual forwarding. If GitHub is not signed in, the sidebar offers the sign-in and continues on its own. The CLI persists its tunnel, so the `https://<id>-43121.<cluster>.devtunnels.ms/` address survives restarts and reboots.
+- **ngrok** as an alternative service. Paste **either** an ngrok API key or an agent authtoken (they look alike; the extension tells them apart and mints a dedicated authtoken from an API key). The agent runs with `--url https://`, which binds the account's stable auto-assigned dev domain, so the address is permanent on the free plan too. A reserved domain can pin a chosen name. If the agent is not on PATH, the sidebar shows the install command for your OS.
+- **Your own route** (Tailscale, Cloudflare Tunnel, reverse proxy) can be entered as a manual address.
+- Remote access is a machine-wide choice stored next to the pairing secret — not a VS Code setting — owned by the window that runs the gateway and managed from any window through the authenticated `GET`/`POST /api/remote-access` routes. Leadership changes move the tunnel to the new owner.
+
+![ngrok setup in the sidebar](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-2-remote-access-ngrok.png)
+
+### Connections that heal themselves
+
+- `/api/health` advertises every address the gateway answers on (`endpoints`): all physical LAN interfaces plus the active tunnel and any manual URL. The same list is streamed in every state snapshot and pushed the moment a tunnel comes up or goes away, so a phone paired at home learns a remote address added later without re-scanning, and a phone on the tunnel learns a changed home IP.
+- One pairing code for home and away: the QR carries every address (`#k=<secret>&e=<addresses>`); the app pairs through whichever answers and remembers all of them. A **Home Wi-Fi / Anywhere** picker chooses which address a phone camera opens first.
+- Phones probe LAN candidates in parallel, then remote ones, then fall back to a subnet scan when the last-good address fails.
+
+![One code for home and away](https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/extension-3-vs-tunnel-dash.png)
+
+### Fixes
+
+- Chats no longer flash "Working" after being opened and left on the phone: replaying an existing transcript on attach, and log lines that touched no turn, were counted as activity.
+- The dashboard's event stream backs off instead of reconnecting every 250 ms when it dies before its first snapshot.
+- Removed the short-lived `githubCopilotMonitor.remoteAccess` / `remoteUrl` settings and the `Set Remote Access URL` command; the sidebar is the single place to manage remote access. Renamed *Copy Dashboard URL* to *Copy Pairing Link*.
+
+### Wire protocol
+
+- `apiVersion` stays 4; new capability `remoteAccess`. New routes: `POST /api/auth`, `GET`/`POST /api/remote-access`. `GET /api/health` adds `authRequired`, `authorized`, `endpoints`. `GatewayState` adds `endpoints`.
+
+## [1.2.3]
+
+- Fixed effort/context (and rename, approval-mode fallback) changes made from the dashboard or phone not reaching VS Code. These are written to the session log, which VS Code reads only when it loads a session; the previous "open in editor and close it" release did nothing while the chat panel still held the session. The session is now gathered into the panel, the panel is moved to a fresh blank chat so the last reference drops, VS Code's own dispose-time write is allowed to land, the change is appended, and the session is shown again from disk.
+- Without the voice bridge, focusing a chat now lands it in the chat panel (open as editor, then "Move Chat into Side Bar") instead of leaving editor tabs behind; the panel is also what VS Code's own model-selection command acts on.
+
+## [1.2.2]
+
+- Fixed "VS Code created a chat but did not expose its session identity" when creating a chat from the dashboard or phone. The internal `_chat.voice.*` commands the monitor relied on exist only while `agents.voice.enabled` is on; VS Code offers no other way to ask for a new chat's identity, so the monitor now makes VS Code persist its live chats (a no-op rename of an existing chat runs the chat service's immediate save) and identifies the new chat from the session file that appears.
+- Fixed the selected model snapping back to the previous one after changing it from the phone. The panel's stored selection is read from VS Code's storage, which flushes lazily, so a read right after the change still named the old model and overwrote the new one; a selection the monitor made now outranks such reads until storage confirms it. The same read no longer requires the voice bridge to know which chat is focused.
+- Switching models now applies the effort/context VS Code remembers for that model, as VS Code itself does, instead of the model's schema defaults.
+
+## [1.2.1]
+
+- Read the model list from VS Code's own cached picker list (`chat.cachedLanguageModels.v2`) instead of Copilot's debug `models.json`, so newly rolled-out models appear in the dashboard and mobile app exactly when they appear in VS Code, with VS Code's own effort/context options. The debug-log file was only written with debug logging enabled and had gone stale.
+- Fixed a stale model overlay: when VS Code was switched to a model the dashboard did not know, the previous selection stayed displayed and changing effort/context failed with "VS Code is still applying the selected model". The overlay is now recomputed from VS Code's storage on every change and dropped when it cannot be resolved.
+- Model configuration changes no longer depend on the session log having caught up with VS Code's selection; the persisted value is reproduced from the catalog entry VS Code itself stores.
+- Hid blank "New Chat" sessions VS Code leaves behind, except the chat that is selected, focused in VS Code, or was just created from a phone; the session list carries `isEmpty` so clients can tell an empty chat from one whose count is simply not loaded.
+- The first viewer now opens on the chat VS Code has focused (falling back to the newest chat with content) instead of the most recently touched blank chat.
+- Session lists no longer claim "0 turns" for chats that are not being tailed; they show the exact count when known, "Ready to chat" for empty chats, and the last-activity time otherwise.
+
+## [1.2.0]
+
+Event-driven core. The extension no longer polls, schedules exports, or re-reads whole chat logs; every piece of work is triggered by a file-system event, a connection event, or a user action. This fixes the machine-wide hangs caused by the previous 2-second live exports and full-file re-reads of large chats.
+
+- Replaced the session watcher with `SessionCore`: non-recursive `fs.watch` on the exact `chatSessions`, `transcripts`, `debug-logs` and `state.vscdb` directories, with Windows-safe ancestor watching so a deleted-and-recreated directory is picked up again.
+- Added `LineTailer`, which reads only new bytes from a remembered offset and verifies file identity (inode, size, anchor hash) so VS Code's in-place session log compaction, Copilot's debug log truncation, and rotations are detected and replayed instead of producing corrupt transcripts.
+- Added `SessionLogProjection`, an incremental projection of VS Code's mutation log that keeps the newest 40 turns and compact summaries for the rest; verified byte-identical against a full replay on real 2 MB and 46 MB logs.
+- Read the session list from VS Code's own SQLite session index instead of scanning and parsing every log file; locked reads are retried with backoff.
+- Merged live transcript and debug log turns with persisted turns by user text and timestamp, never overriding sealed history; tools outstanding for two seconds become approvable and trigger a single stall-probe export.
+- Removed the periodic live export entirely; exports now happen only on demand (`POST /api/sessions/sync`), for a stall probe, or after a model-state command.
+- Made everything viewer-gated: with no dashboard or phone connected there are no watchers, no tailers, and no timers.
+- Replaced 2-second window registry heartbeats with a publish-once descriptor that self-heals through `fs.watch`; the gateway discovers windows from registry events and treats its connection to each window as the liveness signal, purging descriptors of crashed windows after bounded reconnects.
+- Removed the gateway lease heartbeat and the 2-second coordinator loop; leases are validated by the gateway's health nonce and followers hold an idle `GET /api/presence` stream whose closure triggers immediate re-election.
+- Made the sidebar QR view re-render on address-change events instead of refreshing every 2 seconds, with an explicit Start state after the monitor is stopped.
+- Ran SSE keepalive intervals only while a stream is open.
+- Native model/effort/context synchronization no longer polls while its SQLite watcher is healthy.
+- Bumped the gateway/bridge `apiVersion` to 4 and added the `sessionSync` capability; the `MonitorState` and `GatewayState` payloads are unchanged, so existing dashboards and mobile apps keep working.
+- Added the `eventsV2` delta stream (`GET /api/events?v=2`): one snapshot, then compact JSON patches with string-append and keyed-array operations, so streaming responses send only their new text and a sliding turn window sends only the new turn. The dashboard, the mobile app, and the gateway’s relay to each window use it; protocol 1 remains available.
+- Made the SSE hub keep its own copy of the last streamed state so patches stay correct even if a backend mutates state in place, and coalesced updates for slow sockets into one catch-up patch.
+- Removed the progressive transcript, session state cache, and bounded file read modules that the new core made unnecessary.
+
+## [1.1.3]
+
+- Made machine-wide window registry heartbeats atomic and serialized so concurrent VS Code Insiders windows cannot expose empty or stale descriptors.
+- Recovered a briefly missing lease from the healthy same-host gateway during rolling extension updates instead of replacing it on a random port.
+- Clarified that each window's random loopback bridge is internal while all windows share one stable machine-wide pairing gateway.
+- Refreshed the advertised LAN address for QR, open, and copy actions after Wi-Fi or hotspot changes without restarting VS Code.
+- Replaced large-chat placeholders with progressive 40-turn history pages using compact transcript indexes or background mutation-log workers.
+- Preserved real titles, prompts, assistant responses, completion state, and editable request IDs while discarding giant tool/result payloads from remote history.
+- Cached compact mutation indexes by source fingerprint and bounded cache growth; first indexing stays off the extension-host event loop and later opens use the cache.
+- Limited startup transcript parsing to 32 MB per workspace and retained only the newest 120 turns per loaded chat while preserving total counts.
+- Added Earlier/Newer paging on desktop and Android with constant client memory and variable-page boundary safety.
+- Added explicit indexing and truncated-history states so background work never appears as indefinite loading or missing history.
+- Fixed a poll fallthrough that alternated unchanged progressive pages with large-chat placeholders, causing visible flashing.
+- Added change-only, privacy-safe history transition diagnostics in the Copilot Monitor output channel and browser console.
+- Used bounded stable reads and combined primary/supplement budgets so concurrently growing transcript files cannot bypass memory limits.
+- Rejected oversized live-export payloads before cloning, parsing, or retaining them in the monitor.
+- Serialized sidebar refreshes so slow gateway startup cannot accumulate overlapping asynchronous work.
+
 ## [1.1.0]
 
 - Fixed a Stable VS Code race where a blank chat was created successfully but its asynchronously persisted identity appeared just after the New Chat request returned an error.

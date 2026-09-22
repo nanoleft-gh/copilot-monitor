@@ -1,9 +1,18 @@
 # Copilot Monitor Mobile
 
-The Copilot Monitor mobile app connects to the local gateway exposed by the
-Copilot Monitor VS Code extension. It can follow GitHub Copilot Chat sessions,
-send and edit requests, select models and model configuration, change approval
-modes, and approve pending tools from an Android or iOS device.
+The Copilot Monitor mobile app connects to the gateway exposed by the Copilot
+Monitor VS Code extension. It can follow GitHub Copilot Chat sessions, send and
+edit requests, select models and model configuration, change approval modes,
+and approve pending tools from an Android or iOS device — on your Wi-Fi or,
+once remote access is turned on in VS Code, from anywhere.
+
+<p align="center">
+  <img alt="Home screen with paired computers" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-1-home-screen.jpeg" width="19%">
+  <img alt="Conversations list" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-2-conversations-list.jpeg" width="19%">
+  <img alt="Open conversation with markdown replies" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-3-opened-conversation.jpeg" width="19%">
+  <img alt="Thinking effort picker" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-4-thinking-effort-edit.jpeg" width="19%">
+  <img alt="Edit and resubmit a request" src="https://raw.githubusercontent.com/nanoleft-gh/copilot-monitor/master/demo/mobile-6-edit-message-for-resubmitting.jpeg" width="19%">
+</p>
 
 The application is built with Expo and React Native. Expo is the project
 toolchain and native build system; it does not mean the released application is
@@ -85,15 +94,18 @@ local network or through an Expo development tunnel.
 1. Install and start the Copilot Monitor VS Code extension.
 2. Open the Copilot Monitor sidebar in VS Code.
 3. In the mobile app, choose **Pair computer**.
-4. Scan the QR code or paste the gateway URL.
+4. Scan the QR code or paste the pairing link.
 
-The default gateway port is `43121`. Pairing stores the computer's persistent
-host identity and current LAN endpoint. If the LAN address changes, the app
-attempts bounded discovery on the phone's current `/24` subnet and accepts only
-a gateway reporting the same persistent host identity.
+The default gateway port is `43121`. The code carries the computer's pairing
+secret and every address the computer answers on (LAN interfaces, tunnel,
+manual URL). The app pairs through whichever address answers, stores the secret
+in the device keystore, and presents it as a bearer token on every request.
 
-The gateway is intentionally tokenless. Use it only on a trusted private
-network and do not expose port `43121` to the public internet.
+After pairing the app keeps itself connected: it learns address changes from
+the live stream, probes LAN then remote addresses when the last-good one fails,
+falls back to a verified subnet scan on Wi-Fi, and retries immediately on
+network changes or when returning to the foreground. Another scan is needed
+only when the computer's pairing secret is reset.
 
 ## Native Development Builds
 
@@ -153,7 +165,10 @@ The shared Expo configuration lives in `app.json`.
 - iOS includes local-network privacy text and an App Transport Security local
   networking exception for the HTTP gateway.
 - Camera permission is used only to scan pairing QR codes.
-- Persistent paired hosts are stored with AsyncStorage.
+- Paired hosts (identity, name, addresses) are stored with AsyncStorage; the
+  pairing secret is stored with `expo-secure-store`.
+- Assistant replies render as markdown with `react-native-markdown-display`,
+  with a plain-text fallback if rendering fails.
 
 ## iOS Compatibility Status
 
@@ -194,17 +209,22 @@ pnpm validate    # TypeScript and lint
 
 ### Computer becomes unavailable after changing networks
 
-Open the saved computer and use Refresh. The app tries the saved endpoint, the
-standard gateway port, and then verified local-subnet discovery. If discovery
-cannot find the matching host, confirm VS Code is running and scan the current
-QR code again.
+Open the saved computer and use Refresh. The app tries the saved address, every
+other address the computer advertised (other interfaces, tunnel), and then a
+verified local-subnet scan. If nothing answers, confirm VS Code is running; if
+the computer's pairing secret was reset, scan the current QR code again.
 
 ### Expo Go cannot load Metro on Android
 
 Use `adb reverse tcp:18086 tcp:18086` and open
-`exp://127.0.0.1:18086` as shown above.
+`exp://127.0.0.1:18086` as shown above. With several devices attached, target
+one explicitly:
+
+```bash
+ANDROID_SERIAL=<DEVICE> npx expo start --android --go
+```
 
 ### Existing VS Code windows expose old behavior
 
 After force-installing an updated VSIX, run **Developer: Reload Window** in each
-open VS Code window so its extension host loads the new JavaScript.
+open VS Code window so its extension host loads the new JavaScript.   
