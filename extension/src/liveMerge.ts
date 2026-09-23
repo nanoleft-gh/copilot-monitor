@@ -30,8 +30,6 @@ export interface MergeResult {
 }
 
 const pairingToleranceMs = 5 * 60_000;
-/** A live tool still running after this long may be waiting for the user's confirmation. */
-const approvableAfterMs = 2_000;
 
 export function mergeLiveTurns(input: MergeInput): MergeResult {
 	const { persisted, live, now } = input;
@@ -111,7 +109,7 @@ function overlay(persisted: TranscriptTurn, live: LiveTurn, now: number): Transc
 	if (sealed) {
 		return persisted;
 	}
-	const activities = mergeActivities(persisted.activities, live.tools, now, true);
+	const activities = mergeActivities(persisted.activities, live.tools);
 	const assistantText = live.assistantText.length > persisted.assistantText.length ? live.assistantText : persisted.assistantText;
 	const thinking = live.thinking.length > persisted.thinking.length ? live.thinking : persisted.thinking;
 	const status = live.status === 'completed' ? 'completed' : 'working';
@@ -129,7 +127,7 @@ function overlay(persisted: TranscriptTurn, live: LiveTurn, now: number): Transc
 
 function fromLive(live: LiveTurn, now: number): TranscriptTurn {
 	const working = live.status === 'working';
-	const activities = mergeActivities([], live.tools, now, working);
+	const activities = mergeActivities([], live.tools);
 	const blocks: TranscriptBlock[] = [];
 	if (live.thinking) {
 		blocks.push({ kind: 'thinking', text: live.thinking, title: '' });
@@ -158,8 +156,6 @@ function fromLive(live: LiveTurn, now: number): TranscriptTurn {
 function mergeActivities(
 	persisted: readonly TranscriptActivity[],
 	tools: readonly LiveToolCall[],
-	now: number,
-	turnWorking: boolean,
 ): TranscriptActivity[] {
 	const result: TranscriptActivity[] = persisted.map(activity => ({ ...activity }));
 	for (const tool of tools) {
@@ -171,14 +167,14 @@ function mergeActivities(
 			}
 			continue;
 		}
-		result.push(toActivity(tool, now, turnWorking));
+		result.push(toActivity(tool));
 	}
 	return result;
 }
 
-function toActivity(tool: LiveToolCall, now: number, turnWorking: boolean): TranscriptActivity {
+/** Live sources cannot see confirmation state; approval comes only from the export probe. */
+function toActivity(tool: LiveToolCall): TranscriptActivity {
 	const finished = tool.status === 'completed' || tool.status === 'failed';
-	const stalled = !finished && turnWorking && now - (tool.startedAt ?? tool.requestedAt) >= approvableAfterMs;
 	const durationMs = tool.completedAt !== undefined && tool.startedAt !== undefined ? tool.completedAt - tool.startedAt : undefined;
 	return {
 		id: tool.id,
@@ -186,7 +182,6 @@ function toActivity(tool: LiveToolCall, now: number, turnWorking: boolean): Tran
 		status: finished ? 'completed' : 'running',
 		toolId: tool.name,
 		...(durationMs !== undefined ? { durationMs } : {}),
-		...(stalled ? { canApprove: true } : {}),
 	};
 }
 

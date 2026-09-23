@@ -919,7 +919,8 @@ export class SessionCore {
 			live,
 			now,
 		});
-		const status: ActiveSessionState['status'] = view.status === 'loading' ? 'loading' : merged.status;
+		// Live turns are shown while the digest is still being built, so a working chat is never blank.
+		const status: ActiveSessionState['status'] = view.status === 'loading' && merged.turns.length === 0 ? 'loading' : merged.status;
 		const permissionLevel: ChatPermissionLevel = ready ? parsePermissionLevel(view.inputState) : record.index?.permissionLevel ?? 'default';
 		const isEmpty = ready || merged.turns.length > 0
 			? merged.turnCount === 0 && merged.turns.length === 0

@@ -34,8 +34,8 @@ import {
 import { SessionCore } from './sessionCore';
 import { findMatchingSession } from './sessionMatcher';
 import { localSessionResource as localSessionResourceOf, sessionIdFromResource } from './sessionResource';
-import { isActivePendingTool } from './toolDecision';
-import { normalizeTranscript, TranscriptTurn } from './transcript';
+import { applyExportSnapshot, ExportSnapshot, isActivePendingTool } from './toolDecision';
+import { normalizeTranscript, pendingConfirmationToolIds, TranscriptTurn } from './transcript';
 
 /**
  * The extension-host face of the monitor. Owns the {@link SessionCore} (all file-driven
@@ -53,14 +53,6 @@ const stallProbeDelayMs = 3_000;
 const maximumProbedToolCalls = 256;
 /** How long a model selection made from the dashboard outranks storage reads that still show the old model. */
 const modelIntentGraceMs = 15_000;
-
-interface ExportSnapshot {
-	readonly resource: string;
-	readonly turns: readonly TranscriptTurn[];
-	readonly model: SessionModelState | undefined;
-	readonly capturedAt: number;
-	readonly coreRevision: string;
-}
 
 export class SessionMonitor implements vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<MonitorState>();
@@ -586,17 +578,17 @@ export class SessionMonitor implements vscode.Disposable {
 	}
 
 	/**
-	 * Live sources cannot distinguish a tool waiting for confirmation from one that is simply
-	 * slow. When the newest turn has an approvable tool nobody has probed yet, run one export
-	 * after a grace period so the dashboard learns the renderer's real confirmation state.
+	 * Live sources cannot see whether a tool is waiting for confirmation. When a tool on the
+	 * newest turn is still running after a grace period, run one export so the dashboard learns
+	 * the renderer's real state. Auto-approving sessions never wait, so they are never probed.
 	 */
 	private scheduleStallProbe(active: ActiveSessionState | undefined): void {
-		if (!active || this.eventClientCount === 0 || this.stallProbeTimer) {
+		if (!active || this.eventClientCount === 0 || this.stallProbeTimer || active.permissionLevel !== 'default') {
 			return;
 		}
 		const lastTurn = active.turns.at(-1);
 		const candidate = lastTurn?.status === 'working'
-			? lastTurn.activities.find(activity => activity.canApprove && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
+			? lastTurn.activities.find(activity => activity.toolId !== undefined && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
 			: undefined;
 		if (!candidate) {
 			return;
@@ -693,12 +685,14 @@ export class SessionMonitor implements vscode.Disposable {
 			const matched = findMatchingSession(sessions, transcript) ?? target;
 			const stabilized = this.liveExportTracker.stabilize(matched.resource, transcript);
 			this.completePendingTurn(matched.resource, stabilized.turns);
+			const requests = Array.isArray(exported.requests) ? exported.requests : [];
+			const lastRequest = requests.at(-1);
 			this.exportSnapshot = {
 				resource: matched.resource,
-				turns: stabilized.turns,
+				turnId: stabilized.turns.at(-1)?.id,
+				pendingToolIds: isRecord(lastRequest) ? pendingConfirmationToolIds(lastRequest) : [],
 				model: parseSessionModelState(exported),
 				capturedAt: Date.now(),
-				coreRevision: matched.revision,
 			};
 			this.emit();
 		} catch (error) {
@@ -1063,44 +1057,6 @@ export function resolveDigestDatabasePath(context: vscode.ExtensionContext): str
 		return path.join(context.storageUri.fsPath, 'history.db');
 	}
 	return path.join(context.globalStorageUri.fsPath, 'history-empty-window.db');
-}
-
-/**
- * Overlays the renderer's exported view of the session onto the file-derived one. The
- * export is the only source that knows about pending tool confirmations immediately, so
- * its activities and status win for the newest, still-working turn.
- */
-export function applyExportSnapshot(session: ActiveSessionState, snapshot: ExportSnapshot): ActiveSessionState {
-	if (session.turns.length === 0 || snapshot.turns.length === 0) {
-		return session;
-	}
-	const last = session.turns[session.turns.length - 1];
-	const exported = snapshot.turns.find(turn => turn.id === last.id)
-		?? snapshot.turns.find(turn => turn.userText.trim() === last.userText.trim() && Math.abs(turn.timestamp - last.timestamp) < 5 * 60_000);
-	if (!exported) {
-		return session;
-	}
-	if (last.status !== 'working' && exported.status !== 'working') {
-		return session;
-	}
-	const turns = [...session.turns.slice(0, -1), {
-		...last,
-		id: last.id,
-		editable: last.editable,
-		status: exported.status,
-		assistantText: exported.assistantText.length >= last.assistantText.length ? exported.assistantText : last.assistantText,
-		thinking: exported.thinking.length >= last.thinking.length ? exported.thinking : last.thinking,
-		activities: exported.activities,
-		blocks: exported.blocks,
-		completedAt: exported.completedAt ?? last.completedAt,
-	}];
-	return {
-		...session,
-		turns,
-		status: turns.some(turn => turn.status === 'working') ? 'working' : 'idle',
-		model: snapshot.model ? mergeSessionModelState(session.model, snapshot.model) : session.model,
-		revision: `${session.revision}+x${snapshot.capturedAt}`,
-	};
 }
 
 /** Resolves once the file's size has stopped changing (VS Code's dispose-time write has landed). */

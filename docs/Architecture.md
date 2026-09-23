@@ -164,16 +164,23 @@ turns are kept; older ones are already in the digest.
 
 Live turns are aligned to persisted turns **from the end**, pairing a live turn with a
 persisted turn only when the normalised user text matches **and** |Δt| ≤ 5 min. Sealed
-persisted turns are never overridden by live data. Live tool calls outstanding for ≥ 2 s
-become `canApprove: true`; the first such tool also triggers **one** stall-probe export
-(section 6.4) so the dashboard learns whether VS Code is really waiting for approval.
+persisted turns are never overridden by live data. Live data never claims a tool needs
+approval: a tool on the newest working turn that is still unfinished 3 s after it appeared
+triggers **one** stall-probe export (section 6.4), skipped entirely when the chat's
+permission level auto-approves.
 
 ### 6.4 Export snapshot (on demand only)
 
-`SessionMonitor.syncNow()` asks VS Code for the live session object once and overlays it on
-the newest working turn. It runs only for a stall probe, a user-initiated sync
-(`POST /api/sessions/sync`), or after a command that changes model state. There is no
-scheduled export.
+`SessionMonitor.syncNow()` asks VS Code for the live session object once. Only the verdict is
+kept: which tool calls of the newest request are held for confirmation (serialised
+`isConfirmed` is `undefined` and there is no result — `ChatToolInvocation.toJSON`), plus the
+live model state. `applyExportSnapshot` marks exactly those still-unfinished tools
+`waiting` / `canApprove` and never replaces turn text, blocks or other tools, so live
+progress keeps streaming after an export. An approval decision re-exports to refresh the
+verdict. The export runs only for a stall probe, a user-initiated sync
+(`POST /api/sessions/sync`), a tool decision, or after a command that changes model state;
+there is no scheduled export (it needs the chat focused in VS Code, so polling would steal
+focus).
 
 ## 7. Multi-window layer
 
@@ -343,7 +350,7 @@ the ratio grows with the size of the retained turn window.
 | Mutation touches a request whose raw JSON was trimmed | `RebuildRequiredError` → one full rebuild |
 | `history.db` locked by another window's worker | host connection gives up after 250 ms; sync retried (≤ 3×) |
 | Line > 64 MB | skipped, reported, tailing continues |
-| Transcript cannot distinguish "waiting for approval" from "running" | optimistic `canApprove` after 2 s + one stall-probe export |
+| Transcript cannot distinguish "waiting for approval" from "running" | one export per slow tool reads the renderer's real confirmation state; no timer-based guess |
 
 ## 11. Verification
 

@@ -33,6 +33,12 @@ With five windows open, connecting the app made each window parse its selected s
 
 - `SessionLogProjection`, the 40-turn in-memory window and the separate "oversized" path (paged mutation index in `globalStorage/progressive-history`) are gone; the digest covers every size up to 1 GB.
 
+### Fixes
+
+- **Working chats stay live.** Opening a chat while Copilot was working could freeze the phone on what it showed at that moment until the turn ended and the chat was reopened: the approval probe's export replaced the turn's text and tool list and kept doing so. The export now contributes only its verdict (which tools await confirmation, and the model state); live text and tools keep streaming. A watched chat whose digest is still being built shows its live turns instead of *Loading*.
+- **No more false approval prompts.** Any tool still running after 2 s used to be offered for approval, so long terminal commands and searches that needed no confirmation showed *Allow*, and tapping it answered "no longer pending". Approval now appears only when VS Code's own tool state says the call is waiting (`isConfirmed` unset and no result in the renderer's export). Chats in auto-approve or autopilot mode are never probed.
+- Digests of chats deleted in VS Code are removed when the digest opens.
+
 ## [2.0.1]
 
 ### Fixes

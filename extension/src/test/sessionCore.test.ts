@@ -384,6 +384,28 @@ describe('SessionCore', () => {
 		assert.deepEqual(session(core, sessionA)!.turns, []);
 	});
 
+	it('shows live progress of a working chat while its digest is still being built', async () => {
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'first', { modelState: { value: 1 }, timestamp: base - 60_000 })]));
+		await fs.writeFile(path.join(fixture.transcripts, `${sessionA}.jsonl`),
+			transcriptLine('user.message', { content: 'in flight' }, base)
+			+ transcriptLine('assistant.turn_start', { turnId: '0' }, base + 1)
+			+ transcriptLine('assistant.message', { content: 'Streaming now', toolRequests: [] }, base + 2));
+		let release: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		const core = createCore({
+			syncDigest: async (digest, sessionId, filePath, signal) => {
+				await gate;
+				return syncSessionDigest({ digest, sessionId, filePath, signal });
+			},
+		});
+		await core.setViewerCount(1);
+		core.setWatched([sessionA]);
+		await waitFor(() => session(core, sessionA)?.turns.at(-1)?.assistantText === 'Streaming now');
+		assert.equal(session(core, sessionA)!.status, 'working', 'not stuck on loading while the digest builds');
+		release();
+		await waitFor(() => session(core, sessionA)?.turnCount === 2);
+	});
+
 	it('reports a digest failure on the session instead of throwing', async () => {
 		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'a')]));
 		const core = createCore({ syncDigest: async () => { throw new Error('disk on fire'); } });
