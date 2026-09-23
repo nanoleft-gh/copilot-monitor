@@ -300,6 +300,10 @@ describe('SessionDigest', () => {
 	it('removes the digest when the log disappears and reports oversized logs without reading them', async () => {
 		await fs.writeFile(logPath, serialize([initial([request(0, 'a')])]));
 		await sync();
+		assert.equal(digest.pruneMissing(() => true), 0);
+		assert.equal(digest.pruneMissing(filePath => filePath !== logPath), 1, 'deleted chats are pruned without a sync');
+		assert.equal(digest.session(sessionId), undefined);
+		await sync();
 		await fs.rm(logPath);
 		assert.equal((await sync()).status, 'gone');
 		assert.equal(digest.session(sessionId), undefined);

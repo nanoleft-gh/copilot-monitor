@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import * as path from 'node:path';
 import { DirectoryEvent, DirectoryWatcher } from './directoryWatcher';
 import { LineTailer } from './lineTailer';
@@ -836,6 +836,11 @@ export class SessionCore {
 			mkdirSync(path.dirname(this.options.paths.digestDatabasePath), { recursive: true });
 			// Short wait: the extension host must never block on a worker's write transaction.
 			this.digestStore = new SessionDigest(this.options.paths.digestDatabasePath, { busyTimeoutMs: 250 });
+			try {
+				this.digestStore.pruneMissing(existsSync);
+			} catch (error) {
+				this.log(`digest prune failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 		return this.digestStore;
 	}

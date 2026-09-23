@@ -248,6 +248,22 @@ export class SessionDigest {
 		this.statements.deleteSession.run(sessionId);
 	}
 
+	/** Drops digests whose log is gone (chat deleted in VS Code or pruned past its 400-session cap). */
+	pruneMissing(exists: (filePath: string) => boolean): number {
+		const rows = this.database.prepare('SELECT session_id, file_path FROM digest_sessions').all() as Array<{ session_id: string; file_path: string }>;
+		let removed = 0;
+		for (const row of rows) {
+			if (!exists(row.file_path)) {
+				this.removeSession(row.session_id);
+				removed++;
+			}
+		}
+		if (removed > 0) {
+			this.vacuum();
+		}
+		return removed;
+	}
+
 	setCursor(sessionId: string, cursor: DigestCursor): void {
 		this.statements.setCursor.run(cursor.ino, cursor.size, cursor.mtimeMs, cursor.anchorHash ?? null, cursor.indexedOffset, Date.now(), sessionId);
 	}
