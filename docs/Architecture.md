@@ -5,8 +5,9 @@ dashboard and the mobile app. The design goal is simple to state and strict to h
 
 > **Nothing runs unless something changed, and nothing is read that is not needed.**
 
-There are no periodic polls, no scheduled exports, and no full re-reads of session files.
-Every piece of work is triggered by a file-system event, a connection event, or a user action.
+There are no idle polls and no full re-reads of session files. Every piece of work is
+triggered by a file-system event, a connection event, or a user action; the one repeating
+export (section 6.4) runs only while a viewer watches a working chat, on a CPU budget.
 
 ## 1. Why the previous design hung the machine
 
@@ -169,18 +170,44 @@ approval: a tool on the newest working turn that is still unfinished 3 s after i
 triggers **one** stall-probe export (section 6.4), skipped entirely when the chat's
 permission level auto-approves.
 
-### 6.4 Export snapshot (on demand only)
+### 6.4 Export snapshot (budgeted, focus-free)
 
-`SessionMonitor.syncNow()` asks VS Code for the live session object once. Only the verdict is
-kept: which tool calls of the newest request are held for confirmation (serialised
-`isConfirmed` is `undefined` and there is no result — `ChatToolInvocation.toJSON`), plus the
-live model state. `applyExportSnapshot` marks exactly those still-unfinished tools
-`waiting` / `canApprove` and never replaces turn text, blocks or other tools, so live
-progress keeps streaming after an export. An approval decision re-exports to refresh the
-verdict. The export runs only for a stall probe, a user-initiated sync
-(`POST /api/sessions/sync`), a tool decision, or after a command that changes model state;
-there is no scheduled export (it needs the chat focused in VS Code, so polling would steal
-focus).
+Within one model round, the text being generated exists only in VS Code's in-memory chat
+model: the transcript is flushed before hooks, the debug log records completed spans every
+4 s, and the session log flushes on the 60 s storage save. The only extension-visible view
+of it is `workbench.action.chat.export`, which serialises `lastFocusedWidget`'s model with
+`JSON.stringify(model.toExport(), undefined, 2)` on the renderer's UI thread.
+
+`SessionMonitor.runExport()` writes that export into an in-memory file system (≤ 96 MB) and
+`exportScan.ts` reads it without a full parse: request ids by byte search for the fixed
+6-space `"requestId"` key (JSON strings cannot contain raw newlines, so the pattern cannot
+occur inside text), and only the newest request object is `JSON.parse`d. From it the monitor
+keeps:
+
+* the **verdict** — tool calls held for confirmation (serialised `isConfirmed` is `undefined`
+  and there is no result — `ChatToolInvocation.toJSON`), and the live model state;
+* the **preview** — the newest request normalised to a `TranscriptTurn`, only for exports
+  ≤ 4 MB.
+
+`applyExportSnapshot` touches only the newest *working* turn. The preview is used while it is
+**ahead** of the files (more non-whitespace text or thinking, or already finished): text,
+thinking and block order come from it, tool status from the files (the export marks every
+invocation complete), and tools only the files know are kept. Once the files catch up the
+preview is ignored, so it can never hold progress back. Pending tools are then marked
+`waiting` / `canApprove`; each snapshot replaces the previous verdict, so a tool approved in
+VS Code loses its *Allow* on the next export.
+
+Identity: an export made without focusing (every probe and poll) is kept only if every
+persisted request id of the watched chat appears in it, or, for a chat with no persisted
+request yet, its single request's prompt matches. Otherwise VS Code has another chat focused
+and the poll backs off (10 s, doubling to 60 s, per chat). Only user actions — select or sync
+from a viewer (`POST /api/sessions/sync`), commands — focus the chat first.
+
+When: while a viewer watches the active chat and it is working, and either its export is
+previewable or it shows a pending approval. The next export waits at least 20× the last one's
+duration (≤ 5 % of the UI thread), and never less than 1.5 s (5 s for chats too large to
+preview). The export size is measured per chat; before the first export it is estimated from
+the session log's size. A stall probe (section 6.3) and an approval decision export once.
 
 ## 7. Multi-window layer
 
@@ -256,6 +283,7 @@ Timers that still exist, and when they run:
 | Unwatch grace 60 s | one-shot | a watched session lost its last watcher |
 | Viewer fan-out spacing 100 ms | one-shot | the gateway is pushing a viewer change to several windows |
 | Stall probe 3 s | one-shot | a live tool has been outstanding and viewers exist |
+| Export poll ≥ 1.5 s and ≥ 20× the last export's duration | one-shot, re-armed | a viewer watches the active chat while it is working (section 6.4) |
 | Digest retry 1/2 s | one-shot | a digest sync failed (at most 3 times per attach) |
 | Watcher retry, reconnects (0.5/1.5/4 s), presence backoff (0.25/1/2 s) | one-shot | something is broken |
 | SSE keepalive comment 15 s | interval | at least one SSE stream is open |
@@ -351,6 +379,9 @@ the ratio grows with the size of the retained turn window.
 | `history.db` locked by another window's worker | host connection gives up after 250 ms; sync retried (≤ 3×) |
 | Line > 64 MB | skipped, reported, tailing continues |
 | Transcript cannot distinguish "waiting for approval" from "running" | one export per slow tool reads the renderer's real confirmation state; no timer-based guess |
+| VS Code has a different chat focused than the one being polled | request-id identity check rejects the export; poll backs off to 60 s; focus is never stolen |
+| Export of a very long chat is tens of MB | no full parse (byte scan + newest request); no streaming preview above 4 MB; poll spaced by 20× its measured cost |
+| Export preview lags the files (or vice versa) | the newer of the two wins per turn, by visible text length |
 
 ## 11. Verification
 

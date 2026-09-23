@@ -32,10 +32,11 @@ import {
 	ToolDecisionRequest,
 } from './protocol';
 import { SessionCore } from './sessionCore';
-import { findMatchingSession } from './sessionMatcher';
 import { localSessionResource as localSessionResourceOf, sessionIdFromResource } from './sessionResource';
-import { applyExportSnapshot, ExportSnapshot, isActivePendingTool } from './toolDecision';
-import { normalizeTranscript, pendingConfirmationToolIds, TranscriptTurn } from './transcript';
+import { applyExportSnapshot, ExportSnapshot, exportMatchesSession, isActivePendingTool } from './toolDecision';
+import { normalizeRequestTurn, pendingConfirmationToolIds, TranscriptTurn } from './transcript';
+import { scanExport } from './exportScan';
+import { capTurn, defaultTurnCaps } from './sessionDigest';
 
 /**
  * The extension-host face of the monitor. Owns the {@link SessionCore} (all file-driven
@@ -51,6 +52,15 @@ const persistWaitDelayMs = 50;
 /** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
 const stallProbeDelayMs = 3_000;
 const maximumProbedToolCalls = 256;
+/** Exports may take at most 1/20 of VS Code's UI thread while polling. */
+const exportBudgetFactor = 20;
+const exportPollMinimumMs = 1_500;
+const exportPollLargeChatMinimumMs = 5_000;
+/** When VS Code has a different chat focused, check back this rarely, doubling up to the maximum. */
+const exportPollFocusRetryMs = 10_000;
+const exportPollFocusRetryMaximumMs = 60_000;
+/** Streaming previews are only taken from chats whose export stays this small. */
+const exportPreviewMaximumBytes = 4 * 1024 * 1024;
 /** How long a model selection made from the dashboard outranks storage reads that still show the old model. */
 const modelIntentGraceMs = 15_000;
 
@@ -95,6 +105,12 @@ export class SessionMonitor implements vscode.Disposable {
 	private exportRunning: Promise<void> | undefined;
 	private readonly probedToolCalls = new Set<string>();
 	private stallProbeTimer: NodeJS.Timeout | undefined;
+	private exportPollTimer: NodeJS.Timeout | undefined;
+	private lastExportDurationMs = 0;
+	private lastExportEndedAt = 0;
+	/** Export size per chat, newest last; bounded because only watched chats are exported. */
+	private readonly exportBytes = new Map<string, number>();
+	private exportMismatch: { resource: string; count: number } | undefined;
 	private error: string | undefined;
 	private lastEmittedSignature: string | undefined;
 	private eventClientCount = 0;
@@ -181,6 +197,7 @@ export class SessionMonitor implements vscode.Disposable {
 			this.nativeInputStateSync.stop();
 			this.exportSnapshot = undefined;
 			this.clearStallProbe();
+			this.clearExportPoll();
 			void this.core.setViewerCount(0);
 		} else if (count > 0) {
 			void this.core.setViewerCount(count);
@@ -530,14 +547,15 @@ export class SessionMonitor implements vscode.Disposable {
 		await focusChatSession(resource);
 		await decideTool(resource, request.decision);
 		await new Promise(resolve => setTimeout(resolve, 25));
-		await this.syncNow(request.sessionResource);
+		await this.syncNow(request.sessionResource, { focus: false });
 	}
 
 	/**
-	 * Runs VS Code's chat export for the selected session once, on demand. This is the only
-	 * path that touches the renderer's chat model, so it is never scheduled automatically.
+	 * Reads the renderer's live copy of a chat once through VS Code's chat export. Only a user
+	 * action focuses the chat first; probes export whatever VS Code has focused and keep the
+	 * result only if it is the chat they asked about.
 	 */
-	async syncNow(sessionResource?: string): Promise<void> {
+	async syncNow(sessionResource?: string, options: { focus?: boolean } = {}): Promise<void> {
 		const target = sessionResource ?? this.core.getState().activeSessionResource;
 		if (!target) {
 			return;
@@ -546,8 +564,9 @@ export class SessionMonitor implements vscode.Disposable {
 			await this.exportRunning;
 			return;
 		}
-		this.exportRunning = this.runExport(target).finally(() => {
+		this.exportRunning = this.runExport(target, options.focus !== false).finally(() => {
 			this.exportRunning = undefined;
+			this.scheduleExportPoll();
 		});
 		await this.exportRunning;
 	}
@@ -555,6 +574,7 @@ export class SessionMonitor implements vscode.Disposable {
 	dispose(): void {
 		this.disposed = true;
 		this.clearStallProbe();
+		this.clearExportPoll();
 		this.nativeInputStateSync.dispose();
 		this.core.dispose();
 		this.closeNativeStateDatabases();
@@ -574,6 +594,7 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 		this.error = undefined;
 		this.scheduleStallProbe(coreState.sessions.find(session => session.resource === coreState.activeSessionResource));
+		this.scheduleExportPoll();
 		this.emit();
 	}
 
@@ -605,9 +626,68 @@ export class SessionMonitor implements vscode.Disposable {
 				return;
 			}
 			this.rememberProbe(key);
-			void this.syncNow(active.resource);
-		}, stallProbeDelayMs);
+			void this.syncNow(active.resource, { focus: false });
+		}, Math.max(stallProbeDelayMs, this.exportBudgetRemainingMs()));
 		this.stallProbeTimer.unref();
+	}
+
+	/**
+	 * While the chat a viewer is watching is working, or shows a tool awaiting approval,
+	 * re-export it on a CPU budget: the export serialises the whole chat on VS Code's UI thread,
+	 * so the next one waits at least {@link exportBudgetFactor} times as long as the last took.
+	 * Streaming text is only offered for chats small enough to export cheaply.
+	 */
+	private scheduleExportPoll(): void {
+		if (this.disposed || this.exportPollTimer || this.exportRunning) {
+			return;
+		}
+		const target = this.exportPollTarget();
+		if (!target) {
+			return;
+		}
+		const floor = target.previewable ? exportPollMinimumMs : exportPollLargeChatMinimumMs;
+		const mismatches = this.exportMismatch?.resource === target.resource ? this.exportMismatch.count : 0;
+		const focusBackoff = mismatches > 0 ? Math.min(exportPollFocusRetryMaximumMs, exportPollFocusRetryMs * 2 ** (mismatches - 1)) : 0;
+		const delay = Math.max(floor, this.exportBudgetRemainingMs(), focusBackoff);
+		this.exportPollTimer = setTimeout(() => {
+			this.exportPollTimer = undefined;
+			if (this.exportPollTarget()?.resource === target.resource) {
+				void this.syncNow(target.resource, { focus: false });
+			}
+		}, delay);
+		this.exportPollTimer.unref();
+	}
+
+	private exportPollTarget(): { resource: string; previewable: boolean } | undefined {
+		if (this.eventClientCount === 0) {
+			return undefined;
+		}
+		const coreState = this.core.getState();
+		const session = coreState.sessions.find(candidate => candidate.resource === coreState.activeSessionResource);
+		if (!session || session.turns.length === 0) {
+			return undefined;
+		}
+		const previewable = this.estimatedExportBytes(session) <= exportPreviewMaximumBytes;
+		const awaitingApproval = this.exportSnapshot?.resource === session.resource && this.exportSnapshot.pendingToolIds.length > 0;
+		const working = session.status === 'working';
+		return (working && previewable) || (working && awaitingApproval) ? { resource: session.resource, previewable } : undefined;
+	}
+
+	/** Measured after the first export; before it, a compacted session log is about the export's size. */
+	private estimatedExportBytes(session: ActiveSessionState): number {
+		return this.exportBytes.get(session.resource) ?? this.core.sessionFile(session.sessionId)?.size ?? Number.POSITIVE_INFINITY;
+	}
+
+	/** Milliseconds until the next export fits the UI-thread budget. */
+	private exportBudgetRemainingMs(): number {
+		return Math.max(0, this.lastExportEndedAt + this.lastExportDurationMs * exportBudgetFactor - Date.now());
+	}
+
+	private clearExportPoll(): void {
+		if (this.exportPollTimer) {
+			clearTimeout(this.exportPollTimer);
+			this.exportPollTimer = undefined;
+		}
 	}
 
 	private rememberProbe(key: string): void {
@@ -660,39 +740,47 @@ export class SessionMonitor implements vscode.Disposable {
 
 	// #region export (on demand)
 
-	private async runExport(sessionResource: string): Promise<void> {
+	private async runExport(sessionResource: string, focus: boolean): Promise<void> {
 		try {
-			const sessions = this.getSessions();
-			const target = sessions.find(session => session.resource === sessionResource);
+			const target = this.core.getState().sessions.find(session => session.resource === sessionResource);
 			if (!target || target.status === 'loading') {
 				return;
 			}
-			await focusChatSession(vscode.Uri.parse(sessionResource));
+			if (focus) {
+				await focusChatSession(vscode.Uri.parse(sessionResource));
+			}
 			this.liveExportFileSystem.reset();
+			const started = Date.now();
 			await vscode.commands.executeCommand('workbench.action.chat.export', this.liveExportUri);
-			const bytes = this.liveExportFileSystem.readFile();
-			if (bytes.byteLength === 0) {
+			const scan = scanExport(this.liveExportFileSystem.readFile());
+			this.liveExportFileSystem.reset();
+			this.lastExportDurationMs = Date.now() - started;
+			this.lastExportEndedAt = Date.now();
+			if (scan.bytes === 0 || !scan.lastRequest) {
 				return;
 			}
-			const exported = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
-			if (!isRecord(exported)) {
+			const index = Math.max(0, scan.requestIds.length - 1);
+			const preview = capTurn(normalizeRequestTurn(scan.lastRequest, index), defaultTurnCaps);
+			if (!focus && !exportMatchesSession(scan.requestIds, target, preview.userText)) {
+				// VS Code has another chat focused; the phone keeps its file-derived view.
+				const count = this.exportMismatch?.resource === sessionResource ? this.exportMismatch.count + 1 : 1;
+				this.exportMismatch = { resource: sessionResource, count };
 				return;
 			}
-			const transcript = normalizeTranscript(exported);
-			if (transcript.turns.length === 0) {
-				return;
+			this.exportMismatch = undefined;
+			this.exportBytes.delete(sessionResource);
+			this.exportBytes.set(sessionResource, scan.bytes);
+			while (this.exportBytes.size > 16) {
+				this.exportBytes.delete(this.exportBytes.keys().next().value as string);
 			}
-			const matched = findMatchingSession(sessions, transcript) ?? target;
-			const stabilized = this.liveExportTracker.stabilize(matched.resource, transcript);
-			this.completePendingTurn(matched.resource, stabilized.turns);
-			const requests = Array.isArray(exported.requests) ? exported.requests : [];
-			const lastRequest = requests.at(-1);
+			this.completePendingTurn(sessionResource, [preview]);
 			this.exportSnapshot = {
-				resource: matched.resource,
-				turnId: stabilized.turns.at(-1)?.id,
-				pendingToolIds: isRecord(lastRequest) ? pendingConfirmationToolIds(lastRequest) : [],
-				model: parseSessionModelState(exported),
+				resource: sessionResource,
+				turnId: preview.id,
+				pendingToolIds: pendingConfirmationToolIds(scan.lastRequest),
+				model: parseSessionModelState({ requests: [scan.lastRequest] }),
 				capturedAt: Date.now(),
+				...(scan.bytes <= exportPreviewMaximumBytes ? { preview } : {}),
 			};
 			this.emit();
 		} catch (error) {
@@ -1125,8 +1213,4 @@ function configurationEquals(
 
 function isFileNotFound(error: unknown): boolean {
 	return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
