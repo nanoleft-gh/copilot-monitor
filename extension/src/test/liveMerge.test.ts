@@ -78,7 +78,8 @@ describe('mergeLiveTurns', () => {
 		const merged = result.turns[0];
 		assert.equal(merged.assistantText, 'Partial answer continues');
 		assert.equal(merged.status, 'working');
-		assert.deepEqual(merged.activities.map(activity => [activity.toolId, activity.status, activity.canApprove]), [['run_in_terminal', 'running', true]]);
+		// A long-running live tool is just running: only the renderer knows whether it awaits approval.
+		assert.deepEqual(merged.activities.map(activity => [activity.toolId, activity.status, activity.canApprove]), [['run_in_terminal', 'running', undefined]]);
 		assert.deepEqual(merged.blocks.map(block => block.kind), ['text', 'activity', 'text']);
 		assert.equal((merged.blocks[2] as { text: string }).text, 'answer continues');
 	});

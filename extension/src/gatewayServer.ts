@@ -22,7 +22,7 @@ import {
 	RemoteAccessUpdateRequest,
 	SendMessageResult,
 } from './protocol';
-import { StateStreamHub } from './stateStream';
+import { StateStreamHub, WatchTarget } from './stateStream';
 import { authCookie, clearedAuthCookie, presentedToken, requestIsHttps, tokensMatch } from './gatewayAuth';
 
 const maximumRequestBytes = 64 * 1024;
@@ -46,6 +46,8 @@ export interface GatewayBackend {
 	setPermissionLevel(request: GatewayPermissionLevelRequest): Promise<void>;
 	decideTool(request: GatewayToolDecisionRequest): Promise<void>;
 	setEventClientCount?(count: number): void;
+	/** Chats gateway clients have open, per window; only these are tailed and carry turns. */
+	setWatched?(targets: readonly WatchTarget[]): void;
 }
 
 export interface GatewayServerOptions {
@@ -94,7 +96,10 @@ export class GatewayServer {
 	) {
 		this.server = http.createServer((request, response) => void this.handleRequest(request, response));
 		this.streams = new StateStreamHub<GatewayState>(() => this.decorate(backend.getState()), {
-			onDidChangeViewerCount: count => backend.setEventClientCount?.(count),
+			onDidChangeViewers: viewers => {
+				backend.setWatched?.(viewers.watched);
+				backend.setEventClientCount?.(viewers.count);
+			},
 		});
 		this.backendSubscription = backend.onDidChange(state => this.streams.broadcast(this.decorate(state)));
 	}
@@ -251,6 +256,7 @@ export class GatewayServer {
 				this.streams.open(request, response, {
 					protocol: StateStreamHub.protocolFromQuery(url.searchParams.get('v')),
 					countsAsViewer: true,
+					watch: StateStreamHub.watchFromQuery(url.searchParams.getAll('watch')),
 				});
 				return;
 			}

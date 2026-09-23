@@ -51,11 +51,13 @@ interface MutableTurn {
 }
 
 const maximumArgsPreviewChars = 400;
-const maximumLiveTurns = 200;
+const defaultMaximumLiveTurns = 8;
 
 export class LiveTurnAccumulator {
 	private readonly turnsInternal: MutableTurn[] = [];
 	private sessionId: string | undefined;
+
+	constructor(private readonly maximumTurns = defaultMaximumLiveTurns) {}
 
 	get turns(): readonly LiveTurn[] {
 		return this.turnsInternal.map(toLiveTurn);
@@ -246,8 +248,8 @@ export class LiveTurnAccumulator {
 			textTruncated: false,
 			openRoundToolCount: 0,
 		});
-		if (this.turnsInternal.length > maximumLiveTurns) {
-			this.turnsInternal.splice(0, this.turnsInternal.length - maximumLiveTurns);
+		if (this.turnsInternal.length > this.maximumTurns) {
+			this.turnsInternal.splice(0, this.turnsInternal.length - this.maximumTurns);
 		}
 	}
 

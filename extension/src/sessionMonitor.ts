@@ -10,8 +10,6 @@ import { cachedLanguageModelsStorageKey, emptyModelCatalog, mergeConfigurationFi
 import { createSessionModelConfigurationMutation, createSessionValueMutation, updateProfileModelConfiguration } from './modelConfigurationUpdate';
 import { createNativeChatInputStateSnapshot } from './nativeChatInputState';
 import { NativeInputStateSync, NativeInputStateWatcher } from './nativeInputStateSync';
-import { indexPagedMutationHistoryInWorker, loadPagedMutationHistoryInWorker } from './pagedMutationHistoryWorkerClient';
-import { deserializePagedMutationHistoryIndex, PagedMutationHistoryIndex, serializePagedMutationHistoryIndex, SerializedPagedMutationHistoryIndex } from './pagedMutationHistory';
 import {
 	ActiveSessionState,
 	ChatModelDescriptor,
@@ -34,10 +32,11 @@ import {
 	ToolDecisionRequest,
 } from './protocol';
 import { SessionCore } from './sessionCore';
-import { findMatchingSession } from './sessionMatcher';
 import { localSessionResource as localSessionResourceOf, sessionIdFromResource } from './sessionResource';
-import { isActivePendingTool } from './toolDecision';
-import { normalizeTranscript, TranscriptTurn } from './transcript';
+import { applyExportSnapshot, ExportSnapshot, exportMatchesSession, isActivePendingTool } from './toolDecision';
+import { normalizeRequestTurn, pendingConfirmationToolIds, TranscriptTurn } from './transcript';
+import { scanExport } from './exportScan';
+import { capTurn, defaultTurnCaps } from './sessionDigest';
 
 /**
  * The extension-host face of the monitor. Owns the {@link SessionCore} (all file-driven
@@ -50,21 +49,20 @@ const maximumOutboundHistory = 20;
 const nativeStateDatabaseFiles = new Set(['state.vscdb', 'state.vscdb-wal', 'state.vscdb-shm']);
 const persistWaitAttempts = 20;
 const persistWaitDelayMs = 50;
-const maximumProgressiveIndexCacheFiles = 64;
-const maximumProgressiveIndexCacheBytes = 64 * 1024 * 1024;
 /** Delay before probing a tool that looks stalled, so fast tools never trigger an export. */
 const stallProbeDelayMs = 3_000;
 const maximumProbedToolCalls = 256;
+/** Exports may take at most 1/20 of VS Code's UI thread while polling. */
+const exportBudgetFactor = 20;
+const exportPollMinimumMs = 1_500;
+const exportPollLargeChatMinimumMs = 5_000;
+/** When VS Code has a different chat focused, check back this rarely, doubling up to the maximum. */
+const exportPollFocusRetryMs = 10_000;
+const exportPollFocusRetryMaximumMs = 60_000;
+/** Streaming previews are only taken from chats whose export stays this small. */
+const exportPreviewMaximumBytes = 4 * 1024 * 1024;
 /** How long a model selection made from the dashboard outranks storage reads that still show the old model. */
 const modelIntentGraceMs = 15_000;
-
-interface ExportSnapshot {
-	readonly resource: string;
-	readonly turns: readonly TranscriptTurn[];
-	readonly model: SessionModelState | undefined;
-	readonly capturedAt: number;
-	readonly coreRevision: string;
-}
 
 export class SessionMonitor implements vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<MonitorState>();
@@ -80,10 +78,6 @@ export class SessionMonitor implements vscode.Disposable {
 	private readonly profileStateDatabasePath: string;
 	/** APPLICATION-scoped storage: cached model list and per-model configuration. */
 	private readonly applicationStateDatabasePath: string;
-	private readonly progressiveIndexDirectory: string;
-	private readonly progressiveAbortController = new AbortController();
-	private readonly progressiveMutationIndexes = new Map<string, PagedMutationHistoryIndex>();
-	private readonly progressiveMutationIndexing = new Map<string, Promise<PagedMutationHistoryIndex>>();
 	private readonly liveExportTracker = new LiveExportTracker();
 	private readonly liveExportUri: vscode.Uri;
 	private readonly liveExportFileSystem = new LiveExportFileSystem();
@@ -111,6 +105,12 @@ export class SessionMonitor implements vscode.Disposable {
 	private exportRunning: Promise<void> | undefined;
 	private readonly probedToolCalls = new Set<string>();
 	private stallProbeTimer: NodeJS.Timeout | undefined;
+	private exportPollTimer: NodeJS.Timeout | undefined;
+	private lastExportDurationMs = 0;
+	private lastExportEndedAt = 0;
+	/** Export size per chat, newest last; bounded because only watched chats are exported. */
+	private readonly exportBytes = new Map<string, number>();
+	private exportMismatch: { resource: string; count: number } | undefined;
 	private error: string | undefined;
 	private lastEmittedSignature: string | undefined;
 	private eventClientCount = 0;
@@ -127,7 +127,6 @@ export class SessionMonitor implements vscode.Disposable {
 		this.sessionDirectories = resolveSessionDirectories(context);
 		this.copilotTranscriptDirectories = resolveCopilotTranscriptDirectories(context);
 		this.copilotDebugLogDirectories = resolveCopilotDebugLogDirectories(context);
-		this.progressiveIndexDirectory = path.join(context.globalStorageUri.fsPath, 'progressive-history');
 		this.languageModelsConfigurationPath = path.join(
 			path.dirname(path.dirname(context.globalStorageUri.fsPath)),
 			'chatLanguageModels.json',
@@ -140,6 +139,7 @@ export class SessionMonitor implements vscode.Disposable {
 				transcriptDirectories: this.copilotTranscriptDirectories,
 				debugLogDirectories: this.copilotDebugLogDirectories,
 				indexDatabasePath: resolveSessionIndexDatabasePath(context),
+				digestDatabasePath: resolveDigestDatabasePath(context),
 			},
 			log: message => this.log(`[core] ${message}`),
 		});
@@ -197,10 +197,17 @@ export class SessionMonitor implements vscode.Disposable {
 			this.nativeInputStateSync.stop();
 			this.exportSnapshot = undefined;
 			this.clearStallProbe();
+			this.clearExportPoll();
 			void this.core.setViewerCount(0);
 		} else if (count > 0) {
 			void this.core.setViewerCount(count);
 		}
+	}
+
+	/** The chats viewers currently have open; only these are tailed and carry turns. */
+	setWatchedSessions(sessionResources: readonly string[]): void {
+		const ids = sessionResources.map(resource => sessionIdFromResource(resource)).filter((id): id is string => id !== undefined);
+		this.core.setWatched(ids);
 	}
 
 	/** First viewer: open on the chat VS Code has focused, then let the core attach. */
@@ -347,13 +354,7 @@ export class SessionMonitor implements vscode.Disposable {
 			throw new MonitorRequestError(409, 'The conversation changed before the edited request could be submitted.');
 		}
 		const sessionId = requireSessionId(request.sessionResource);
-		let requestIndex = this.core.requestIndexOf(sessionId, request.requestId) ?? -1;
-		if (requestIndex < 0 && this.core.isOversized(sessionId)) {
-			const index = await this.getProgressiveMutationIndex(sessionId);
-			requestIndex = request.sourceText
-				? findProgressiveRequestIndex(index.requests, request.sourceText, request.sourceTimestamp)
-				: index.requests.findIndex(value => value.requestId === request.requestId);
-		}
+		const requestIndex = this.core.requestIndexOf(sessionId, request.requestId) ?? -1;
 		if (requestIndex < 0) {
 			throw new MonitorRequestError(409, 'The selected request is no longer editable.');
 		}
@@ -398,18 +399,12 @@ export class SessionMonitor implements vscode.Disposable {
 		const sessionId = session.sessionId;
 		const limit = Math.max(1, Math.min(Math.floor(request.limit ?? 40), 40));
 		const page = this.core.historyPage(sessionId, request.before, limit);
-		if (page) {
-			return { ...page, revision: session.revision };
+		if (!page) {
+			throw new MonitorRequestError(409, session.historyUnavailable === 'oversized'
+				? 'This chat is too large to page remotely; open it in VS Code.'
+				: 'History is available only while the chat is open. Open it and try again.');
 		}
-		if (!this.core.isOversized(sessionId)) {
-			throw new MonitorRequestError(409, 'Earlier history remains available only in VS Code.');
-		}
-		const index = await this.getProgressiveMutationIndex(sessionId);
-		const total = index.requests.length;
-		const end = Math.max(0, Math.min(Math.floor(request.before), total));
-		const start = Math.max(0, end - limit);
-		const result = await loadPagedMutationHistoryInWorker(index, start, end - start, session.revision, this.progressiveAbortController.signal);
-		return { ...result, revision: session.revision };
+		return { ...page, revision: session.revision };
 	}
 
 	async selectModel(request: ModelSelectionRequest): Promise<void> {
@@ -552,14 +547,15 @@ export class SessionMonitor implements vscode.Disposable {
 		await focusChatSession(resource);
 		await decideTool(resource, request.decision);
 		await new Promise(resolve => setTimeout(resolve, 25));
-		await this.syncNow(request.sessionResource);
+		await this.syncNow(request.sessionResource, { focus: false });
 	}
 
 	/**
-	 * Runs VS Code's chat export for the selected session once, on demand. This is the only
-	 * path that touches the renderer's chat model, so it is never scheduled automatically.
+	 * Reads the renderer's live copy of a chat once through VS Code's chat export. Only a user
+	 * action focuses the chat first; probes export whatever VS Code has focused and keep the
+	 * result only if it is the chat they asked about.
 	 */
-	async syncNow(sessionResource?: string): Promise<void> {
+	async syncNow(sessionResource?: string, options: { focus?: boolean } = {}): Promise<void> {
 		const target = sessionResource ?? this.core.getState().activeSessionResource;
 		if (!target) {
 			return;
@@ -568,8 +564,9 @@ export class SessionMonitor implements vscode.Disposable {
 			await this.exportRunning;
 			return;
 		}
-		this.exportRunning = this.runExport(target).finally(() => {
+		this.exportRunning = this.runExport(target, options.focus !== false).finally(() => {
 			this.exportRunning = undefined;
+			this.scheduleExportPoll();
 		});
 		await this.exportRunning;
 	}
@@ -577,7 +574,7 @@ export class SessionMonitor implements vscode.Disposable {
 	dispose(): void {
 		this.disposed = true;
 		this.clearStallProbe();
-		this.progressiveAbortController.abort();
+		this.clearExportPoll();
 		this.nativeInputStateSync.dispose();
 		this.core.dispose();
 		this.closeNativeStateDatabases();
@@ -597,21 +594,22 @@ export class SessionMonitor implements vscode.Disposable {
 		}
 		this.error = undefined;
 		this.scheduleStallProbe(coreState.sessions.find(session => session.resource === coreState.activeSessionResource));
+		this.scheduleExportPoll();
 		this.emit();
 	}
 
 	/**
-	 * Live sources cannot distinguish a tool waiting for confirmation from one that is simply
-	 * slow. When the newest turn has an approvable tool nobody has probed yet, run one export
-	 * after a grace period so the dashboard learns the renderer's real confirmation state.
+	 * Live sources cannot see whether a tool is waiting for confirmation. When a tool on the
+	 * newest turn is still running after a grace period, run one export so the dashboard learns
+	 * the renderer's real state. Auto-approving sessions never wait, so they are never probed.
 	 */
 	private scheduleStallProbe(active: ActiveSessionState | undefined): void {
-		if (!active || this.eventClientCount === 0 || this.stallProbeTimer) {
+		if (!active || this.eventClientCount === 0 || this.stallProbeTimer || active.permissionLevel !== 'default') {
 			return;
 		}
 		const lastTurn = active.turns.at(-1);
 		const candidate = lastTurn?.status === 'working'
-			? lastTurn.activities.find(activity => activity.canApprove && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
+			? lastTurn.activities.find(activity => activity.toolId !== undefined && activity.status !== 'completed' && !this.probedToolCalls.has(`${active.resource}:${activity.id}`))
 			: undefined;
 		if (!candidate) {
 			return;
@@ -628,9 +626,68 @@ export class SessionMonitor implements vscode.Disposable {
 				return;
 			}
 			this.rememberProbe(key);
-			void this.syncNow(active.resource);
-		}, stallProbeDelayMs);
+			void this.syncNow(active.resource, { focus: false });
+		}, Math.max(stallProbeDelayMs, this.exportBudgetRemainingMs()));
 		this.stallProbeTimer.unref();
+	}
+
+	/**
+	 * While the chat a viewer is watching is working, or shows a tool awaiting approval,
+	 * re-export it on a CPU budget: the export serialises the whole chat on VS Code's UI thread,
+	 * so the next one waits at least {@link exportBudgetFactor} times as long as the last took.
+	 * Streaming text is only offered for chats small enough to export cheaply.
+	 */
+	private scheduleExportPoll(): void {
+		if (this.disposed || this.exportPollTimer || this.exportRunning) {
+			return;
+		}
+		const target = this.exportPollTarget();
+		if (!target) {
+			return;
+		}
+		const floor = target.previewable ? exportPollMinimumMs : exportPollLargeChatMinimumMs;
+		const mismatches = this.exportMismatch?.resource === target.resource ? this.exportMismatch.count : 0;
+		const focusBackoff = mismatches > 0 ? Math.min(exportPollFocusRetryMaximumMs, exportPollFocusRetryMs * 2 ** (mismatches - 1)) : 0;
+		const delay = Math.max(floor, this.exportBudgetRemainingMs(), focusBackoff);
+		this.exportPollTimer = setTimeout(() => {
+			this.exportPollTimer = undefined;
+			if (this.exportPollTarget()?.resource === target.resource) {
+				void this.syncNow(target.resource, { focus: false });
+			}
+		}, delay);
+		this.exportPollTimer.unref();
+	}
+
+	private exportPollTarget(): { resource: string; previewable: boolean } | undefined {
+		if (this.eventClientCount === 0) {
+			return undefined;
+		}
+		const coreState = this.core.getState();
+		const session = coreState.sessions.find(candidate => candidate.resource === coreState.activeSessionResource);
+		if (!session || session.turns.length === 0) {
+			return undefined;
+		}
+		const previewable = this.estimatedExportBytes(session) <= exportPreviewMaximumBytes;
+		const awaitingApproval = this.exportSnapshot?.resource === session.resource && this.exportSnapshot.pendingToolIds.length > 0;
+		const working = session.status === 'working';
+		return (working && previewable) || (working && awaitingApproval) ? { resource: session.resource, previewable } : undefined;
+	}
+
+	/** Measured after the first export; before it, a compacted session log is about the export's size. */
+	private estimatedExportBytes(session: ActiveSessionState): number {
+		return this.exportBytes.get(session.resource) ?? this.core.sessionFile(session.sessionId)?.size ?? Number.POSITIVE_INFINITY;
+	}
+
+	/** Milliseconds until the next export fits the UI-thread budget. */
+	private exportBudgetRemainingMs(): number {
+		return Math.max(0, this.lastExportEndedAt + this.lastExportDurationMs * exportBudgetFactor - Date.now());
+	}
+
+	private clearExportPoll(): void {
+		if (this.exportPollTimer) {
+			clearTimeout(this.exportPollTimer);
+			this.exportPollTimer = undefined;
+		}
 	}
 
 	private rememberProbe(key: string): void {
@@ -683,37 +740,47 @@ export class SessionMonitor implements vscode.Disposable {
 
 	// #region export (on demand)
 
-	private async runExport(sessionResource: string): Promise<void> {
+	private async runExport(sessionResource: string, focus: boolean): Promise<void> {
 		try {
-			const sessions = this.getSessions();
-			const target = sessions.find(session => session.resource === sessionResource);
+			const target = this.core.getState().sessions.find(session => session.resource === sessionResource);
 			if (!target || target.status === 'loading') {
 				return;
 			}
-			await focusChatSession(vscode.Uri.parse(sessionResource));
+			if (focus) {
+				await focusChatSession(vscode.Uri.parse(sessionResource));
+			}
 			this.liveExportFileSystem.reset();
+			const started = Date.now();
 			await vscode.commands.executeCommand('workbench.action.chat.export', this.liveExportUri);
-			const bytes = this.liveExportFileSystem.readFile();
-			if (bytes.byteLength === 0) {
+			const scan = scanExport(this.liveExportFileSystem.readFile());
+			this.liveExportFileSystem.reset();
+			this.lastExportDurationMs = Date.now() - started;
+			this.lastExportEndedAt = Date.now();
+			if (scan.bytes === 0 || !scan.lastRequest) {
 				return;
 			}
-			const exported = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
-			if (!isRecord(exported)) {
+			const index = Math.max(0, scan.requestIds.length - 1);
+			const preview = capTurn(normalizeRequestTurn(scan.lastRequest, index), defaultTurnCaps);
+			if (!focus && !exportMatchesSession(scan.requestIds, target, preview.userText)) {
+				// VS Code has another chat focused; the phone keeps its file-derived view.
+				const count = this.exportMismatch?.resource === sessionResource ? this.exportMismatch.count + 1 : 1;
+				this.exportMismatch = { resource: sessionResource, count };
 				return;
 			}
-			const transcript = normalizeTranscript(exported);
-			if (transcript.turns.length === 0) {
-				return;
+			this.exportMismatch = undefined;
+			this.exportBytes.delete(sessionResource);
+			this.exportBytes.set(sessionResource, scan.bytes);
+			while (this.exportBytes.size > 16) {
+				this.exportBytes.delete(this.exportBytes.keys().next().value as string);
 			}
-			const matched = findMatchingSession(sessions, transcript) ?? target;
-			const stabilized = this.liveExportTracker.stabilize(matched.resource, transcript);
-			this.completePendingTurn(matched.resource, stabilized.turns);
+			this.completePendingTurn(sessionResource, [preview]);
 			this.exportSnapshot = {
-				resource: matched.resource,
-				turns: stabilized.turns,
-				model: parseSessionModelState(exported),
+				resource: sessionResource,
+				turnId: preview.id,
+				pendingToolIds: pendingConfirmationToolIds(scan.lastRequest),
+				model: parseSessionModelState({ requests: [scan.lastRequest] }),
 				capturedAt: Date.now(),
-				coreRevision: matched.revision,
+				...(scan.bytes <= exportPreviewMaximumBytes ? { preview } : {}),
 			};
 			this.emit();
 		} catch (error) {
@@ -954,52 +1021,6 @@ export class SessionMonitor implements vscode.Disposable {
 		throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
 	}
 
-	private async getProgressiveMutationIndex(sessionId: string): Promise<PagedMutationHistoryIndex> {
-		const cached = this.progressiveMutationIndexes.get(sessionId);
-		const file = this.core.sessionFile(sessionId);
-		if (!file) {
-			throw new MonitorRequestError(404, 'The persisted Copilot session file is no longer available.');
-		}
-		if (cached && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
-			return cached;
-		}
-		const existing = this.progressiveMutationIndexing.get(sessionId);
-		if (existing) {
-			return existing;
-		}
-		const indexing = this.loadOrBuildProgressiveMutationIndex(sessionId, file);
-		this.progressiveMutationIndexing.set(sessionId, indexing);
-		try {
-			const index = await indexing;
-			this.progressiveMutationIndexes.set(sessionId, index);
-			return index;
-		} finally {
-			this.progressiveMutationIndexing.delete(sessionId);
-		}
-	}
-
-	private async loadOrBuildProgressiveMutationIndex(sessionId: string, file: { filePath: string; size: number; mtimeMs: number }): Promise<PagedMutationHistoryIndex> {
-		const cachePath = path.join(this.progressiveIndexDirectory, `${sessionId}.json`);
-		try {
-			const cached = JSON.parse(await fs.readFile(cachePath, 'utf8')) as SerializedPagedMutationHistoryIndex;
-			if (cached.filePath === file.filePath && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
-				return deserializePagedMutationHistoryIndex(cached);
-			}
-		} catch {
-			// Missing or stale cache is rebuilt below.
-		}
-		const index = await indexPagedMutationHistoryInWorker(file.filePath, this.progressiveAbortController.signal);
-		await fs.mkdir(this.progressiveIndexDirectory, { recursive: true });
-		const temporaryPath = `${cachePath}.${process.pid}.tmp`;
-		await fs.writeFile(temporaryPath, JSON.stringify(serializePagedMutationHistoryIndex(index)), 'utf8');
-		await fs.rename(temporaryPath, cachePath).catch(async () => {
-			await fs.rm(cachePath, { force: true });
-			await fs.rename(temporaryPath, cachePath);
-		});
-		await pruneProgressiveIndexCache(this.progressiveIndexDirectory, cachePath);
-		return index;
-	}
-
 	// #endregion
 
 	// #region commands helpers
@@ -1118,42 +1139,12 @@ export function resolveSessionIndexDatabasePath(context: vscode.ExtensionContext
 	return path.join(path.dirname(context.globalStorageUri.fsPath), 'state.vscdb');
 }
 
-/**
- * Overlays the renderer's exported view of the session onto the file-derived one. The
- * export is the only source that knows about pending tool confirmations immediately, so
- * its activities and status win for the newest, still-working turn.
- */
-export function applyExportSnapshot(session: ActiveSessionState, snapshot: ExportSnapshot): ActiveSessionState {
-	if (session.turns.length === 0 || snapshot.turns.length === 0) {
-		return session;
+/** The digest lives next to the sessions it describes: per workspace, or global for empty windows. */
+export function resolveDigestDatabasePath(context: vscode.ExtensionContext): string {
+	if (context.storageUri) {
+		return path.join(context.storageUri.fsPath, 'history.db');
 	}
-	const last = session.turns[session.turns.length - 1];
-	const exported = snapshot.turns.find(turn => turn.id === last.id)
-		?? snapshot.turns.find(turn => turn.userText.trim() === last.userText.trim() && Math.abs(turn.timestamp - last.timestamp) < 5 * 60_000);
-	if (!exported) {
-		return session;
-	}
-	if (last.status !== 'working' && exported.status !== 'working') {
-		return session;
-	}
-	const turns = [...session.turns.slice(0, -1), {
-		...last,
-		id: last.id,
-		editable: last.editable,
-		status: exported.status,
-		assistantText: exported.assistantText.length >= last.assistantText.length ? exported.assistantText : last.assistantText,
-		thinking: exported.thinking.length >= last.thinking.length ? exported.thinking : last.thinking,
-		activities: exported.activities,
-		blocks: exported.blocks,
-		completedAt: exported.completedAt ?? last.completedAt,
-	}];
-	return {
-		...session,
-		turns,
-		status: turns.some(turn => turn.status === 'working') ? 'working' : 'idle',
-		model: snapshot.model ? mergeSessionModelState(session.model, snapshot.model) : session.model,
-		revision: `${session.revision}+x${snapshot.capturedAt}`,
-	};
+	return path.join(context.globalStorageUri.fsPath, 'history-empty-window.db');
 }
 
 /** Resolves once the file's size has stopped changing (VS Code's dispose-time write has landed). */
@@ -1205,64 +1196,6 @@ function decodeLocalSessionId(resource: vscode.Uri): string {
 	return sessionId;
 }
 
-function findProgressiveRequestIndex(
-	requests: readonly Record<string, unknown>[],
-	sourceText: string,
-	sourceTimestamp: number | undefined,
-): number {
-	const expected = normalizeComparablePrompt(sourceText);
-	let bestIndex = -1;
-	let bestDistance = Number.POSITIVE_INFINITY;
-	for (let index = 0; index < requests.length; index++) {
-		const request = requests[index];
-		const message = isRecord(request.message) ? request.message : undefined;
-		if (normalizeComparablePrompt(typeof message?.text === 'string' ? message.text : '') !== expected) {
-			continue;
-		}
-		const timestamp = typeof request.timestamp === 'number' ? request.timestamp : undefined;
-		const distance = sourceTimestamp !== undefined && timestamp !== undefined ? Math.abs(timestamp - sourceTimestamp) : index;
-		if (distance < bestDistance) {
-			bestDistance = distance;
-			bestIndex = index;
-		}
-	}
-	return bestIndex;
-}
-
-function normalizeComparablePrompt(value: string): string {
-	return value.replace(/^User:\s*/i, '').replace(/\s+/g, ' ').trim();
-}
-
-async function pruneProgressiveIndexCache(directory: string, retainedPath: string): Promise<void> {
-	let entries: Array<{ path: string; size: number; mtimeMs: number }> = [];
-	try {
-		entries = await Promise.all((await fs.readdir(directory))
-			.filter(name => name.endsWith('.json'))
-			.map(async name => {
-				const filePath = path.join(directory, name);
-				const stat = await fs.stat(filePath);
-				return { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs };
-			}));
-	} catch {
-		return;
-	}
-	entries.sort((left, right) => right.mtimeMs - left.mtimeMs);
-	let retainedBytes = 0;
-	let retainedFiles = 0;
-	for (const entry of entries) {
-		const keep = entry.path === retainedPath || (
-			retainedFiles < maximumProgressiveIndexCacheFiles
-			&& retainedBytes + entry.size <= maximumProgressiveIndexCacheBytes
-		);
-		if (keep) {
-			retainedFiles++;
-			retainedBytes += entry.size;
-		} else {
-			await fs.rm(entry.path, { force: true }).catch(() => undefined);
-		}
-	}
-}
-
 function summarize(value: string, length: number): string {
 	const singleLine = value.replace(/\s+/g, ' ').trim();
 	return singleLine.length > length ? `${singleLine.slice(0, length - 1)}…` : singleLine;
@@ -1280,8 +1213,4 @@ function configurationEquals(
 
 function isFileNotFound(error: unknown): boolean {
 	return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

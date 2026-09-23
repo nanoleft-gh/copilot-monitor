@@ -249,6 +249,30 @@ export function mergeTranscriptSupplement(transcript: Transcript, supplement: Tr
 	};
 }
 
+/**
+ * Tool calls of an exported (live) request that VS Code is holding for the user's confirmation.
+ * The renderer serialises `isConfirmed` once an invocation is confirmed, denied or auto-approved;
+ * `undefined` with no result means it is still waiting (see `ChatToolInvocation.toJSON`).
+ */
+export function pendingConfirmationToolIds(request: JsonObject): string[] {
+	const response = Array.isArray(request.response) ? request.response : [];
+	const ids: string[] = [];
+	for (const part of response) {
+		if (!isObject(part) || part.kind !== 'toolInvocationSerialized' || part.isConfirmed !== undefined || part.resultDetails !== undefined) {
+			continue;
+		}
+		const data = isObject(part.toolSpecificData) ? part.toolSpecificData : undefined;
+		if (data?.kind === 'terminal' && data.terminalCommandState !== undefined) {
+			continue;
+		}
+		const id = stringValue(part.toolCallId);
+		if (id) {
+			ids.push(id);
+		}
+	}
+	return ids;
+}
+
 export function normalizeRequestTurn(request: JsonObject, index: number): TranscriptTurn {
 	const response = Array.isArray(request.response) ? request.response : [];
 	const markdown: string[] = [];

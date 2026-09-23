@@ -13,6 +13,11 @@ type StreamHandlers = {
   onStatus?: (status: StreamStatus) => void;
 };
 
+export type StreamOptions = {
+  /** The chat this screen shows; the gateway streams turns only for watched chats, and only while the stream is open. */
+  watch?: { windowId: string; sessionResource: string };
+};
+
 /** Reconnect delays after consecutive failures; the last value repeats. A little jitter avoids thundering herds. */
 const reconnectDelaysMs = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 /** The gateway comments the stream every 15 s; silence beyond this means the socket died without telling us. */
@@ -44,9 +49,10 @@ const responseTextResetBytes = 256 * 1024;
  * Before each retry the host is re-located, so a new IP, a different Wi-Fi, or
  * the computer's remote (tunnel) address are all picked up automatically.
  */
-export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers): () => void {
+export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers, options: StreamOptions = {}): () => void {
   let closed = false;
   let request: XMLHttpRequest | undefined;
+  const streamPath = `/api/events?v=2${options.watch ? `&watch=${encodeURIComponent(`${options.watch.windowId}|${options.watch.sessionResource}`)}` : ''}`;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let staleTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnecting = false;
@@ -164,7 +170,7 @@ export function subscribeToGateway(host: HostProfile, handlers: StreamHandlers):
     const xhr = new XMLHttpRequest();
     request = xhr;
     try {
-      xhr.open('GET', new URL('/api/events?v=2', host.endpoint).toString());
+      xhr.open('GET', new URL(streamPath, host.endpoint).toString());
       xhr.setRequestHeader('Accept', 'text/event-stream');
       for (const [name, value] of Object.entries(authHeaders(host))) xhr.setRequestHeader(name, value);
       xhr.onreadystatechange = () => {

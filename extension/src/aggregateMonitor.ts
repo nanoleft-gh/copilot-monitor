@@ -22,15 +22,19 @@ import {
 } from './protocol';
 import { readWindowDescriptors, removeWindowDescriptor, WindowDescriptor } from './windowRegistry';
 import { applyPatch, isPatch } from './stateDelta';
+import type { WatchTarget } from './stateStream';
 
 const defaultScanDebounceMs = 100;
 const relayRequestTimeoutMs = 15_000;
 /** Reconnect delays after the event stream to a window drops; after the last one the window is declared dead. */
 const defaultReconnectDelaysMs: readonly number[] = [500, 1_500, 4_000];
+/** Spacing between viewer updates sent to successive windows, so their attach work does not land at once. */
+const defaultViewerFanoutSpacingMs = 100;
 
 export interface AggregateMonitorOptions {
 	readonly scanDebounceMs?: number;
 	readonly reconnectDelaysMs?: readonly number[];
+	readonly viewerFanoutSpacingMs?: number;
 }
 
 /**
@@ -46,11 +50,14 @@ export class AggregateMonitor {
 	private readonly gatewayStartedAt = Date.now();
 	private readonly scanDebounceMs: number;
 	private readonly reconnectDelaysMs: readonly number[];
+	private readonly viewerFanoutSpacingMs: number;
 	private watcher: DirectoryWatcher | undefined;
 	private scanTimer: NodeJS.Timeout | undefined;
 	private scanRunning: Promise<void> | undefined;
 	private scanRequested = false;
 	private eventClientCount = 0;
+	private watched: readonly WatchTarget[] = [];
+	private fanoutTimer: NodeJS.Timeout | undefined;
 	private disposed = false;
 
 	constructor(
@@ -59,6 +66,7 @@ export class AggregateMonitor {
 	) {
 		this.scanDebounceMs = options.scanDebounceMs ?? defaultScanDebounceMs;
 		this.reconnectDelaysMs = options.reconnectDelaysMs ?? defaultReconnectDelaysMs;
+		this.viewerFanoutSpacingMs = options.viewerFanoutSpacingMs ?? defaultViewerFanoutSpacingMs;
 	}
 
 	async start(): Promise<void> {
@@ -197,9 +205,39 @@ export class AggregateMonitor {
 
 	setEventClientCount(count: number): void {
 		this.eventClientCount = count;
-		for (const connection of this.connections.values()) {
-			connection.setEventClientCount(count);
+		this.scheduleViewerFanout();
+	}
+
+	setWatched(targets: readonly WatchTarget[]): void {
+		this.watched = targets;
+		this.scheduleViewerFanout();
+	}
+
+	/** Pushes the viewer set to windows one at a time, spaced out, so five windows do not attach in the same tick. */
+	private scheduleViewerFanout(): void {
+		if (this.fanoutTimer || this.disposed) {
+			return;
 		}
+		const pending = [...this.connections.values()];
+		const step = () => {
+			this.fanoutTimer = undefined;
+			const connection = pending.shift();
+			if (!connection || this.disposed) {
+				return;
+			}
+			connection.setViewers(this.eventClientCount, this.watchedIn(connection.windowId));
+			if (pending.length > 0) {
+				this.fanoutTimer = setTimeout(step, this.viewerFanoutSpacingMs);
+				this.fanoutTimer.unref();
+			}
+		};
+		// The first window is updated on the next tick so several changes in one tick coalesce.
+		this.fanoutTimer = setTimeout(step, 0);
+		this.fanoutTimer.unref();
+	}
+
+	private watchedIn(windowId: string): string[] {
+		return this.watched.filter(target => target.windowId === windowId).map(target => target.sessionResource);
 	}
 
 	dispose(): void {
@@ -209,6 +247,10 @@ export class AggregateMonitor {
 		if (this.scanTimer) {
 			clearTimeout(this.scanTimer);
 			this.scanTimer = undefined;
+		}
+		if (this.fanoutTimer) {
+			clearTimeout(this.fanoutTimer);
+			this.fanoutTimer = undefined;
 		}
 		for (const connection of this.connections.values()) {
 			connection.dispose();
@@ -276,7 +318,7 @@ export class AggregateMonitor {
 					() => this.forgetDeadWindow(descriptor.windowId),
 				);
 				this.connections.set(descriptor.windowId, connection);
-				connection.setEventClientCount(this.eventClientCount);
+				connection.setViewers(this.eventClientCount, this.watchedIn(descriptor.windowId));
 				connection.connect();
 				changed = true;
 			} else {
@@ -316,6 +358,8 @@ class WindowConnection {
 	private connected = false;
 	private buffer = '';
 	private eventClientCount = 0;
+	private watched: readonly string[] = [];
+	private forwardedViewers: string | undefined;
 	private reconnectAttempt = 0;
 	private reconnectTimer: NodeJS.Timeout | undefined;
 	private disposed = false;
@@ -329,6 +373,10 @@ class WindowConnection {
 
 	get localPort(): number {
 		return this.descriptor.localPort;
+	}
+
+	get windowId(): string {
+		return this.descriptor.windowId;
 	}
 
 	updateDescriptor(descriptor: WindowDescriptor): boolean {
@@ -374,7 +422,8 @@ class WindowConnection {
 			}
 			this.connected = true;
 			this.reconnectAttempt = 0;
-			this.forwardEventClientCount();
+			this.forwardedViewers = undefined;
+			this.forwardViewers();
 			this.onChange();
 			response.setEncoding('utf8');
 			response.on('data', chunk => this.handleData(String(chunk)));
@@ -385,10 +434,11 @@ class WindowConnection {
 		request.on('error', () => this.handleDisconnect());
 	}
 
-	setEventClientCount(count: number): void {
+	setViewers(count: number, watched: readonly string[]): void {
 		this.eventClientCount = count;
+		this.watched = watched;
 		if (this.connected) {
-			this.forwardEventClientCount();
+			this.forwardViewers();
 		}
 	}
 
@@ -503,7 +553,15 @@ class WindowConnection {
 		this.reconnectTimer.unref();
 	}
 
-	private forwardEventClientCount(): void {
-		void this.postJson('/api/clients', { count: this.eventClientCount }).catch(() => undefined);
+	private forwardViewers(): void {
+		const payload = { count: this.eventClientCount, watched: this.watched };
+		const key = JSON.stringify(payload);
+		if (key === this.forwardedViewers) {
+			return;
+		}
+		this.forwardedViewers = key;
+		void this.postJson('/api/clients', payload).catch(() => {
+			this.forwardedViewers = undefined;
+		});
 	}
 }

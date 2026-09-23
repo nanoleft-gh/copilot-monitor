@@ -4,7 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { SessionCore } from '../sessionCore';
+import { SessionCore, SessionCoreOptions } from '../sessionCore';
+import { syncSessionDigest } from '../sessionDigestBuilder';
 import { sessionIndexStorageKey } from '../sessionIndex';
 import { localSessionResource } from '../sessionResource';
 
@@ -72,22 +73,41 @@ describe('SessionCore', () => {
 	let fixture: Fixture;
 	const cores: SessionCore[] = [];
 
-	function createCore(now?: () => number): SessionCore {
+	function createCore(overrides: Partial<SessionCoreOptions> = {}): SessionCore {
 		const core = new SessionCore({
 			paths: {
 				sessionDirectories: [fixture.sessions],
 				transcriptDirectories: [fixture.transcripts],
 				debugLogDirectories: [fixture.debugLogs],
 				indexDatabasePath: fixture.database,
+				digestDatabasePath: path.join(fixture.root, 'monitor', 'history.db'),
 			},
 			fileDebounceMs: 10,
 			indexDebounceMs: 20,
 			activityWindowMs: 300,
-			retainedTurns: 5,
-			now,
+			liveWindowTurns: 5,
+			detachGraceMs: 0,
+			// Inline sync keeps the tests deterministic and fast; the worker path is covered in sessionDigest.test.
+			syncDigest: (digest, sessionId, filePath, signal) => syncSessionDigest({ digest, sessionId, filePath, signal }),
+			...overrides,
 		});
 		cores.push(core);
 		return core;
+	}
+
+	function session(core: SessionCore, sessionId: string) {
+		return core.getState().sessions.find(candidate => candidate.sessionId === sessionId);
+	}
+
+	/** Watches a session and waits until its digest has been read. */
+	async function watch(core: SessionCore, ...sessionIds: string[]): Promise<void> {
+		core.setWatched(sessionIds);
+		for (const sessionId of sessionIds) {
+			await waitFor(() => {
+				const state = session(core, sessionId);
+				return state !== undefined && state.status !== 'loading';
+			});
+		}
 	}
 
 	beforeEach(async () => {
@@ -111,7 +131,7 @@ describe('SessionCore', () => {
 		assert.equal(core.viewers, 0);
 	});
 
-	it('lists sessions from the index with metadata only, newest first, and reads turns only for the selected one', async () => {
+	it('lists sessions from the index with metadata only, and reads turns only for watched ones', async () => {
 		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'question A'), request(1, 'second A')], { customTitle: 'Projected A' }));
 		await fs.writeFile(path.join(fixture.sessions, `${sessionB}.jsonl`), initialLine(sessionB, [request(0, 'question B')]));
 		writeIndex(fixture, {
@@ -120,10 +140,15 @@ describe('SessionCore', () => {
 		});
 		const core = createCore();
 		await core.setViewerCount(1);
-		const state = core.getState();
+		let state = core.getState();
 		assert.deepEqual(state.sessions.map(session => session.sessionId), [sessionB, sessionA]);
-		// Newest session is selected automatically and carries turns; the other is metadata only.
+		// Newest session is the default focus, but nothing is watched yet: metadata only, no log parsed.
 		assert.equal(state.activeSessionResource, localSessionResource(sessionB));
+		assert.ok(state.sessions.every(session => session.turns.length === 0 && session.turnCount === undefined));
+		assert.equal(core.watchedSessions.length, 0);
+
+		await watch(core, sessionB);
+		state = core.getState();
 		const [active, other] = state.sessions;
 		assert.equal(active.title, 'Index title B');
 		assert.equal(active.turns.length, 1);
@@ -135,19 +160,19 @@ describe('SessionCore', () => {
 		assert.equal(other.permissionLevel, 'autoApprove');
 		assert.equal(other.status, 'idle');
 
-		await core.selectSession(sessionA);
-		const selected = core.getState().sessions.find(session => session.sessionId === sessionA)!;
+		await watch(core, sessionA);
+		const selected = session(core, sessionA)!;
 		assert.equal(selected.title, 'Projected A');
 		assert.equal(selected.turns.length, 2);
 		assert.equal(core.requestIndexOf(sessionA, 'request-1'), 1);
-		assert.deepEqual(core.getState().sessions.find(session => session.sessionId === sessionB)!.turns, []);
+		assert.deepEqual(session(core, sessionB)!.turns, [], 'unwatched again: no turns are held');
+		assert.deepEqual(core.watchedSessions, [sessionA]);
 	});
 
 	it('derives a title from the file head when the index does not know the session yet', async () => {
 		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'What is the meaning of this stack trace?')]));
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionB);
 		const summary = core.getState().sessions[0];
 		assert.equal(summary.title, 'What is the meaning of this stack trace?');
 		assert.equal(summary.isEmpty, false);
@@ -171,15 +196,15 @@ describe('SessionCore', () => {
 		assert.equal(byId.get(sessionA)?.isEmpty, true);
 		assert.equal(byId.get(sessionA)?.turnCount, 0);
 		assert.equal(byId.get(sessionB)?.isEmpty, false);
-		assert.equal(byId.get(sessionB)?.turnCount, 1);
+		assert.equal(byId.get(sessionB)?.turnCount, undefined, 'counts are only known for watched chats');
 		assert.equal(byId.get(sessionC)?.isEmpty, true, 'unindexed blank chat is detected from its log head');
 
-		// The blank chat receives its first request: the projection knows before the index does.
-		await core.selectSession(sessionA);
-		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.isEmpty, true);
+		// The blank chat receives its first request: the digest knows before the index does.
+		await watch(core, sessionA);
+		assert.equal(session(core, sessionA)?.isEmpty, true);
 		await fs.appendFile(path.join(fixture.sessions, `${sessionA}.jsonl`), JSON.stringify({ kind: 2, k: ['requests'], v: [request(0, 'now it has content', { modelState: { value: 1 } })], i: 0 }) + '\n');
-		await waitFor(() => core.getState().sessions.find(session => session.sessionId === sessionA)?.isEmpty === false);
-		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.turnCount, 1);
+		await waitFor(() => session(core, sessionA)?.isEmpty === false);
+		assert.equal(session(core, sessionA)?.turnCount, 1);
 	});
 
 	it('follows appended mutations and transcript progress through file events', async () => {
@@ -189,7 +214,7 @@ describe('SessionCore', () => {
 		let changes = 0;
 		core.onDidChange(() => changes++);
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
+		await watch(core, sessionA);
 
 		await fs.appendFile(sessionPath, JSON.stringify({ kind: 2, k: ['requests'], v: [request(1, 'second')] }) + '\n');
 		await waitFor(() => core.getState().sessions[0].turns.length === 2);
@@ -225,15 +250,15 @@ describe('SessionCore', () => {
 		assert.equal(core.getState().sessions[0].status, 'idle');
 	});
 
-	it('marks a non-selected session as working while its transcript is being written, then idle again', async () => {
+	it('marks a non-watched session as working while its transcript is being written, then idle again', async () => {
 		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'a')]));
 		await fs.writeFile(path.join(fixture.sessions, `${sessionB}.jsonl`), initialLine(sessionB, [request(0, 'b')]));
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
+		await watch(core, sessionA);
 		await fs.writeFile(path.join(fixture.transcripts, `${sessionB}.jsonl`), transcriptLine('user.message', { content: 'b' }, base));
-		await waitFor(() => core.getState().sessions.find(session => session.sessionId === sessionB)?.status === 'working');
-		await waitFor(() => core.getState().sessions.find(session => session.sessionId === sessionB)?.status === 'idle', 3_000);
+		await waitFor(() => session(core, sessionB)?.status === 'working');
+		await waitFor(() => session(core, sessionB)?.status === 'idle', 3_000);
 	});
 
 	it('does not report a finished chat as working just because it was opened and then left', async () => {
@@ -247,12 +272,13 @@ describe('SessionCore', () => {
 			+ transcriptLine('assistant.turn_end', { turnId: '0' }, base + 3));
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
-		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
-		await core.selectSession(sessionB);
-		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
-		await core.selectSession(sessionA);
-		assert.equal(core.getState().sessions.find(session => session.sessionId === sessionA)?.status, 'idle');
+		await watch(core, sessionA);
+		assert.equal(session(core, sessionA)?.status, 'idle');
+		await watch(core, sessionB);
+		assert.equal(session(core, sessionA)?.status, 'idle');
+		await watch(core, sessionA);
+		await new Promise(resolve => setTimeout(resolve, 50));
+		assert.equal(session(core, sessionA)?.status, 'idle');
 	});
 
 	it('picks up the index appearing later and new/removed session files', async () => {
@@ -272,13 +298,14 @@ describe('SessionCore', () => {
 		await waitFor(() => core.getState().sessions.length === 0);
 	});
 
-	it('pages persisted history from the projection and reports oversized logs', async () => {
+	it('pages persisted history from the digest, also for a session that is no longer watched', async () => {
 		const requests = Array.from({ length: 12 }, (_, index) => request(index, `q${index}`, { response: [{ value: `a${index}` }], modelState: { value: 1 } }));
 		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, requests));
+		await fs.writeFile(path.join(fixture.sessions, `${sessionB}.jsonl`), initialLine(sessionB, [request(0, 'b')]));
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
-		const active = core.getState().sessions[0];
+		await watch(core, sessionA);
+		const active = session(core, sessionA)!;
 		assert.equal(active.turns.length, 5);
 		assert.equal(active.historyStart, 7);
 		assert.equal(active.turnCount, 12);
@@ -286,7 +313,14 @@ describe('SessionCore', () => {
 		const page = core.historyPage(sessionA, 7, 4)!;
 		assert.deepEqual(page.turns.map(turn => turn.userText), ['q3', 'q4', 'q5', 'q6']);
 		assert.equal(page.hasEarlier, true);
-		assert.equal(core.historyPage(sessionB, 7, 4), undefined);
+		assert.equal(core.historyPage(sessionB, 7, 4), undefined, 'never digested');
+
+		// Unwatched, but the digest still matches the file: history stays available without re-reading the log.
+		await watch(core, sessionB);
+		assert.deepEqual(session(core, sessionA)!.turns, []);
+		assert.deepEqual(core.historyPage(sessionA, 12, 2)!.turns.map(turn => turn.userText), ['q10', 'q11']);
+		await fs.appendFile(path.join(fixture.sessions, `${sessionA}.jsonl`), JSON.stringify({ kind: 2, k: ['requests'], v: [request(12, 'q12')] }) + '\n');
+		await waitFor(() => core.historyPage(sessionA, 12, 2) === undefined, 3_000);
 	});
 
 	it('survives a compaction rewrite of the session log', async () => {
@@ -294,12 +328,12 @@ describe('SessionCore', () => {
 		await fs.writeFile(sessionPath, initialLine(sessionA, [request(0, 'a')]) + JSON.stringify({ kind: 2, k: ['requests'], v: [request(1, 'b')] }) + '\n');
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
-		assert.equal(core.getState().sessions[0].turns.length, 2);
+		await watch(core, sessionA);
+		assert.equal(session(core, sessionA)!.turns.length, 2);
 		// VS Code replaces the whole file with a fresh Initial entry after enough mutations.
 		await fs.writeFile(sessionPath, initialLine(sessionA, [request(0, 'a'), request(1, 'b'), request(2, 'c')], { customTitle: 'Compacted' }));
-		await waitFor(() => core.getState().sessions[0].turns.length === 3);
-		assert.equal(core.getState().sessions[0].title, 'Compacted');
+		await waitFor(() => session(core, sessionA)!.turns.length === 3);
+		assert.equal(session(core, sessionA)!.title, 'Compacted');
 	});
 
 	it('tears everything down when the last viewer leaves and rebuilds on return', async () => {
@@ -307,12 +341,78 @@ describe('SessionCore', () => {
 		await fs.writeFile(sessionPath, initialLine(sessionA, [request(0, 'a')]));
 		const core = createCore();
 		await core.setViewerCount(1);
-		await core.selectSession(sessionA);
+		await watch(core, sessionA);
 		await core.setViewerCount(0);
 		await fs.appendFile(sessionPath, JSON.stringify({ kind: 2, k: ['requests'], v: [request(1, 'b')] }) + '\n');
 		await new Promise(resolve => setTimeout(resolve, 150));
 		assert.deepEqual(core.getState().sessions[0].turns, [], 'nothing is held while nobody watches');
+		assert.equal(core.watchedSessions.length, 0);
 		await core.setViewerCount(1);
-		assert.equal(core.getState().sessions[0].turns.length, 2);
+		await waitFor(() => session(core, sessionA)?.turns.length === 2);
+	});
+
+	it('keeps a session attached for the grace period after its watcher leaves', async () => {
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'a')]));
+		const core = createCore({ detachGraceMs: 200 });
+		await core.setViewerCount(1);
+		await watch(core, sessionA);
+		core.setWatched([]);
+		assert.equal(session(core, sessionA)!.turns.length, 1, 'still attached during the grace');
+		core.setWatched([sessionA]);
+		await new Promise(resolve => setTimeout(resolve, 300));
+		assert.equal(session(core, sessionA)!.turns.length, 1, 're-watching within the grace cancels the detach');
+		core.setWatched([]);
+		await waitFor(() => session(core, sessionA)!.turns.length === 0, 2_000);
+		// The same applies when the last viewer disconnects entirely.
+		await watch(core, sessionA);
+		await core.setViewerCount(0);
+		assert.equal(session(core, sessionA)!.turns.length, 1);
+		await core.setViewerCount(1);
+		await new Promise(resolve => setTimeout(resolve, 300));
+		assert.equal(session(core, sessionA)!.turns.length, 1);
+	});
+
+	it('caps how many sessions are attached at once, keeping the most recently requested', async () => {
+		const sessionC = 'cccccccc-0000-4000-8000-000000000003';
+		for (const id of [sessionA, sessionB, sessionC]) {
+			await fs.writeFile(path.join(fixture.sessions, `${id}.jsonl`), initialLine(id, [request(0, id)]));
+		}
+		const core = createCore({ maximumWatchedSessions: 2 });
+		await core.setViewerCount(1);
+		await watch(core, sessionA, sessionB, sessionC);
+		assert.deepEqual([...core.watchedSessions].sort(), [sessionB, sessionC].sort());
+		assert.deepEqual(session(core, sessionA)!.turns, []);
+	});
+
+	it('shows live progress of a working chat while its digest is still being built', async () => {
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'first', { modelState: { value: 1 }, timestamp: base - 60_000 })]));
+		await fs.writeFile(path.join(fixture.transcripts, `${sessionA}.jsonl`),
+			transcriptLine('user.message', { content: 'in flight' }, base)
+			+ transcriptLine('assistant.turn_start', { turnId: '0' }, base + 1)
+			+ transcriptLine('assistant.message', { content: 'Streaming now', toolRequests: [] }, base + 2));
+		let release: () => void = () => undefined;
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		const core = createCore({
+			syncDigest: async (digest, sessionId, filePath, signal) => {
+				await gate;
+				return syncSessionDigest({ digest, sessionId, filePath, signal });
+			},
+		});
+		await core.setViewerCount(1);
+		core.setWatched([sessionA]);
+		await waitFor(() => session(core, sessionA)?.turns.at(-1)?.assistantText === 'Streaming now');
+		assert.equal(session(core, sessionA)!.status, 'working', 'not stuck on loading while the digest builds');
+		release();
+		await waitFor(() => session(core, sessionA)?.turnCount === 2);
+	});
+
+	it('reports a digest failure on the session instead of throwing', async () => {
+		await fs.writeFile(path.join(fixture.sessions, `${sessionA}.jsonl`), initialLine(sessionA, [request(0, 'a')]));
+		const core = createCore({ syncDigest: async () => { throw new Error('disk on fire'); } });
+		await core.setViewerCount(1);
+		core.setWatched([sessionA]);
+		await waitFor(() => session(core, sessionA)?.status === 'idle');
+		assert.deepEqual(session(core, sessionA)!.turns, []);
+		assert.equal(session(core, sessionA)!.title, 'a', 'metadata still comes from the log head');
 	});
 });

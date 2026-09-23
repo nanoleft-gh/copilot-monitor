@@ -42,6 +42,8 @@ export interface LineTailerOptions {
 	readonly maximumLineBytes?: number;
 	/** On first attach, files larger than this start near EOF instead of at byte 0. */
 	readonly skipToTailIfLargerThan?: number;
+	/** On first attach, start at the returned offset (a line start) instead of byte 0. */
+	readonly initialOffset?: (size: number) => Promise<number>;
 }
 
 export interface LineTailerCursor {
@@ -51,7 +53,7 @@ export interface LineTailerCursor {
 	readonly lineIndex: number;
 }
 
-const defaultChunkBytes = 4 * 1024 * 1024;
+const defaultChunkBytes = 1024 * 1024;
 const defaultAnchorBytes = 4096;
 const defaultResyncTailBytes = 64 * 1024;
 const defaultMaximumLineBytes = 64 * 1024 * 1024;
@@ -145,6 +147,8 @@ export class LineTailer {
 			if (skipThreshold !== undefined && size > skipThreshold) {
 				this.offset = await this.findLineStartNearEnd(size);
 				this.events.onReset?.('oversized', this.generation);
+			} else if (this.options.initialOffset) {
+				this.offset = Math.max(0, Math.min(size, await this.options.initialOffset(size)));
 			} else {
 				this.offset = 0;
 			}
@@ -177,6 +181,10 @@ export class LineTailer {
 				}
 				this.offset += bytesRead;
 				this.consume(buffer.subarray(0, bytesRead));
+				if (this.offset < size) {
+					// Let timers and I/O callbacks run between chunks of a large backlog.
+					await new Promise<void>(resolve => setImmediate(resolve));
+				}
 			}
 			this.anchorHash = await this.readAnchor(handle);
 		} finally {

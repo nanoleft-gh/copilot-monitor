@@ -20,10 +20,24 @@ import { applyPatch, diffValue, Patch } from './stateDelta';
 
 export type StreamProtocol = 1 | 2 | 'none';
 
+/** A chat a client is looking at. `windowId` is absent on the per-window bridge. */
+export interface WatchTarget {
+	readonly windowId?: string;
+	readonly sessionResource: string;
+}
+
+export interface ViewerSummary {
+	readonly count: number;
+	/** Union of every viewer's watch targets, in first-seen order. */
+	readonly watched: readonly WatchTarget[];
+}
+
 export interface StreamClientOptions {
 	readonly protocol: StreamProtocol;
 	/** Whether this stream represents a person looking at the data (drives viewer gating). */
 	readonly countsAsViewer: boolean;
+	/** Chats this stream's owner has open; they live exactly as long as the stream. */
+	readonly watch?: readonly WatchTarget[];
 }
 
 export interface StreamClient {
@@ -34,7 +48,7 @@ export interface StreamClient {
 
 export interface StateStreamHubOptions {
 	readonly keepaliveIntervalMs?: number;
-	readonly onDidChangeViewerCount?: (count: number) => void;
+	readonly onDidChangeViewers?: (viewers: ViewerSummary) => void;
 }
 
 interface Generation {
@@ -79,18 +93,41 @@ export class StateStreamHub<TState> {
 	}
 
 	get viewerCount(): number {
+		return this.viewers().count;
+	}
+
+	viewers(): ViewerSummary {
 		let count = 0;
+		const watched = new Map<string, WatchTarget>();
 		for (const client of this.clients) {
-			if (client.options.countsAsViewer) {
-				count++;
+			if (!client.options.countsAsViewer) {
+				continue;
+			}
+			count++;
+			for (const target of client.options.watch ?? []) {
+				watched.set(`${target.windowId ?? ''}\u0000${target.sessionResource}`, target);
 			}
 		}
-		return count;
+		return { count, watched: [...watched.values()] };
 	}
 
 	/** Parses `?v=` into a protocol; unknown values fall back to protocol 1. */
 	static protocolFromQuery(value: string | null): 1 | 2 {
 		return value === '2' ? 2 : 1;
+	}
+
+	/** Parses repeated `?watch=` values: `<sessionResource>` or `<windowId>|<sessionResource>`. */
+	static watchFromQuery(values: readonly string[]): WatchTarget[] {
+		const targets: WatchTarget[] = [];
+		for (const value of values) {
+			const separator = value.indexOf('|');
+			const windowId = separator > 0 ? value.slice(0, separator) : undefined;
+			const sessionResource = separator > 0 ? value.slice(separator + 1) : value;
+			if (sessionResource && targets.length < 8) {
+				targets.push(windowId ? { windowId, sessionResource } : { sessionResource });
+			}
+		}
+		return targets;
 	}
 
 	open(request: http.IncomingMessage, response: http.ServerResponse, options: StreamClientOptions): StreamClient {
@@ -251,6 +288,6 @@ export class StateStreamHub<TState> {
 	}
 
 	private notifyViewers(): void {
-		this.options.onDidChangeViewerCount?.(this.viewerCount);
+		this.options.onDidChangeViewers?.(this.viewers());
 	}
 }

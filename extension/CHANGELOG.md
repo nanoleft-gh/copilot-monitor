@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.1.0]
+
+Opening the phone no longer makes every VS Code window re-read its chat logs. The list is metadata, history lives in an on-disk digest, and only the chat you are looking at is tailed.
+
+### Why
+
+With five windows open, connecting the app made each window parse its selected session log, transcript and debug log from byte 0 — about 750 MB across the machine, with extension hosts climbing to several GB and the desktop stalling. VS Code compacts a session log into a single JSON line after 1024 mutations, so "tailing" a compacted 120 MB log meant `JSON.parse` of 120 MB. Backgrounding the app tore everything down and the next foreground paid it all again.
+
+### Metadata-first list
+
+- The session list is built from VS Code's own index (`state.vscdb`), `fs.stat` and directory events only. No session log is parsed until a client opens a chat. Turn counts are shown only for opened chats.
+
+### Watched chats
+
+- A client names the chat it displays on its event stream (`GET /api/events?v=2&watch=<windowId>|<sessionResource>`); the watch lives exactly as long as the stream. The gateway unions every client's chats and forwards each window only its own (`POST /api/clients {count, watched}`), one window at a time, 100 ms apart. At most three chats per window are attached; a chat stays attached for 60 s after its last watcher leaves so a brief background/foreground does not redo the work.
+- Clients that never send `watch` receive metadata only. New capability `lazyHistory` in `/api/health`; `apiVersion` stays 4. The browser dashboard and the 2.1.0 mobile app send `watch`; the 2.0.0 app shows chats as loading until updated.
+
+### On-disk digest instead of in-memory projection
+
+- Each opened chat gets a per-workspace SQLite digest (`history.db` in the extension's workspace storage; `node:sqlite`, no native module): one row per request with the normalised turn and a compacted raw request. Appends are consumed from the recorded byte offset; a compaction rewrite is detected through a hash of the bytes before that offset and rebuilt.
+- Lines above 256 KB — a compacted Initial entry is the whole session on one line — are tokenised with `stream-json`, so one request exists in memory at a time and every string is capped at 64 KB. Rebuilds run in a worker thread; short appends are applied inline.
+- Raw JSON is kept only for the newest 16 requests (VS Code never diffs a sealed request again); a mutation to an older one forces a rebuild.
+- History pages are range selects; the phone's *Load earlier messages* never touches the log. Paging works for a chat that is no longer open as long as its digest still matches the file.
+- Measured on a real 122 MB compacted log: first open 1.8 s in the worker, +19 MB peak heap, 11 MB digest, 20-turn page in 17 ms, reopen 0 ms.
+
+### Live logs start at the end
+
+- Copilot's transcript and debug log are scanned backwards (256 KB blocks, at most 4 MB) to the line that opens the second-last turn and tailed from there; a 90 MB debug log costs kilobytes to attach. `LineTailer` reads 1 MB chunks and yields between them. The live overlay keeps 8 turns instead of 200.
+
+### Removed
+
+- `SessionLogProjection`, the 40-turn in-memory window and the separate "oversized" path (paged mutation index in `globalStorage/progressive-history`) are gone; the digest covers every size up to 1 GB.
+
+### Fixes
+
+- **Working chats stay live.** Opening a chat while Copilot was working could freeze the phone on what it showed at that moment until the turn ended and the chat was reopened: the approval probe's export replaced the turn's text and tool list and kept doing so. The export now contributes only its verdict (which tools await confirmation, and the model state); live text and tools keep streaming. A watched chat whose digest is still being built shows its live turns instead of *Loading*.
+- **No more false approval prompts.** Any tool still running after 2 s used to be offered for approval, so long terminal commands and searches that needed no confirmation showed *Allow*, and tapping it answered "no longer pending". Approval now appears only when VS Code's own tool state says the call is waiting (`isConfirmed` unset and no result in the renderer's export). Chats in auto-approve or autopilot mode are never probed.
+- Digests of chats deleted in VS Code are removed when the digest opens.
+- **Text and thinking stream within a model round.** Copilot writes a round's text to its logs only when the round ends, so the phone used to see a long answer appear all at once. While a watched chat is working, the monitor now exports VS Code's live chat on a CPU budget (at most 1/20 of the UI thread, never more often than every 1.5 s) and shows the newest request's text and thinking while they are ahead of the logs. Tool status still comes from the logs, and the preview can never hold back progress the logs already show. Chats whose export exceeds 4 MB (estimated from the session log before the first export) get round-level updates only, so VS Code's UI stays responsive.
+- **Probes no longer steal focus.** Stall probes, the streaming poll and the refresh after an approval export whatever chat VS Code has focused and keep the result only if its request ids prove it is the watched chat; otherwise they back off (10 s, doubling to 60 s). Only a user action from the phone focuses the chat.
+- **Stale *Allow* cleared.** Approving a tool directly in VS Code now removes the prompt from the phone on the next poll, instead of leaving an *Allow* that answered "no longer pending".
+- **Approval probe works for long chats.** The export buffer grew from 16 MB to 96 MB and is no longer parsed whole: request ids are found by byte search and only the newest request is parsed.
+
 ## [2.0.1]
 
 ### Fixes

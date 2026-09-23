@@ -22,6 +22,8 @@ type PermissionLevel = 'default' | 'autoApprove' | 'autopilot';
 
 /** How long a confirmed-by-the-computer model change may take to show up in a snapshot before the UI stops waiting. */
 const optimisticModelTimeoutMs = 15_000;
+/** Turns fetched per "load earlier/newer" request; the stream itself carries only the newest few. */
+const historyPageSize = 20;
 
 function mergeConfigurationFields(
   catalogFields: readonly ModelConfigurationField[],
@@ -171,7 +173,7 @@ export default function ChatScreen() {
             setStreamStatus(status);
             if (status === 'unpaired') setError('This computer no longer accepts the phone\'s pairing. Scan its code in VS Code again.');
           },
-        });
+        }, { watch: { windowId: params.windowId, sessionResource: params.sessionResource } });
       } catch (initError) {
         if (active) {
           setError(initError instanceof Error ? initError.message : String(initError));
@@ -199,7 +201,7 @@ export default function ChatScreen() {
     const currentEnd = historyPage?.end ?? (currentStart + displayedSession.turns.length);
     const totalCount = displayedSession.turnCount ?? displayedSession.turns.length;
     if ((direction === 'earlier' && currentStart <= 0) || (direction === 'newer' && currentEnd >= totalCount)) return;
-    const before = direction === 'earlier' ? currentStart : Math.min(totalCount, currentEnd + 40);
+    const before = direction === 'earlier' ? currentStart : Math.min(totalCount, currentEnd + historyPageSize);
     setHistoryLoading(true);
     setError(undefined);
     try {
@@ -209,7 +211,7 @@ export default function ChatScreen() {
         params.sessionResource,
         displayedSession.revision,
         before,
-        40,
+        historyPageSize,
       ));
     } catch (historyError) {
       setError(historyError instanceof Error ? historyError.message : String(historyError));
